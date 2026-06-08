@@ -165,6 +165,7 @@ export class TransactionsService {
         memberProfileId: user.profileId,
         applicationDate,
         amountCents: Math.abs(dto.amountCents),
+        type: dto.type,
       },
       select: {
         id: true,

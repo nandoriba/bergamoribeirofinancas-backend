@@ -107,6 +107,37 @@ describe('TransactionsService', () => {
     expect(create).toHaveBeenCalledTimes(1);
   });
 
+  it('does not compare manual duplicates across opposite transaction types', async () => {
+    const create = vi.fn(async (args) => args.data);
+    const findMany = vi.fn(async (args) => {
+      if (args.where.type === 'income') return [];
+      return [
+        {
+          id: 'transaction-1',
+          applicationDate: new Date('2026-04-03T00:00:00.000Z'),
+          amountCents: 106_97,
+          description: 'Compra no débito via NuPay - iFood',
+        },
+      ];
+    });
+    const service = new TransactionsService({ transaction: { create, findMany } } as never);
+
+    await service.create(user, {
+      applicationDate: '2026-04-03',
+      referenceMonth: '2026-04-01',
+      description: 'Estorno - Compra no débito via NuPay - iFood',
+      amountCents: 106_97,
+      type: 'income',
+    });
+
+    expect(findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ amountCents: 106_97, type: 'income' }),
+      }),
+    );
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
   it('blocks manual strong duplicates by amount, application date and description', async () => {
     const create = vi.fn(async (args) => args.data);
     const findMany = vi.fn().mockResolvedValue([

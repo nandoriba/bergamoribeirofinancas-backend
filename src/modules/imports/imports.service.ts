@@ -60,7 +60,7 @@ export class ImportsService {
       user.profileId,
       parsed.rows.map((row) => row.externalId).filter((id): id is string => Boolean(id)),
     );
-    const existingDuplicateCandidates = await this.findExistingDuplicateCandidates(user.profileId, parsed.rows);
+    const existingDuplicateCandidates = await this.findExistingDuplicateCandidates(user.profileId, parsed.rows, parsed.type);
     const seenExternalIds = new Set<string>();
     const seenValueDateDescriptions = new Map(existingDuplicateCandidates);
 
@@ -77,6 +77,7 @@ export class ImportsService {
               existingExternalIds,
               seenExternalIds,
               seenValueDateDescriptions,
+              parsed.type,
             );
             return {
               rowIndex: row.rowIndex,
@@ -336,27 +337,32 @@ export class ImportsService {
     return new Set(transactions.map((transaction) => transaction.externalId).filter((id): id is string => Boolean(id)));
   }
 
-  private async findExistingDuplicateCandidates(memberProfileId: string, rows: ParsedImportRow[]) {
+  private async findExistingDuplicateCandidates(memberProfileId: string, rows: ParsedImportRow[], importType: ImportType) {
     const filters = rows
       .filter((row) => row.date && row.amountCents !== undefined)
       .map((row) => ({
         applicationDate: row.date as Date,
-        amountCents: normalizeAmountCents(row.amountCents ?? 0),
+        signedAmountCents: duplicateAmountForImportRow(importType, row),
       }));
 
     if (filters.length === 0) return new Map<string, DuplicateCandidate[]>();
 
-    const uniqueFilters = [...new Map(filters.map((filter) => [duplicateKey(filter.applicationDate, filter.amountCents), filter])).values()];
+    const uniqueFilters = [...new Map(filters.map((filter) => [duplicateKey(filter.applicationDate, filter.signedAmountCents), filter])).values()];
     const transactions = await this.prisma.transaction.findMany({
       where: {
         memberProfileId,
-        OR: uniqueFilters,
+        OR: uniqueFilters.map((filter) => ({
+          applicationDate: filter.applicationDate,
+          amountCents: normalizeAmountCents(filter.signedAmountCents),
+          type: filter.signedAmountCents >= 0 ? 'income' : 'expense',
+        })),
       },
       select: {
         id: true,
         applicationDate: true,
         amountCents: true,
         description: true,
+        type: true,
         account: { select: { name: true } },
       },
     });
@@ -366,7 +372,7 @@ export class ImportsService {
       addDuplicateCandidate(candidates, {
         id: transaction.id,
         applicationDate: toDateKey(transaction.applicationDate),
-        amountCents: normalizeAmountCents(transaction.amountCents),
+        amountCents: signedTransactionAmountCents(transaction),
         description: transaction.description,
         source: 'Sistema',
         accountName: transaction.account?.name,
@@ -380,6 +386,7 @@ export class ImportsService {
     existingExternalIds: Set<string>,
     seenExternalIds: Set<string>,
     seenValueDateDescriptions: Map<string, DuplicateCandidate[]>,
+    importType: ImportType,
   ): DuplicateClassification {
     if (row.status === 'review') return { status: ImportRowStatus.review, falseDuplicate: false, candidates: [] };
 
@@ -393,7 +400,7 @@ export class ImportsService {
       return { status: ImportRowStatus.review, falseDuplicate: false, candidates: [] };
     }
 
-    const amountCents = normalizeAmountCents(row.amountCents);
+    const amountCents = duplicateAmountForImportRow(importType, row);
     const key = duplicateKey(row.date, amountCents);
     const candidates = seenValueDateDescriptions.get(key);
     const description = normalizeText(row.description);
@@ -518,14 +525,25 @@ function normalizeText(value: string) {
 }
 
 function duplicateKey(applicationDate: Date, amountCents: number) {
-  return `${applicationDate.toISOString().slice(0, 10)}:${normalizeAmountCents(amountCents)}`;
+  return `${applicationDate.toISOString().slice(0, 10)}:${Math.round(amountCents)}`;
 }
 
 function addDuplicateCandidate(candidates: Map<string, DuplicateCandidate[]>, candidate: DuplicateCandidate) {
-  const key = `${candidate.applicationDate}:${normalizeAmountCents(candidate.amountCents)}`;
+  const key = `${candidate.applicationDate}:${Math.round(candidate.amountCents)}`;
   const items = candidates.get(key) ?? [];
   items.push(candidate);
   candidates.set(key, items);
+}
+
+function duplicateAmountForImportRow(importType: ImportType, row: ParsedImportRow): number {
+  const amountCents = Math.round(row.amountCents ?? 0);
+  if (importType === 'nubank_credit_card') return -normalizeAmountCents(amountCents);
+  return amountCents;
+}
+
+function signedTransactionAmountCents(transaction: { amountCents: number; type: TransactionType }): number {
+  const amountCents = normalizeAmountCents(transaction.amountCents);
+  return transaction.type === 'income' ? amountCents : -amountCents;
 }
 
 function mapPreviewStatus(status: ImportRowStatus, falseDuplicate: boolean): ImportPreviewStatus {

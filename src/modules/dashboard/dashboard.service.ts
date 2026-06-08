@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { ImportRowStatus, Prisma } from '@prisma/client';
+import type { ImportType, TransactionType } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
 import {
@@ -378,20 +379,22 @@ export class DashboardService {
       return [];
     }
 
-    const amountCents = normalizeAmountCents(row.amountCents);
+    const signedAmountCents = duplicateAmountForImportRow(row.importBatch.type, row.amountCents);
     const description = normalizeText(row.description ?? '');
     const [transactions, batchRows] = await Promise.all([
       this.prisma.transaction.findMany({
         where: {
           memberProfileId: row.importBatch.memberProfileId,
           applicationDate: row.date,
-          amountCents,
+          amountCents: normalizeAmountCents(signedAmountCents),
+          type: signedAmountCents >= 0 ? 'income' : 'expense',
         },
         select: {
           id: true,
           description: true,
           applicationDate: true,
           amountCents: true,
+          type: true,
           account: { select: { name: true } },
         },
       }),
@@ -416,7 +419,7 @@ export class DashboardService {
         id: transaction.id,
         description: transaction.description,
         applicationDate: toDateKey(transaction.applicationDate),
-        amountCents: normalizeAmountCents(transaction.amountCents),
+        amountCents: signedTransactionAmountCents(transaction),
         source: 'Sistema',
         accountName: transaction.account?.name,
       }));
@@ -427,14 +430,14 @@ export class DashboardService {
           candidate.date &&
           candidate.description &&
           candidate.amountCents !== null &&
-          normalizeAmountCents(candidate.amountCents) === amountCents &&
+          duplicateAmountForImportRow(row.importBatch.type, candidate.amountCents) === signedAmountCents &&
           normalizeText(candidate.description) !== description,
       )
       .map((candidate) => ({
         id: candidate.id,
         description: candidate.description as string,
         applicationDate: toDateKey(candidate.date as Date),
-        amountCents: normalizeAmountCents(candidate.amountCents as number),
+        amountCents: duplicateAmountForImportRow(row.importBatch.type, candidate.amountCents as number),
         source: 'Prévia atual',
       }));
 
@@ -515,4 +518,15 @@ function resolveImportReviewReason(status: ImportRowStatus, description: string 
 function isCreditCardAdjustment(description?: string | null): boolean {
   const text = normalizeText(description ?? '');
   return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
+}
+
+function duplicateAmountForImportRow(importType: ImportType, amountCents: number): number {
+  const signedAmountCents = Math.round(amountCents);
+  if (importType === 'nubank_credit_card') return -normalizeAmountCents(signedAmountCents);
+  return signedAmountCents;
+}
+
+function signedTransactionAmountCents(transaction: { amountCents: number; type: TransactionType }): number {
+  const amountCents = normalizeAmountCents(transaction.amountCents);
+  return transaction.type === 'income' ? amountCents : -amountCents;
 }

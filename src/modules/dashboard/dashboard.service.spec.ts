@@ -178,6 +178,7 @@ describe('DashboardService', () => {
             description: 'Compra existente',
             applicationDate: new Date('2026-08-02T00:00:00.000Z'),
             amountCents: 1990,
+            type: 'expense',
             account: { name: 'Nubank Cartão' },
           },
         ]),
@@ -191,7 +192,7 @@ describe('DashboardService', () => {
     ).resolveImportDuplicateCandidates({
       id: 'preview-row-2',
       importBatchId: 'batch-1',
-      importBatch: { memberProfileId: 'profile-1' },
+      importBatch: { memberProfileId: 'profile-1', type: 'nubank_credit_card' },
       status: 'duplicate',
       falseDuplicate: true,
       date: new Date('2026-08-02T00:00:00.000Z'),
@@ -204,14 +205,14 @@ describe('DashboardService', () => {
       expect.objectContaining({
         description: 'Compra existente',
         applicationDate: '2026-08-02',
-        amountCents: 1990,
+        amountCents: -1990,
         source: 'Sistema',
         accountName: 'Nubank Cartão',
       }),
       expect.objectContaining({
         description: 'Compra parecida',
         applicationDate: '2026-08-02',
-        amountCents: 1990,
+        amountCents: -1990,
         source: 'Prévia atual',
       }),
     ]);

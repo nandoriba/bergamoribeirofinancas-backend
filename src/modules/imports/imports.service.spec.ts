@@ -34,7 +34,7 @@ describe('ImportsService', () => {
         expect.objectContaining({
           description: 'Mercado',
           applicationDate: '2026-06-08',
-          amountCents: 10000,
+          amountCents: -10000,
           source: 'Prévia atual',
         }),
       ],
@@ -59,6 +59,24 @@ describe('ImportsService', () => {
     expect(preview.rows[0]).toMatchObject({ status: 'new' });
     expect(preview.rows[1]).toMatchObject({ status: 'duplicate' });
     expect(preview.rows[1]).not.toHaveProperty('falseDuplicate');
+  });
+
+  it('does not flag opposite signed amounts as duplicates', async () => {
+    const service = new ImportsService(buildPreviewPrismaMock() as never, new ImportParserService(), {} as never);
+
+    const preview = await service.preview(user, {
+      originalname: 'NU_123.csv',
+      buffer: Buffer.from(
+        [
+          'Data,Valor,Identificador,Descrição',
+          '03/04/2026,"-106,97",id-1,Compra no débito via NuPay - iFood',
+          '03/04/2026,"106,97",id-2,Estorno - Compra no débito via NuPay - iFood',
+        ].join('\n'),
+      ),
+    });
+
+    expect(preview.rows[0]).toMatchObject({ status: 'new' });
+    expect(preview.rows[1]).toMatchObject({ status: 'new', duplicateCandidates: [] });
   });
 
   it('blocks confirming possible duplicates without an explicit decision', async () => {
