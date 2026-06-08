@@ -1,9 +1,13 @@
 import { RecurrenceType, TransactionStatus, TransactionType } from '@prisma/client';
-import { IsDateString, IsEnum, IsInt, IsOptional, IsString, IsUUID } from 'class-validator';
+import { IsDateString, IsEnum, IsInt, IsOptional, IsString, IsUUID, Min } from 'class-validator';
 
 export class CreateTransactionDto {
   @IsDateString()
   date!: string;
+
+  @IsOptional()
+  @IsDateString()
+  referenceMonth?: string;
 
   @IsString()
   description!: string;
@@ -45,5 +49,9 @@ export class CreateTransactionDto {
   @IsOptional()
   @IsUUID()
   invoiceId?: string;
-}
 
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  installmentNumber?: number;
+}

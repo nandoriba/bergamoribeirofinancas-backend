@@ -211,6 +211,7 @@ model Category {
 model Transaction {
   id                  String            @id @default(uuid())
   date                DateTime
+  referenceMonth      DateTime
   description         String
   amountCents         Int
   type                TransactionType
@@ -232,13 +233,18 @@ model Transaction {
   recurringTemplate   RecurringTemplate? @relation(fields: [recurringTemplateId], references: [id])
   installmentPlanId   String?
   installmentPlan     InstallmentPlan?  @relation(fields: [installmentPlanId], references: [id])
+  installmentNumber   Int?
+  linkedToPlanAt      DateTime?
+  linkedToPlanByUserId String?
   importRowId         String?           @unique
   importRow           ImportRow?        @relation(fields: [importRowId], references: [id])
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
   @@unique([memberProfileId, externalId])
+  @@unique([installmentPlanId, installmentNumber])
   @@index([memberProfileId, date])
+  @@index([memberProfileId, referenceMonth])
 }
 
 model Invoice {
@@ -283,6 +289,8 @@ model InstallmentPlan {
   description     String
   totalInstallments Int
   paidInstallments  Int          @default(0)
+  firstInstallmentNumber Int      @default(1)
+  firstReferenceMonth DateTime
   monthlyAmountCents Int
   totalAmountCents Int
   startsAt        DateTime

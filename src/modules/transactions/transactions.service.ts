@@ -15,7 +15,7 @@ export class TransactionsService {
     const reference = parseMonth(query.month);
     const where: Prisma.TransactionWhereInput = {
       memberProfile: { familyId: user.familyId },
-      date: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
+      referenceMonth: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
     };
 
     if (query.profileId) {
@@ -27,6 +27,8 @@ export class TransactionsService {
       include: {
         account: true,
         category: true,
+        invoice: true,
+        installmentPlan: true,
         memberProfile: { select: { id: true, displayName: true } },
       },
       orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
@@ -38,6 +40,7 @@ export class TransactionsService {
     return this.prisma.transaction.create({
       data: {
         date: new Date(dto.date),
+        referenceMonth: startOfMonth(new Date(dto.referenceMonth ?? dto.date)),
         description: dto.description,
         amountCents: dto.amountCents,
         type: dto.type,
@@ -49,9 +52,16 @@ export class TransactionsService {
         accountId: dto.accountId,
         categoryId: dto.categoryId,
         invoiceId: dto.invoiceId,
+        installmentNumber: dto.installmentNumber,
         memberProfileId: user.profileId,
       },
-      include: { account: true, category: true },
+      include: {
+        account: true,
+        category: true,
+        invoice: true,
+        installmentPlan: true,
+        memberProfile: { select: { id: true, displayName: true } },
+      },
     });
   }
 
@@ -63,8 +73,15 @@ export class TransactionsService {
       data: {
         ...dto,
         date: dto.date ? new Date(dto.date) : undefined,
+        referenceMonth: dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined,
       },
-      include: { account: true, category: true },
+      include: {
+        account: true,
+        category: true,
+        invoice: true,
+        installmentPlan: true,
+        memberProfile: { select: { id: true, displayName: true } },
+      },
     });
   }
 
@@ -91,7 +108,7 @@ export class TransactionsService {
   ) {
     if (accountId) {
       const account = await this.prisma.account.findFirst({
-        where: { id: accountId, memberProfile: { familyId: user.familyId } },
+        where: { id: accountId, memberProfileId: user.profileId },
       });
       if (!account) throw new BadRequestException('Conta inválida');
     }
@@ -105,10 +122,12 @@ export class TransactionsService {
 
     if (invoiceId) {
       const invoice = await this.prisma.invoice.findFirst({
-        where: { id: invoiceId, memberProfile: { familyId: user.familyId } },
+        where: { id: invoiceId, memberProfileId: user.profileId },
       });
       if (!invoice) throw new BadRequestException('Fatura inválida');
+      if (accountId && invoice.accountId !== accountId) {
+        throw new BadRequestException('Fatura não pertence à conta selecionada');
+      }
     }
   }
 }
-

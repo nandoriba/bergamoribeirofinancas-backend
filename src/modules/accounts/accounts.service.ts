@@ -12,6 +12,7 @@ export class AccountsService {
   list(user: AuthenticatedUser) {
     return this.prisma.account.findMany({
       where: { memberProfile: { familyId: user.familyId } },
+      include: { memberProfile: { select: { id: true, displayName: true } } },
       orderBy: [{ type: 'asc' }, { name: 'asc' }],
     });
   }
@@ -46,4 +47,3 @@ export class AccountsService {
     return account;
   }
 }
-

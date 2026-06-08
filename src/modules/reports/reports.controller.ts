@@ -14,8 +14,10 @@ export class ReportsController {
   monthly(
     @CurrentUser() user: AuthenticatedUser,
     @Query('month') month?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
     @Query('family') family?: string,
   ) {
-    return this.reportsService.monthly(user, { month, family: family !== 'false' });
+    return this.reportsService.monthly(user, { month, from, to, family: family !== 'false' });
   }
 }

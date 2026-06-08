@@ -23,6 +23,7 @@ import {
   normalizeAmountCents,
 } from '../../shared/finance-calculator';
 import type { AuthenticatedUser } from '../auth/auth.types';
+import { RecurringService } from '../recurring/recurring.service';
 
 const SHORT_MONTHS = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
 const CATEGORY_COLORS = ['#3d6cb0', '#5c89c4', '#7aa5d4', '#9abfe2', '#b8d3ec', '#3a4a66'];
@@ -45,13 +46,18 @@ interface DashboardQuery {
 
 @Injectable()
 export class DashboardService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly recurringService: RecurringService,
+  ) {}
 
   async getDashboard(user: AuthenticatedUser, query: DashboardQuery) {
     const reference = parseMonth(query.month);
     const monthStart = startOfMonth(reference);
     const monthEnd = endOfMonth(reference);
     const profileIds = await this.resolveProfileIds(user, query);
+
+    await this.recurringService.materializeForProfiles(profileIds, reference);
 
     const [openingBalanceCents, monthTransactions, previousMonthTransactions, importRows, installments, invoices, recurring] =
       await Promise.all([
@@ -165,10 +171,10 @@ export class DashboardService {
     return this.prisma.transaction.findMany({
       where: {
         memberProfileId: { in: profileIds },
-        date: { gte: start, lte: end },
+        referenceMonth: { gte: start, lte: end },
       },
       include: transactionInclude,
-      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ referenceMonth: 'desc' }, { date: 'desc' }, { createdAt: 'desc' }],
     });
   }
 
@@ -184,7 +190,7 @@ export class DashboardService {
       this.prisma.transaction.findMany({
         where: {
           memberProfileId: { in: profileIds },
-          date: { lt: monthStart },
+          referenceMonth: { lt: monthStart },
           status: 'confirmed',
         },
       }),
@@ -246,8 +252,8 @@ export class DashboardService {
     const start = startOfMonth(firstMonth);
     const end = endOfMonth(reference);
     const transactions = await this.prisma.transaction.findMany({
-      where: { memberProfileId: { in: profileIds }, date: { gte: start, lte: end } },
-      orderBy: { date: 'asc' },
+      where: { memberProfileId: { in: profileIds }, referenceMonth: { gte: start, lte: end } },
+      orderBy: { referenceMonth: 'asc' },
     });
 
     let runningBalance = await this.getOpeningBalanceCents(profileIds, start);
@@ -255,7 +261,7 @@ export class DashboardService {
     for (let index = 0; index < 12; index += 1) {
       const month = addMonths(firstMonth, index);
       const key = monthKey(month);
-      const monthTransactions = transactions.filter((transaction) => monthKey(transaction.date) === key);
+      const monthTransactions = transactions.filter((transaction) => monthKey(transaction.referenceMonth) === key);
       runningBalance += netCents(monthTransactions);
       points.push({ m: SHORT_MONTHS[month.getUTCMonth()], v: runningBalance });
     }

@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { endOfMonth, monthKey, parseMonth, startOfMonth } from '../../shared/date-range';
+import { addMonths, endOfMonth, monthKey, parseMonth, startOfMonth } from '../../shared/date-range';
 import { expenseCents, incomeCents, netCents, normalizeAmountCents } from '../../shared/finance-calculator';
 import type { AuthenticatedUser } from '../auth/auth.types';
 
@@ -9,20 +9,38 @@ import type { AuthenticatedUser } from '../auth/auth.types';
 export class ReportsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async monthly(user: AuthenticatedUser, query: { month?: string; family: boolean }) {
-    const reference = parseMonth(query.month);
+  async monthly(user: AuthenticatedUser, query: { month?: string; from?: string; to?: string; family: boolean }) {
     const profileIds = await this.getProfileIds(user, query.family);
+    if (query.from || query.to) {
+      const from = parseMonth(query.from ?? query.month);
+      const to = parseMonth(query.to ?? query.from ?? query.month);
+      const months = [];
+      for (let cursor = from; cursor <= to; cursor = addMonths(cursor, 1)) {
+        months.push(await this.buildMonthlyReport(cursor, profileIds));
+      }
+      return {
+        from: monthKey(from),
+        to: monthKey(to),
+        months,
+      };
+    }
+
+    const reference = parseMonth(query.month);
+    return this.buildMonthlyReport(reference, profileIds);
+  }
+
+  private async buildMonthlyReport(reference: Date, profileIds: string[]) {
     const transactions = await this.prisma.transaction.findMany({
       where: {
         memberProfileId: { in: profileIds },
-        date: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
+        referenceMonth: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
       },
       include: {
         account: true,
         category: true,
         memberProfile: { select: { id: true, displayName: true } },
       },
-      orderBy: [{ date: 'asc' }],
+      orderBy: [{ referenceMonth: 'asc' }, { date: 'asc' }],
     });
 
     const profiles = new Map<string, { id: string; name: string; incomeCents: number; expenseCents: number; netCents: number }>();

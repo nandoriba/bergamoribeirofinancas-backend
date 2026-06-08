@@ -2,8 +2,10 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { ImportRowStatus, Prisma, TransactionType } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
+import { startOfMonth } from '../../shared/date-range';
 import { normalizeAmountCents } from '../../shared/finance-calculator';
 import type { AuthenticatedUser } from '../auth/auth.types';
+import { InstallmentsService } from '../installments/installments.service';
 import { ConfirmImportDto } from './dto/confirm-import.dto';
 import { ImportParserService, type ParsedImportRow } from './import-parser.service';
 
@@ -17,6 +19,7 @@ export class ImportsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly parser: ImportParserService,
+    private readonly installmentsService: InstallmentsService,
   ) {}
 
   listBatches(user: AuthenticatedUser) {
@@ -89,12 +92,60 @@ export class ImportsService {
 
     const categories = await this.prisma.category.findMany({ where: { familyId: user.familyId } });
     const categoryByName = new Map(categories.map((category) => [`${category.type}:${category.name}`, category.id]));
+    const account = dto.accountId
+      ? await this.prisma.account.findFirst({ where: { id: dto.accountId, memberProfileId: user.profileId } })
+      : null;
+    if (dto.accountId && !account) throw new BadRequestException('Conta inválida');
 
     const created = [];
+    const bookkeepingDate = new Date();
     for (const row of importableRows) {
       const signedAmount = row.amountCents ?? 0;
       const type: TransactionType = signedAmount >= 0 ? 'income' : 'expense';
       const categoryId = row.suggestedCategory ? categoryByName.get(`${type}:${row.suggestedCategory}`) : undefined;
+      const installment = readInstallment(row.raw);
+
+      if (installment && account?.type === 'credit_card' && type === 'expense' && row.date) {
+        const baseDescription = stripInstallment(row.description ?? 'Importado');
+        const referenceMonth = startOfMonth(row.date);
+        const existingProjected = await this.prisma.transaction.findFirst({
+          where: {
+            memberProfileId: user.profileId,
+            accountId: account.id,
+            referenceMonth,
+            amountCents: normalizeAmountCents(signedAmount),
+            installmentNumber: installment.current,
+            description: { contains: baseDescription, mode: 'insensitive' },
+          },
+        });
+
+        if (existingProjected) {
+          await this.prisma.importRow.update({ where: { id: row.id }, data: { status: ImportRowStatus.duplicate } });
+          continue;
+        }
+
+        const plan = await this.installmentsService.create(user, {
+          description: baseDescription,
+          totalInstallments: installment.total,
+          firstInstallmentNumber: installment.current,
+          monthlyAmountCents: normalizeAmountCents(signedAmount),
+          totalAmountCents: normalizeAmountCents(signedAmount) * installment.total,
+          startsAt: bookkeepingDate.toISOString(),
+          firstReferenceMonth: referenceMonth.toISOString(),
+          accountId: account.id,
+          categoryId,
+          confirmExistingLinks: true,
+        });
+
+        await this.prisma.importRow.update({ where: { id: row.id }, data: { status: ImportRowStatus.imported } });
+        created.push(plan);
+        continue;
+      }
+
+      const invoiceId =
+        account?.type === 'credit_card' && row.date
+          ? await this.findOrCreateInvoice(account.id, user.profileId, startOfMonth(row.date))
+          : undefined;
 
       const transaction = await this.prisma.transaction.upsert({
         where: {
@@ -105,7 +156,8 @@ export class ImportsService {
         },
         update: {},
         create: {
-          date: row.date as Date,
+          date: bookkeepingDate,
+          referenceMonth: startOfMonth(row.date as Date),
           description: row.description ?? 'Importado',
           amountCents: normalizeAmountCents(signedAmount),
           type,
@@ -113,6 +165,8 @@ export class ImportsService {
           recurrenceType: 'none',
           source: batch.type,
           externalId: row.externalId ?? row.id,
+          accountId: account?.id,
+          invoiceId,
           categoryId,
           memberProfileId: user.profileId,
           importRowId: row.id,
@@ -136,6 +190,25 @@ export class ImportsService {
       imported: created.length,
       ignored: batch.rows.length - created.length,
     };
+  }
+
+  private async findOrCreateInvoice(accountId: string, memberProfileId: string, referenceMonth: Date) {
+    const invoice = await this.prisma.invoice.upsert({
+      where: {
+        accountId_referenceMonth: {
+          accountId,
+          referenceMonth,
+        },
+      },
+      update: {},
+      create: {
+        accountId,
+        memberProfileId,
+        referenceMonth,
+        status: 'open',
+      },
+    });
+    return invoice.id;
   }
 
   private async findExistingExternalIds(memberProfileId: string, externalIds: string[]) {
@@ -189,4 +262,21 @@ export class ImportsService {
       status: row.status,
     };
   }
+}
+
+function readInstallment(raw: Prisma.JsonValue): { current: number; total: number } | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !('installment' in raw)) return null;
+  const value = String((raw as { installment?: unknown }).installment ?? '');
+  const match = /^(\d{1,2})\/(\d{1,2})$/.exec(value);
+  if (!match) return null;
+  const current = Number(match[1]);
+  const total = Number(match[2]);
+  return current > 0 && total >= current ? { current, total } : null;
+}
+
+function stripInstallment(description: string) {
+  return description
+    .replace(/(?:parcela\s*)?\d{1,2}\s*\/\s*\d{1,2}/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }

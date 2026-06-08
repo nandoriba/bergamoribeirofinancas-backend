@@ -1,4 +1,4 @@
-import { IsDateString, IsInt, IsString, Min } from 'class-validator';
+import { IsBoolean, IsDateString, IsInt, IsOptional, IsString, IsUUID, Min } from 'class-validator';
 
 export class CreateInstallmentDto {
   @IsString()
@@ -7,6 +7,10 @@ export class CreateInstallmentDto {
   @IsInt()
   @Min(1)
   totalInstallments!: number;
+
+  @IsInt()
+  @Min(1)
+  firstInstallmentNumber: number = 1;
 
   @IsInt()
   @Min(0)
@@ -20,5 +24,23 @@ export class CreateInstallmentDto {
 
   @IsDateString()
   startsAt!: string;
-}
 
+  @IsDateString()
+  firstReferenceMonth!: string;
+
+  @IsOptional()
+  @IsUUID()
+  accountId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  categoryId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  invoiceId?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  confirmExistingLinks?: boolean;
+}

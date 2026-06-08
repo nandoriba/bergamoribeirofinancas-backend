@@ -9,10 +9,35 @@ import { UpdateInvoiceDto } from './dto/update-invoice.dto';
 export class InvoicesService {
   constructor(private readonly prisma: PrismaService) {}
 
+  private readonly invoiceInclude = {
+    account: { include: { memberProfile: { select: { id: true, displayName: true } } } },
+    transactions: {
+      include: {
+        category: true,
+        memberProfile: { select: { id: true, displayName: true } },
+        installmentPlan: {
+          include: {
+            transactions: {
+              include: {
+                invoice: {
+                  include: {
+                    account: true,
+                  },
+                },
+              },
+              orderBy: [{ referenceMonth: 'asc' as const }, { installmentNumber: 'asc' as const }],
+            },
+          },
+        },
+      },
+      orderBy: [{ referenceMonth: 'asc' as const }, { date: 'asc' as const }],
+    },
+  };
+
   list(user: AuthenticatedUser) {
     return this.prisma.invoice.findMany({
       where: { memberProfile: { familyId: user.familyId } },
-      include: { account: true },
+      include: this.invoiceInclude,
       orderBy: { referenceMonth: 'desc' },
     });
   }
@@ -33,11 +58,18 @@ export class InvoicesService {
         accountId: dto.accountId,
         memberProfileId: user.profileId,
       },
+      include: this.invoiceInclude,
     });
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateInvoiceDto) {
     await this.ensureInvoice(user, id);
+    if (dto.accountId) {
+      const account = await this.prisma.account.findFirst({
+        where: { id: dto.accountId, memberProfileId: user.profileId, type: 'credit_card' },
+      });
+      if (!account) throw new BadRequestException('Cartão inválido');
+    }
     return this.prisma.invoice.update({
       where: { id },
       data: {
@@ -46,6 +78,7 @@ export class InvoicesService {
         dueDate: dto.dueDate ? new Date(dto.dueDate) : undefined,
         closingDate: dto.closingDate ? new Date(dto.closingDate) : undefined,
       },
+      include: this.invoiceInclude,
     });
   }
 
@@ -62,4 +95,3 @@ export class InvoicesService {
     return invoice;
   }
 }
-

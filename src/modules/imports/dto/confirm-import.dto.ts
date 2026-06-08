@@ -8,4 +8,8 @@ export class ConfirmImportDto {
   @IsArray()
   @IsUUID('4', { each: true })
   rowIds?: string[];
+
+  @IsOptional()
+  @IsUUID()
+  accountId?: string;
 }

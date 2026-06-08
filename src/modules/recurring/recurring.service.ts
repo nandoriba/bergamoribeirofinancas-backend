@@ -1,7 +1,7 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { parseMonth } from '../../shared/date-range';
+import { endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateRecurringDto } from './dto/create-recurring.dto';
 import { UpdateRecurringDto } from './dto/update-recurring.dto';
@@ -13,12 +13,16 @@ export class RecurringService {
   list(user: AuthenticatedUser) {
     return this.prisma.recurringTemplate.findMany({
       where: { memberProfile: { familyId: user.familyId } },
-      include: { category: true },
+      include: {
+        category: true,
+        memberProfile: { select: { id: true, displayName: true } },
+      },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  create(user: AuthenticatedUser, dto: CreateRecurringDto) {
+  async create(user: AuthenticatedUser, dto: CreateRecurringDto) {
+    await this.validateRelations(user, dto.accountId, dto.categoryId);
     return this.prisma.recurringTemplate.create({
       data: {
         description: dto.description,
@@ -32,17 +36,26 @@ export class RecurringService {
         categoryId: dto.categoryId,
         memberProfileId: user.profileId,
       },
+      include: {
+        category: true,
+        memberProfile: { select: { id: true, displayName: true } },
+      },
     });
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateRecurringDto) {
     await this.ensure(user, id);
+    await this.validateRelations(user, dto.accountId, dto.categoryId);
     return this.prisma.recurringTemplate.update({
       where: { id },
       data: {
         ...dto,
         startsAt: dto.startsAt ? new Date(dto.startsAt) : undefined,
         endsAt: dto.endsAt ? new Date(dto.endsAt) : undefined,
+      },
+      include: {
+        category: true,
+        memberProfile: { select: { id: true, displayName: true } },
       },
     });
   }
@@ -54,45 +67,55 @@ export class RecurringService {
 
   async generateForMonth(user: AuthenticatedUser, month?: string) {
     const reference = parseMonth(month);
+    const transactions = await this.materializeForProfiles([user.profileId], reference);
+    return { generated: transactions.length, transactions };
+  }
+
+  async materializeForProfiles(profileIds: string[], reference: Date) {
+    const monthStart = startOfMonth(reference);
+    const monthEnd = endOfMonth(reference);
     const templates = await this.prisma.recurringTemplate.findMany({
       where: {
-        memberProfileId: user.profileId,
+        memberProfileId: { in: profileIds },
         status: 'active',
-        startsAt: { lte: reference },
-        OR: [{ endsAt: null }, { endsAt: { gte: reference } }],
+        startsAt: { lte: monthEnd },
+        OR: [{ endsAt: null }, { endsAt: { gte: monthStart } }],
       },
     });
 
     const created = [];
+    const bookkeepingDate = new Date();
+    const currentMonth = startOfMonth(bookkeepingDate);
     for (const template of templates) {
-      const date = new Date(Date.UTC(reference.getUTCFullYear(), reference.getUTCMonth(), template.dayOfMonth));
-      const externalId = `recurring:${template.id}:${reference.toISOString().slice(0, 7)}`;
+      const externalId = `recurring:${template.id}:${monthStart.toISOString().slice(0, 7)}`;
       const transaction = await this.prisma.transaction.upsert({
         where: {
           memberProfileId_externalId: {
-            memberProfileId: user.profileId,
+            memberProfileId: template.memberProfileId,
             externalId,
           },
         },
         update: {},
         create: {
-          date,
+          date: bookkeepingDate,
+          referenceMonth: monthStart,
           description: template.description,
           amountCents: template.amountCents,
           type: template.type,
+          status: monthStart > currentMonth ? 'pending' : 'confirmed',
           recurrenceType: 'monthly',
           externalId,
           source: 'recurring',
           accountId: template.accountId,
           categoryId: template.categoryId,
-          memberProfileId: user.profileId,
+          memberProfileId: template.memberProfileId,
           recurringTemplateId: template.id,
         },
       });
       created.push(transaction);
     }
 
-    return { generated: created.length, transactions: created };
+    return created;
   }
 
   private async ensure(user: AuthenticatedUser, id: string) {
@@ -102,5 +125,20 @@ export class RecurringService {
     if (!template) throw new NotFoundException('Recorrente não encontrado');
     return template;
   }
-}
 
+  private async validateRelations(user: AuthenticatedUser, accountId?: string, categoryId?: string) {
+    if (accountId) {
+      const account = await this.prisma.account.findFirst({
+        where: { id: accountId, memberProfileId: user.profileId },
+      });
+      if (!account) throw new BadRequestException('Conta inválida');
+    }
+
+    if (categoryId) {
+      const category = await this.prisma.category.findFirst({
+        where: { id: categoryId, familyId: user.familyId },
+      });
+      if (!category) throw new BadRequestException('Categoria inválida');
+    }
+  }
+}
