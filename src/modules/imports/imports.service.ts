@@ -7,6 +7,7 @@ import { normalizeAmountCents } from '../../shared/finance-calculator';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { InstallmentsService } from '../installments/installments.service';
 import { ConfirmImportDto } from './dto/confirm-import.dto';
+import { DiscardImportDto } from './dto/discard-import.dto';
 import { ImportParserService, type ParsedImportRow } from './import-parser.service';
 
 export interface UploadedCsvFile {
@@ -189,6 +190,30 @@ export class ImportsService {
       batchId: batch.id,
       imported: created.length,
       ignored: batch.rows.length - created.length,
+    };
+  }
+
+  async discard(user: AuthenticatedUser, dto: DiscardImportDto) {
+    const batch = await this.prisma.importBatch.findFirst({
+      where: { id: dto.batchId, memberProfile: { familyId: user.familyId }, status: 'preview' },
+      include: { rows: { select: { id: true } } },
+    });
+    if (!batch) throw new NotFoundException('Prévia de importação não encontrada');
+
+    await this.prisma.$transaction([
+      this.prisma.importRow.updateMany({
+        where: { importBatchId: batch.id },
+        data: { status: ImportRowStatus.ignored },
+      }),
+      this.prisma.importBatch.update({
+        where: { id: batch.id },
+        data: { status: 'discarded' },
+      }),
+    ]);
+
+    return {
+      batchId: batch.id,
+      discarded: batch.rows.length,
     };
   }
 

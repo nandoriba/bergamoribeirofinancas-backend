@@ -73,6 +73,7 @@ enum InvoiceStatus {
 enum ImportBatchStatus {
   preview
   confirmed
+  discarded
   failed
 }
 

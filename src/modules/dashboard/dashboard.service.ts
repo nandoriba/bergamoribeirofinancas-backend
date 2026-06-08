@@ -136,6 +136,7 @@ export class DashboardService {
       transactions: monthTransactions.slice(0, 12).map((transaction) => this.mapTransaction(transaction)),
       importPreview: importRows.map((row) => ({
         id: row.id,
+        batchId: row.importBatch.id,
         date: row.date ? this.formatShortDate(row.date) : '-',
         description: row.description ?? 'Linha sem descrição',
         source: row.importBatch.type,
