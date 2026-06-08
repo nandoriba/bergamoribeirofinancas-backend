@@ -14,9 +14,8 @@ import {
 } from '../../shared/date-range';
 import {
   accountBalanceCents,
-  accountCreditCents,
   creditCardExpenseCents,
-  cumulativeAccountDailyBalances,
+  cumulativeDailyBalances,
   dailyCreditCardSeries,
   dailyExpenseSeries,
   expenseCents,
@@ -29,6 +28,11 @@ import { RecurringService } from '../recurring/recurring.service';
 const SHORT_MONTHS = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
 const CATEGORY_COLORS = ['#3d6cb0', '#5c89c4', '#7aa5d4', '#9abfe2', '#b8d3ec', '#3a4a66'];
 const CREDIT_CARD_CATEGORY = { name: 'Cartão', color: '#d99090' };
+const BALANCE_COMPOSITION_COLORS = {
+  balance: '#64b88f',
+  expense: '#7aa5d4',
+  card: '#d99090',
+};
 
 const transactionInclude = {
   account: true,
@@ -115,8 +119,8 @@ export class DashboardService {
       (transaction) => !isInvoicePaymentTransaction(transaction),
     );
     const numberOfDays = daysInMonth(reference);
-    const saldoDiarioAtual = cumulativeAccountDailyBalances(0, currentTransactions, numberOfDays);
-    const saldoDiarioProjetado = cumulativeAccountDailyBalances(0, monthTransactions, numberOfDays);
+    const saldoDiarioAtual = cumulativeDailyBalances(0, currentSpendingTransactions, numberOfDays);
+    const saldoDiarioProjetado = cumulativeDailyBalances(0, monthSpendingTransactions, numberOfDays);
     const despesaDiariaAtualSpark = dailyExpenseSeries(currentSpendingTransactions, numberOfDays);
     const despesaDiariaProjetadaSpark = dailyExpenseSeries(monthSpendingTransactions, numberOfDays);
     const cartaoDiariaAtualSpark = dailyCreditCardSeries(currentTransactions, numberOfDays);
@@ -125,23 +129,48 @@ export class DashboardService {
     const categoryTotals = this.groupExpenseCategories(monthSpendingTransactions);
     const confirmedInstallments = this.summarizeCreditCardInstallments(currentTransactions);
     const projectedInstallments = this.summarizeCreditCardInstallments(monthTransactions);
+    const saldoAtualTotal = incomeCents(currentTransactions);
+    const saldoProjetadoTotal = incomeCents(monthTransactions);
+    const despesaAtual = expenseCents(currentSpendingTransactions);
+    const cartaoAtual = creditCardExpenseCents(currentTransactions);
+    const cartaoFuturo = creditCardExpenseCents(monthTransactions);
+    const saldoComposicaoConfirmada = buildBalanceComposition({
+      title: 'Composição confirmada',
+      totalLabel: 'CONFIRMADO',
+      balanceLabel: 'Saldo total confirmado sem despesa',
+      expenseLabel: 'Despesa confirmada',
+      cardLabel: 'Cartão confirmado',
+      balanceCents: saldoAtualTotal,
+      expenseCents: Math.max(despesaAtual - cartaoAtual, 0),
+      cardCents: cartaoAtual,
+    });
+    const saldoComposicaoProjetada = buildBalanceComposition({
+      title: 'Composição projetada',
+      totalLabel: 'PROJETADO',
+      balanceLabel: 'Saldo projetado total',
+      expenseLabel: 'Despesa projetada',
+      cardLabel: 'Cartão projetado',
+      balanceCents: saldoProjetadoTotal,
+      expenseCents: Math.max(despesaFuturo - cartaoFuturo, 0),
+      cardCents: cartaoFuturo,
+    });
     const importPreview = await this.mapImportPreviewRows(importRows);
 
     return {
       monthRef: monthKey(reference),
       monthShort: this.formatMonth(reference),
       today: this.formatShortDate(today),
-      saldoAtual: accountBalanceCents(currentTransactions),
-      saldoFuturo: accountBalanceCents(monthTransactions),
-      saldoAtualTotal: accountCreditCents(currentTransactions),
-      saldoProjetadoTotal: accountCreditCents(monthTransactions),
+      saldoAtual: saldoAtualTotal - despesaAtual,
+      saldoFuturo: saldoProjetadoTotal - despesaFuturo,
+      saldoAtualTotal,
+      saldoProjetadoTotal,
       saldoAnt: 0,
       saldoMaxMes: Math.max(0, ...saldoDiarioProjetado),
-      despesaAtual: expenseCents(currentSpendingTransactions),
+      despesaAtual,
       despesaFuturo,
       despesaAntMes: expenseCents(previousMonthSpendingTransactions),
-      cartaoAtual: creditCardExpenseCents(currentTransactions),
-      cartaoFuturo: creditCardExpenseCents(monthTransactions),
+      cartaoAtual,
+      cartaoFuturo,
       cartaoAntMes: creditCardExpenseCents(previousMonthTransactions),
       receitaPrevista: incomeCents(monthTransactions),
       parcelasConfirmadasQuantidade: confirmedInstallments.count,
@@ -170,6 +199,8 @@ export class DashboardService {
       cartaoDiariaProjetadaSpark,
       donutSlices: categoryTotals.donutSlices,
       despesaTotalMes: despesaFuturo,
+      saldoComposicaoConfirmada,
+      saldoComposicaoProjetada,
       transactions: monthTransactions.slice(0, 12).map((transaction) => this.mapTransaction(transaction)),
       importPreview,
     };
@@ -551,6 +582,34 @@ function expenseCategoryForDashboard(
   return {
     name: transaction.category?.name ?? 'Sem categoria',
     color: transaction.category?.color,
+  };
+}
+
+function buildBalanceComposition(input: {
+  title: string;
+  totalLabel: string;
+  balanceLabel: string;
+  expenseLabel: string;
+  cardLabel: string;
+  balanceCents: number;
+  expenseCents: number;
+  cardCents: number;
+}) {
+  const slices = [
+    { name: input.balanceLabel, value: normalizeAmountCents(input.balanceCents), color: BALANCE_COMPOSITION_COLORS.balance },
+    { name: input.expenseLabel, value: normalizeAmountCents(input.expenseCents), color: BALANCE_COMPOSITION_COLORS.expense },
+    { name: input.cardLabel, value: normalizeAmountCents(input.cardCents), color: BALANCE_COMPOSITION_COLORS.card },
+  ];
+  const totalValue = slices.reduce((total, slice) => total + slice.value, 0);
+
+  return {
+    title: input.title,
+    totalLabel: input.totalLabel,
+    totalValue,
+    slices: slices.map((slice) => ({
+      ...slice,
+      pct: totalValue > 0 ? slice.value / totalValue : 0,
+    })),
   };
 }
 

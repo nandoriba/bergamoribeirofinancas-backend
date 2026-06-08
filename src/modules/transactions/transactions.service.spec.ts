@@ -165,6 +165,49 @@ describe('TransactionsService', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it('maps operational categories for credit card purchases and invoice payments', async () => {
+    const findMany = vi.fn().mockResolvedValue([
+      {
+        id: 'card-transaction',
+        type: 'expense',
+        description: 'Compra no cartão',
+        isInvoicePayment: false,
+        account: { type: 'credit_card' },
+        category: { id: 'category-outros', name: 'Outros', color: '#3d6cb0' },
+      },
+      {
+        id: 'invoice-payment',
+        type: 'expense',
+        description: 'Pagamento de fatura',
+        isInvoicePayment: false,
+        account: null,
+        category: { id: 'category-card', name: 'Cartão', color: '#d99090' },
+      },
+    ]);
+    const service = new TransactionsService({ transaction: { findMany } } as never);
+
+    const transactions = await service.list(user, { referenceMonth: '2026-06' });
+
+    expect(transactions).toEqual([
+      expect.objectContaining({
+        id: 'card-transaction',
+        operationalCategory: {
+          key: 'system:credit_card',
+          name: 'Cartão',
+          color: '#d99090',
+        },
+      }),
+      expect.objectContaining({
+        id: 'invoice-payment',
+        operationalCategory: {
+          key: 'system:invoice_payment',
+          name: 'Pagamento de fatura',
+          color: '#d99090',
+        },
+      }),
+    ]);
+  });
+
   it('blocks updates outside the logged profile', async () => {
     const update = vi.fn();
     const service = new TransactionsService({

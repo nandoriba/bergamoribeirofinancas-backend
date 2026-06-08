@@ -7,11 +7,21 @@ import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
 
+const transactionInclude = {
+  account: true,
+  category: true,
+  invoice: true,
+  installmentPlan: true,
+  memberProfile: { select: { id: true, displayName: true } },
+} satisfies Prisma.TransactionInclude;
+
+type TransactionWithRelations = Prisma.TransactionGetPayload<{ include: typeof transactionInclude }>;
+
 @Injectable()
 export class TransactionsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  list(user: AuthenticatedUser, query: { referenceMonth?: string; profileId?: string }) {
+  async list(user: AuthenticatedUser, query: { referenceMonth?: string; profileId?: string }) {
     const reference = parseMonth(query.referenceMonth);
     const where: Prisma.TransactionWhereInput = {
       memberProfile: { familyId: user.familyId },
@@ -22,24 +32,19 @@ export class TransactionsService {
       where.memberProfileId = query.profileId;
     }
 
-    return this.prisma.transaction.findMany({
+    const transactions = await this.prisma.transaction.findMany({
       where,
-      include: {
-        account: true,
-        category: true,
-        invoice: true,
-        installmentPlan: true,
-        memberProfile: { select: { id: true, displayName: true } },
-      },
+      include: transactionInclude,
       orderBy: [{ applicationDate: 'desc' }, { createdAt: 'desc' }],
     });
+    return transactions.map(mapTransactionResponse);
   }
 
   async create(user: AuthenticatedUser, dto: CreateTransactionDto) {
     await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
     const applicationDate = new Date(dto.applicationDate);
     await this.validateDuplicate(user, dto, applicationDate);
-    return this.prisma.transaction.create({
+    const transaction = await this.prisma.transaction.create({
       data: {
         date: new Date(),
         applicationDate,
@@ -58,14 +63,9 @@ export class TransactionsService {
         installmentNumber: dto.installmentNumber,
         memberProfileId: user.profileId,
       },
-      include: {
-        account: true,
-        category: true,
-        invoice: true,
-        installmentPlan: true,
-        memberProfile: { select: { id: true, displayName: true } },
-      },
+      include: transactionInclude,
     });
+    return mapTransactionResponse(transaction);
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateTransactionDto) {
@@ -78,7 +78,7 @@ export class TransactionsService {
       dto.invoiceId ?? current.invoiceId ?? undefined,
     );
     const applicationDate = dto.applicationDate ? new Date(dto.applicationDate) : current.applicationDate;
-    return this.prisma.transaction.update({
+    const transaction = await this.prisma.transaction.update({
       where: { id },
       data: {
         ...updateData,
@@ -89,14 +89,9 @@ export class TransactionsService {
         referenceMonth: dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined,
         status: dto.status || dto.applicationDate ? this.resolveManualStatus(applicationDate, dto.status) : undefined,
       },
-      include: {
-        account: true,
-        category: true,
-        invoice: true,
-        installmentPlan: true,
-        memberProfile: { select: { id: true, displayName: true } },
-      },
+      include: transactionInclude,
     });
+    return mapTransactionResponse(transaction);
   }
 
   async remove(user: AuthenticatedUser, id: string) {
@@ -217,4 +212,52 @@ function normalizeDescription(value: string) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, ' ');
+}
+
+function mapTransactionResponse(transaction: TransactionWithRelations) {
+  return {
+    ...transaction,
+    operationalCategory: resolveOperationalCategory(transaction),
+  };
+}
+
+function resolveOperationalCategory(transaction: TransactionWithRelations) {
+  if (isInvoicePaymentTransaction(transaction)) {
+    return {
+      key: 'system:invoice_payment',
+      name: 'Pagamento de fatura',
+      color: '#d99090',
+    };
+  }
+
+  if (transaction.type === 'expense' && transaction.account?.type === 'credit_card') {
+    return {
+      key: 'system:credit_card',
+      name: 'Cartão',
+      color: '#d99090',
+    };
+  }
+
+  if (transaction.category) {
+    return {
+      key: `category:${transaction.category.id}`,
+      name: transaction.category.name,
+      color: transaction.category.color,
+    };
+  }
+
+  return {
+    key: 'system:uncategorized',
+    name: 'Sem categoria',
+    color: '#3a4a66',
+  };
+}
+
+function isInvoicePaymentTransaction(transaction: TransactionWithRelations) {
+  if (transaction.isInvoicePayment) return true;
+  if (transaction.type !== 'expense' || transaction.account?.type === 'credit_card') return false;
+
+  const description = normalizeDescription(transaction.description);
+  const category = normalizeDescription(transaction.category?.name ?? '');
+  return category === 'cartao' && description.includes('pagamento') && description.includes('fatura');
 }

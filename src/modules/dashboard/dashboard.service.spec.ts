@@ -147,12 +147,32 @@ describe('DashboardService', () => {
     const data = await service.getDashboard(user, { referenceMonth: '2026-06', family: true });
 
     expect(data.saldoAtual).toBe(330_00);
-    expect(data.saldoFuturo).toBe(420_00);
-    expect(data.saldoAtualTotal).toBe(600_00);
-    expect(data.saldoProjetadoTotal).toBe(690_00);
+    expect(data.saldoFuturo).toBe(240_00);
+    expect(data.saldoAtualTotal).toBe(500_00);
+    expect(data.saldoProjetadoTotal).toBe(500_00);
     expect(data.despesaAtual).toBe(170_00);
     expect(data.despesaFuturo).toBe(260_00);
     expect(data.despesaTotalMes).toBe(260_00);
+    expect(data.saldoComposicaoConfirmada).toMatchObject({
+      title: 'Composição confirmada',
+      totalLabel: 'CONFIRMADO',
+      totalValue: 670_00,
+      slices: [
+        { name: 'Saldo total confirmado sem despesa', value: 500_00 },
+        { name: 'Despesa confirmada', value: 70_00 },
+        { name: 'Cartão confirmado', value: 100_00 },
+      ],
+    });
+    expect(data.saldoComposicaoProjetada).toMatchObject({
+      title: 'Composição projetada',
+      totalLabel: 'PROJETADO',
+      totalValue: 760_00,
+      slices: [
+        { name: 'Saldo projetado total', value: 500_00 },
+        { name: 'Despesa projetada', value: 70_00 },
+        { name: 'Cartão projetado', value: 190_00 },
+      ],
+    });
     expect(data.donutSlices).toEqual([
       expect.objectContaining({ name: 'Cartão', value: 190_00 }),
       expect.objectContaining({ name: 'Mercado', value: 70_00 }),
@@ -164,7 +184,7 @@ describe('DashboardService', () => {
     expect(data.parcelasProjetadasQuantidade).toBe(2);
     expect(data.parcelasProjetadasValorCents).toBe(150_00);
     expect(data.saldoDiarioAtual[19]).toBe(330_00);
-    expect(data.saldoDiarioProjetado[19]).toBe(420_00);
+    expect(data.saldoDiarioProjetado[19]).toBe(240_00);
     expect(data.despesaDiariaAtualSpark[19]).toBe(0);
     expect(data.despesaDiariaProjetadaSpark[19]).toBe(50_00);
     expect(data.cartaoDiariaAtualSpark[19]).toBe(0);
