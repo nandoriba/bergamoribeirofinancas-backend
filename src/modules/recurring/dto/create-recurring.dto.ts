@@ -27,6 +27,11 @@ export class CreateRecurringDto {
   endsAt?: string;
 
   @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  notes?: string;
+
+  @IsOptional()
   @IsEnum(RecurringStatus)
   status?: RecurringStatus;
 

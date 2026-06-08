@@ -276,6 +276,7 @@ model RecurringTemplate {
   dayOfMonth      Int
   startsAt        DateTime
   endsAt          DateTime?
+  notes           String?
   status          RecurringStatus @default(active)
   memberProfileId String
   memberProfile   MemberProfile   @relation(fields: [memberProfileId], references: [id])

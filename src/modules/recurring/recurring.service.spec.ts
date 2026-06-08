@@ -21,6 +21,7 @@ describe('RecurringService', () => {
             amountCents: 50_00,
             type: 'expense',
             dayOfMonth: 10,
+            notes: 'Cobrar reajuste anual',
             accountId: null,
             categoryId: null,
             memberProfileId: 'profile-1',
@@ -38,6 +39,7 @@ describe('RecurringService', () => {
         create: expect.objectContaining({
           referenceMonth: new Date('2026-07-01T00:00:00.000Z'),
           applicationDate: new Date('2026-07-10T00:00:00.000Z'),
+          notes: 'Cobrar reajuste anual',
           status: 'pending',
         }),
       }),

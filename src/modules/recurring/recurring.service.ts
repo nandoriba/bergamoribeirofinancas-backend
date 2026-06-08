@@ -32,6 +32,7 @@ export class RecurringService {
         dayOfMonth: dto.dayOfMonth,
         startsAt: new Date(dto.startsAt),
         endsAt: dto.endsAt ? new Date(dto.endsAt) : undefined,
+        notes: normalizeOptionalText(dto.notes),
         status: dto.status ?? 'active',
         accountId: dto.accountId,
         categoryId: dto.categoryId,
@@ -56,6 +57,7 @@ export class RecurringService {
         amountCents: dto.amountCents !== undefined ? Math.abs(dto.amountCents) : undefined,
         startsAt: dto.startsAt ? new Date(dto.startsAt) : undefined,
         endsAt: dto.endsAt ? new Date(dto.endsAt) : undefined,
+        notes: dto.notes !== undefined ? normalizeOptionalText(dto.notes) : undefined,
       },
       include: {
         category: true,
@@ -112,6 +114,7 @@ export class RecurringService {
           recurrenceType: 'monthly',
           externalId,
           source: 'recurring',
+          notes: template.notes,
           accountId: template.accountId,
           categoryId: template.categoryId,
           memberProfileId: template.memberProfileId,
@@ -154,4 +157,9 @@ export class RecurringService {
       throw new BadRequestException('Data final não pode ser anterior à data inicial');
     }
   }
+}
+
+function normalizeOptionalText(value?: string | null) {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
 }
