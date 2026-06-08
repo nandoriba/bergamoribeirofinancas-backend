@@ -1,0 +1,337 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  admin
+  member
+}
+
+enum ThemePreference {
+  dark
+  light
+}
+
+enum ProfileStatus {
+  active
+  pending
+  inactive
+}
+
+enum ApprovalStatus {
+  pending
+  approved
+  rejected
+}
+
+enum InviteStatus {
+  active
+  used
+  expired
+  revoked
+}
+
+enum AccountType {
+  checking
+  credit_card
+  investment
+}
+
+enum CategoryType {
+  income
+  expense
+}
+
+enum TransactionType {
+  income
+  expense
+  transfer
+}
+
+enum TransactionStatus {
+  confirmed
+  pending
+}
+
+enum RecurrenceType {
+  none
+  monthly
+  yearly
+}
+
+enum InvoiceStatus {
+  open
+  closed
+  paid
+}
+
+enum ImportBatchStatus {
+  preview
+  confirmed
+  failed
+}
+
+enum ImportRowStatus {
+  new
+  duplicate
+  review
+  imported
+  ignored
+}
+
+enum ImportType {
+  nubank_account
+  nubank_credit_card
+  unknown
+}
+
+enum RecurringStatus {
+  active
+  paused
+}
+
+model User {
+  id              String          @id @default(uuid())
+  email           String          @unique
+  passwordHash    String
+  name            String
+  role            UserRole        @default(member)
+  themePreference ThemePreference @default(dark)
+  isActive        Boolean         @default(true)
+  familyId        String
+  family          Family          @relation(fields: [familyId], references: [id])
+  profile         MemberProfile?
+  invitesCreated  MemberInvite[]  @relation("InviteCreator")
+  approvalsMade   MemberApproval[] @relation("ApprovalReviewer")
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+}
+
+model Family {
+  id          String          @id @default(uuid())
+  name        String
+  users       User[]
+  profiles    MemberProfile[]
+  invites     MemberInvite[]
+  approvals   MemberApproval[]
+  categories  Category[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+}
+
+model MemberProfile {
+  id                String              @id @default(uuid())
+  displayName       String
+  status            ProfileStatus       @default(active)
+  userId            String              @unique
+  user              User                @relation(fields: [userId], references: [id])
+  familyId          String
+  family            Family              @relation(fields: [familyId], references: [id])
+  accounts          Account[]
+  transactions      Transaction[]
+  invoices          Invoice[]
+  recurringTemplates RecurringTemplate[]
+  installmentPlans  InstallmentPlan[]
+  monthlyOpenings   MonthlyOpening[]
+  importBatches     ImportBatch[]
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+}
+
+model MemberInvite {
+  id             String          @id @default(uuid())
+  token          String          @unique
+  email          String?
+  status         InviteStatus    @default(active)
+  expiresAt      DateTime
+  creatorUserId  String
+  creator        User            @relation("InviteCreator", fields: [creatorUserId], references: [id])
+  familyId       String
+  family         Family          @relation(fields: [familyId], references: [id])
+  approvals      MemberApproval[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+}
+
+model MemberApproval {
+  id              String          @id @default(uuid())
+  status          ApprovalStatus  @default(pending)
+  requestedName   String
+  requestedEmail  String
+  inviteId        String
+  invite          MemberInvite    @relation(fields: [inviteId], references: [id])
+  familyId        String
+  family          Family          @relation(fields: [familyId], references: [id])
+  userId          String?
+  reviewerUserId  String?
+  reviewer        User?           @relation("ApprovalReviewer", fields: [reviewerUserId], references: [id])
+  reviewedAt      DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+}
+
+model Account {
+  id              String          @id @default(uuid())
+  name            String
+  type            AccountType
+  institution     String?
+  lastFourDigits  String?
+  closingDay      Int?
+  dueDay          Int?
+  initialBalanceCents Int          @default(0)
+  memberProfileId String
+  memberProfile   MemberProfile   @relation(fields: [memberProfileId], references: [id])
+  transactions    Transaction[]
+  invoices        Invoice[]
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+}
+
+model Category {
+  id          String      @id @default(uuid())
+  name        String
+  type        CategoryType
+  color       String
+  aliases     String[]    @default([])
+  familyId    String
+  family      Family      @relation(fields: [familyId], references: [id])
+  transactions Transaction[]
+  recurringTemplates RecurringTemplate[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([familyId, name, type])
+}
+
+model Transaction {
+  id                  String            @id @default(uuid())
+  date                DateTime
+  description         String
+  amountCents         Int
+  type                TransactionType
+  status              TransactionStatus @default(confirmed)
+  recurrenceType      RecurrenceType    @default(none)
+  source              String?
+  externalId          String?
+  notes               String?
+  isInvoicePayment    Boolean           @default(false)
+  memberProfileId     String
+  memberProfile       MemberProfile     @relation(fields: [memberProfileId], references: [id])
+  accountId           String?
+  account             Account?          @relation(fields: [accountId], references: [id])
+  categoryId          String?
+  category            Category?         @relation(fields: [categoryId], references: [id])
+  invoiceId           String?
+  invoice             Invoice?          @relation(fields: [invoiceId], references: [id])
+  recurringTemplateId String?
+  recurringTemplate   RecurringTemplate? @relation(fields: [recurringTemplateId], references: [id])
+  installmentPlanId   String?
+  installmentPlan     InstallmentPlan?  @relation(fields: [installmentPlanId], references: [id])
+  importRowId         String?           @unique
+  importRow           ImportRow?        @relation(fields: [importRowId], references: [id])
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@unique([memberProfileId, externalId])
+  @@index([memberProfileId, date])
+}
+
+model Invoice {
+  id              String         @id @default(uuid())
+  referenceMonth  DateTime
+  dueDate         DateTime?
+  closingDate     DateTime?
+  totalCents      Int            @default(0)
+  status          InvoiceStatus  @default(open)
+  accountId       String
+  account         Account        @relation(fields: [accountId], references: [id])
+  memberProfileId String
+  memberProfile   MemberProfile  @relation(fields: [memberProfileId], references: [id])
+  transactions    Transaction[]
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@unique([accountId, referenceMonth])
+}
+
+model RecurringTemplate {
+  id              String          @id @default(uuid())
+  description     String
+  amountCents     Int
+  type            TransactionType
+  dayOfMonth      Int
+  startsAt        DateTime
+  endsAt          DateTime?
+  status          RecurringStatus @default(active)
+  memberProfileId String
+  memberProfile   MemberProfile   @relation(fields: [memberProfileId], references: [id])
+  accountId       String?
+  categoryId      String?
+  category        Category?       @relation(fields: [categoryId], references: [id])
+  transactions    Transaction[]
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+}
+
+model InstallmentPlan {
+  id              String         @id @default(uuid())
+  description     String
+  totalInstallments Int
+  paidInstallments  Int          @default(0)
+  monthlyAmountCents Int
+  totalAmountCents Int
+  startsAt        DateTime
+  memberProfileId String
+  memberProfile   MemberProfile  @relation(fields: [memberProfileId], references: [id])
+  transactions    Transaction[]
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+}
+
+model MonthlyOpening {
+  id              String        @id @default(uuid())
+  referenceMonth  DateTime
+  balanceCents    Int
+  memberProfileId String
+  memberProfile   MemberProfile @relation(fields: [memberProfileId], references: [id])
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([memberProfileId, referenceMonth])
+}
+
+model ImportBatch {
+  id              String            @id @default(uuid())
+  fileName        String
+  type            ImportType
+  status          ImportBatchStatus @default(preview)
+  memberProfileId String
+  memberProfile   MemberProfile     @relation(fields: [memberProfileId], references: [id])
+  rows            ImportRow[]
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+}
+
+model ImportRow {
+  id                String          @id @default(uuid())
+  rowIndex          Int
+  raw               Json
+  date              DateTime?
+  description       String?
+  amountCents       Int?
+  externalId        String?
+  suggestedCategory String?
+  status            ImportRowStatus @default(new)
+  importBatchId     String
+  importBatch       ImportBatch     @relation(fields: [importBatchId], references: [id])
+  transaction        Transaction?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@index([externalId])
+}
