@@ -12,7 +12,7 @@ export class RecurringService {
 
   list(user: AuthenticatedUser) {
     return this.prisma.recurringTemplate.findMany({
-      where: { memberProfile: { familyId: user.familyId } },
+      where: { deletedAt: null, memberProfile: { familyId: user.familyId } },
       include: {
         category: true,
         memberProfile: { select: { id: true, displayName: true } },
@@ -68,7 +68,13 @@ export class RecurringService {
 
   async remove(user: AuthenticatedUser, id: string) {
     await this.ensure(user, id);
-    return this.prisma.recurringTemplate.delete({ where: { id } });
+    return this.prisma.recurringTemplate.update({
+      where: { id },
+      data: {
+        deletedAt: new Date(),
+        status: 'paused',
+      },
+    });
   }
 
   async generateForMonth(user: AuthenticatedUser, month?: string) {
@@ -83,6 +89,7 @@ export class RecurringService {
     const templates = await this.prisma.recurringTemplate.findMany({
       where: {
         memberProfileId: { in: profileIds },
+        deletedAt: null,
         status: 'active',
         startsAt: { lte: monthEnd },
         OR: [{ endsAt: null }, { endsAt: { gte: monthStart } }],
@@ -129,7 +136,7 @@ export class RecurringService {
 
   private async ensure(user: AuthenticatedUser, id: string) {
     const template = await this.prisma.recurringTemplate.findFirst({
-      where: { id, memberProfileId: user.profileId },
+      where: { id, memberProfileId: user.profileId, deletedAt: null },
     });
     if (!template) throw new NotFoundException('Recorrente não encontrado');
     return template;
