@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
+import { clampDayForMonth, endOfDay, endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateRecurringDto } from './dto/create-recurring.dto';
 import { UpdateRecurringDto } from './dto/update-recurring.dto';
@@ -85,8 +85,9 @@ export class RecurringService {
 
     const created = [];
     const bookkeepingDate = new Date();
-    const currentMonth = startOfMonth(bookkeepingDate);
+    const todayEnd = endOfDay(bookkeepingDate);
     for (const template of templates) {
+      const applicationDate = clampDayForMonth(monthStart, template.dayOfMonth);
       const externalId = `recurring:${template.id}:${monthStart.toISOString().slice(0, 7)}`;
       const transaction = await this.prisma.transaction.upsert({
         where: {
@@ -98,11 +99,12 @@ export class RecurringService {
         update: {},
         create: {
           date: bookkeepingDate,
+          applicationDate,
           referenceMonth: monthStart,
           description: template.description,
           amountCents: template.amountCents,
           type: template.type,
-          status: monthStart > currentMonth ? 'pending' : 'confirmed',
+          status: applicationDate <= todayEnd ? 'confirmed' : 'pending',
           recurrenceType: 'monthly',
           externalId,
           source: 'recurring',

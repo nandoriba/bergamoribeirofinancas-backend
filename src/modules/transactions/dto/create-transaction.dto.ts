@@ -2,8 +2,12 @@ import { RecurrenceType, TransactionStatus, TransactionType } from '@prisma/clie
 import { IsDateString, IsEnum, IsInt, IsOptional, IsString, IsUUID, Min } from 'class-validator';
 
 export class CreateTransactionDto {
+  @IsOptional()
   @IsDateString()
-  date!: string;
+  date?: string;
+
+  @IsDateString()
+  applicationDate!: string;
 
   @IsOptional()
   @IsDateString()

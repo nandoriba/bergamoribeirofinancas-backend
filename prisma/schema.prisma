@@ -212,6 +212,7 @@ model Category {
 model Transaction {
   id                  String            @id @default(uuid())
   date                DateTime
+  applicationDate     DateTime
   referenceMonth      DateTime
   description         String
   amountCents         Int
@@ -245,6 +246,7 @@ model Transaction {
   @@unique([memberProfileId, externalId])
   @@unique([installmentPlanId, installmentNumber])
   @@index([memberProfileId, date])
+  @@index([memberProfileId, applicationDate])
   @@index([memberProfileId, referenceMonth])
 }
 

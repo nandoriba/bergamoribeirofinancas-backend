@@ -25,6 +25,10 @@ export class CreateInstallmentDto {
   @IsDateString()
   startsAt!: string;
 
+  @IsOptional()
+  @IsDateString()
+  firstApplicationDate?: string;
+
   @IsDateString()
   firstReferenceMonth!: string;
 

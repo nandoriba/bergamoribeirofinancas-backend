@@ -1,6 +1,8 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { PrismaService } from '../../prisma/prisma.service';
+import { clampDayForMonth, startOfMonth } from '../../shared/date-range';
+import { normalizeAmountCents } from '../../shared/finance-calculator';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
 import { UpdateInvoiceDto } from './dto/update-invoice.dto';
@@ -30,7 +32,7 @@ export class InvoicesService {
           },
         },
       },
-      orderBy: [{ referenceMonth: 'asc' as const }, { date: 'asc' as const }],
+      orderBy: [{ referenceMonth: 'asc' as const }, { applicationDate: 'asc' as const }],
     },
   };
 
@@ -48,13 +50,19 @@ export class InvoicesService {
     });
     if (!account) throw new BadRequestException('Cartão inválido');
 
+    const referenceMonth = startOfMonth(new Date(dto.referenceMonth));
+    const existing = await this.prisma.invoice.findFirst({
+      where: { accountId: account.id, referenceMonth },
+    });
+    if (existing) throw new BadRequestException('Fatura já existe para este cartão e mês');
+
     return this.prisma.invoice.create({
       data: {
-        referenceMonth: new Date(dto.referenceMonth),
-        dueDate: dto.dueDate ? new Date(dto.dueDate) : undefined,
-        closingDate: dto.closingDate ? new Date(dto.closingDate) : undefined,
-        totalCents: dto.totalCents ?? 0,
-        status: dto.status ?? 'open',
+        referenceMonth,
+        dueDate: this.dateFromAccountDay(referenceMonth, account.dueDay),
+        closingDate: this.dateFromAccountDay(referenceMonth, account.closingDay),
+        totalCents: 0,
+        status: 'open',
         accountId: dto.accountId,
         memberProfileId: user.profileId,
       },
@@ -63,20 +71,30 @@ export class InvoicesService {
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateInvoiceDto) {
-    await this.ensureInvoice(user, id);
+    const invoice = await this.ensureInvoice(user, id);
     if (dto.accountId) {
       const account = await this.prisma.account.findFirst({
         where: { id: dto.accountId, memberProfileId: user.profileId, type: 'credit_card' },
       });
       if (!account) throw new BadRequestException('Cartão inválido');
     }
+
+    if (dto.status === 'paid' && invoice.status === 'open') {
+      throw new BadRequestException('Feche a fatura antes de marcar como paga');
+    }
+
+    const nextReferenceMonth = dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined;
+    const totalCents = dto.status === 'closed' ? await this.calculateInvoiceTotalCents(id) : undefined;
+
     return this.prisma.invoice.update({
       where: { id },
       data: {
-        ...dto,
-        referenceMonth: dto.referenceMonth ? new Date(dto.referenceMonth) : undefined,
+        accountId: dto.accountId,
+        referenceMonth: nextReferenceMonth,
         dueDate: dto.dueDate ? new Date(dto.dueDate) : undefined,
         closingDate: dto.closingDate ? new Date(dto.closingDate) : undefined,
+        status: dto.status,
+        totalCents,
       },
       include: this.invoiceInclude,
     });
@@ -93,5 +111,17 @@ export class InvoicesService {
     });
     if (!invoice) throw new NotFoundException('Fatura não encontrada');
     return invoice;
+  }
+
+  private async calculateInvoiceTotalCents(invoiceId: string) {
+    const transactions = await this.prisma.transaction.findMany({
+      where: { invoiceId, isInvoicePayment: false },
+      select: { amountCents: true },
+    });
+    return transactions.reduce((sum, transaction) => sum + normalizeAmountCents(transaction.amountCents), 0);
+  }
+
+  private dateFromAccountDay(referenceMonth: Date, day?: number | null) {
+    return day ? clampDayForMonth(referenceMonth, day) : undefined;
   }
 }

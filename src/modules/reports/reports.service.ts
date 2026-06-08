@@ -40,7 +40,7 @@ export class ReportsService {
         category: true,
         memberProfile: { select: { id: true, displayName: true } },
       },
-      orderBy: [{ referenceMonth: 'asc' }, { date: 'asc' }],
+      orderBy: [{ referenceMonth: 'asc' }, { applicationDate: 'asc' }],
     });
 
     const profiles = new Map<string, { id: string; name: string; incomeCents: number; expenseCents: number; netCents: number }>();

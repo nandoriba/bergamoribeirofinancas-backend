@@ -2,7 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import type { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { addMonths, startOfMonth } from '../../shared/date-range';
+import { addMonths, clampDayForMonth, endOfDay, startOfMonth } from '../../shared/date-range';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateInstallmentDto } from './dto/create-installment.dto';
 import { UpdateInstallmentDto } from './dto/update-installment.dto';
@@ -11,8 +11,8 @@ import { UpdateInstallmentDto } from './dto/update-installment.dto';
 export class InstallmentsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  list(user: AuthenticatedUser) {
-    return this.prisma.installmentPlan.findMany({
+  async list(user: AuthenticatedUser) {
+    const plans = await this.prisma.installmentPlan.findMany({
       where: { memberProfile: { familyId: user.familyId } },
       include: {
         transactions: {
@@ -28,6 +28,17 @@ export class InstallmentsService {
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    const items = plans.map((plan) => this.withComputedAmounts(plan));
+
+    return {
+      items,
+      summary: {
+        totalPurchaseCents: items.reduce((sum, plan) => sum + Math.abs(plan.totalAmountCents), 0),
+        totalInstallments: items.reduce((sum, plan) => sum + plan.totalInstallments, 0),
+        totalAmountToPayCents: items.reduce((sum, plan) => sum + plan.amountToPayCents, 0),
+      },
+    };
   }
 
   async create(user: AuthenticatedUser, dto: CreateInstallmentDto) {
@@ -44,9 +55,13 @@ export class InstallmentsService {
     }
 
     const bookkeepingDate = new Date(dto.startsAt);
-    const currentMonth = startOfMonth(new Date());
+    const baseApplicationDate = new Date(dto.firstApplicationDate ?? dto.startsAt);
+    const todayEnd = endOfDay(new Date());
 
     return this.prisma.$transaction(async (tx) => {
+      const installmentApplicationDates = Array.from({ length: dto.totalInstallments }, (_, index) =>
+        dateWithDay(addMonths(firstInstallmentReference, index), baseApplicationDate.getUTCDate()),
+      );
       const plan = await tx.installmentPlan.create({
         data: {
           description: dto.description,
@@ -55,9 +70,7 @@ export class InstallmentsService {
           firstReferenceMonth,
           paidInstallments:
             dto.paidInstallments ??
-            Array.from({ length: dto.totalInstallments }, (_, index) => addMonths(firstInstallmentReference, index)).filter(
-              (reference) => reference <= currentMonth,
-            ).length,
+            installmentApplicationDates.filter((applicationDate) => applicationDate <= todayEnd).length,
           monthlyAmountCents: dto.monthlyAmountCents,
           totalAmountCents: dto.totalAmountCents,
           startsAt: bookkeepingDate,
@@ -67,6 +80,7 @@ export class InstallmentsService {
 
       for (let installmentNumber = 1; installmentNumber <= dto.totalInstallments; installmentNumber += 1) {
         const referenceMonth = addMonths(firstInstallmentReference, installmentNumber - 1);
+        const applicationDate = installmentApplicationDates[installmentNumber - 1];
         const invoiceId = account?.type === 'credit_card'
           ? await this.findOrCreateInvoice(tx, user, account, referenceMonth, dto.invoiceId)
           : undefined;
@@ -78,6 +92,8 @@ export class InstallmentsService {
             data: {
               installmentPlanId: plan.id,
               installmentNumber,
+              applicationDate,
+              status: 'confirmed',
               linkedToPlanAt: new Date(),
               linkedToPlanByUserId: user.id,
               invoiceId,
@@ -89,11 +105,12 @@ export class InstallmentsService {
         await tx.transaction.create({
           data: {
             date: bookkeepingDate,
+            applicationDate,
             referenceMonth,
             description: `${dto.description} - Parcela ${installmentNumber}/${dto.totalInstallments}`,
             amountCents: dto.monthlyAmountCents,
             type: 'expense',
-            status: referenceMonth > currentMonth ? 'pending' : 'confirmed',
+            status: 'confirmed',
             recurrenceType: 'none',
             source: 'installment',
             accountId: dto.accountId,
@@ -106,7 +123,7 @@ export class InstallmentsService {
         });
       }
 
-      return tx.installmentPlan.findUniqueOrThrow({
+      const created = await tx.installmentPlan.findUniqueOrThrow({
         where: { id: plan.id },
         include: {
           transactions: {
@@ -121,12 +138,14 @@ export class InstallmentsService {
           memberProfile: { select: { id: true, displayName: true } },
         },
       });
+
+      return this.withComputedAmounts(created);
     });
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateInstallmentDto) {
     await this.ensure(user, id);
-    return this.prisma.installmentPlan.update({
+    const updated = await this.prisma.installmentPlan.update({
       where: { id },
       data: {
         description: dto.description,
@@ -151,6 +170,8 @@ export class InstallmentsService {
         memberProfile: { select: { id: true, displayName: true } },
       },
     });
+
+    return this.withComputedAmounts(updated);
   }
 
   async remove(user: AuthenticatedUser, id: string) {
@@ -171,6 +192,17 @@ export class InstallmentsService {
     });
     if (!plan) throw new NotFoundException('Parcelamento não encontrado');
     return plan;
+  }
+
+  private withComputedAmounts<TPlan extends { totalInstallments: number; paidInstallments: number; monthlyAmountCents: number }>(
+    plan: TPlan,
+  ) {
+    const remainingInstallments = Math.max(plan.totalInstallments - plan.paidInstallments, 0);
+    return {
+      ...plan,
+      remainingInstallments,
+      amountToPayCents: remainingInstallments * Math.abs(plan.monthlyAmountCents),
+    };
   }
 
   private async validateRelations(user: AuthenticatedUser, accountId?: string, categoryId?: string, invoiceId?: string) {
@@ -290,6 +322,5 @@ function isSimilar(base: string, candidate: string) {
 }
 
 function dateWithDay(referenceMonth: Date, day: number) {
-  const safeDay = Math.min(Math.max(day, 1), new Date(Date.UTC(referenceMonth.getUTCFullYear(), referenceMonth.getUTCMonth() + 1, 0)).getUTCDate());
-  return new Date(Date.UTC(referenceMonth.getUTCFullYear(), referenceMonth.getUTCMonth(), safeDay));
+  return clampDayForMonth(referenceMonth, day);
 }

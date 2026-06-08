@@ -72,6 +72,8 @@ export class ImportParserService {
     const description = row.title || row.descricao || row.description;
     const installment = extractInstallment(description);
     const externalId = buildSyntheticExternalId('nubank-card', date, description, amountCents);
+    const adjustment = isCreditCardAdjustment(description);
+    const categoryAmount = amountCents === undefined ? undefined : -Math.abs(amountCents);
 
     return this.withReviewStatus({
       rowIndex,
@@ -80,8 +82,8 @@ export class ImportParserService {
       description,
       amountCents,
       externalId,
-      suggestedCategory: suggestCategory(description, amountCents),
-      status: 'new',
+      suggestedCategory: adjustment ? 'Revisar' : suggestCategory(description, categoryAmount),
+      status: adjustment ? 'review' : 'new',
     });
   }
 
@@ -248,4 +250,9 @@ function extractInstallment(description?: string): string | undefined {
   if (!description) return undefined;
   const match = /(?:parcela\s*)?(\d{1,2})\s*\/\s*(\d{1,2})/i.exec(description);
   return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
+function isCreditCardAdjustment(description?: string): boolean {
+  const text = normalizeKey(description ?? '');
+  return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
 }

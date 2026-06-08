@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
+import { endOfDay, endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
@@ -11,8 +11,8 @@ import { UpdateTransactionDto } from './dto/update-transaction.dto';
 export class TransactionsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  list(user: AuthenticatedUser, query: { month?: string; profileId?: string }) {
-    const reference = parseMonth(query.month);
+  list(user: AuthenticatedUser, query: { referenceMonth?: string; profileId?: string }) {
+    const reference = parseMonth(query.referenceMonth);
     const where: Prisma.TransactionWhereInput = {
       memberProfile: { familyId: user.familyId },
       referenceMonth: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
@@ -31,20 +31,22 @@ export class TransactionsService {
         installmentPlan: true,
         memberProfile: { select: { id: true, displayName: true } },
       },
-      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ applicationDate: 'desc' }, { createdAt: 'desc' }],
     });
   }
 
   async create(user: AuthenticatedUser, dto: CreateTransactionDto) {
     await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
+    const applicationDate = new Date(dto.applicationDate);
     return this.prisma.transaction.create({
       data: {
-        date: new Date(dto.date),
-        referenceMonth: startOfMonth(new Date(dto.referenceMonth ?? dto.date)),
+        date: new Date(),
+        applicationDate,
+        referenceMonth: startOfMonth(new Date(dto.referenceMonth ?? dto.applicationDate)),
         description: dto.description,
         amountCents: dto.amountCents,
         type: dto.type,
-        status: dto.status ?? 'confirmed',
+        status: this.resolveManualStatus(applicationDate, dto.status),
         recurrenceType: dto.recurrenceType ?? 'none',
         source: dto.source,
         externalId: dto.externalId,
@@ -66,14 +68,17 @@ export class TransactionsService {
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateTransactionDto) {
-    await this.ensureTransaction(user, id);
+    const current = await this.ensureTransaction(user, id);
     await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
+    const applicationDate = dto.applicationDate ? new Date(dto.applicationDate) : current.applicationDate;
     return this.prisma.transaction.update({
       where: { id },
       data: {
         ...dto,
-        date: dto.date ? new Date(dto.date) : undefined,
+        date: undefined,
+        applicationDate: dto.applicationDate ? applicationDate : undefined,
         referenceMonth: dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined,
+        status: dto.status || dto.applicationDate ? this.resolveManualStatus(applicationDate, dto.status) : undefined,
       },
       include: {
         account: true,
@@ -129,5 +134,10 @@ export class TransactionsService {
         throw new BadRequestException('Fatura não pertence à conta selecionada');
       }
     }
+  }
+
+  private resolveManualStatus(applicationDate: Date, requested?: 'confirmed' | 'pending') {
+    if (applicationDate <= endOfDay(new Date())) return 'confirmed';
+    return requested ?? 'pending';
   }
 }

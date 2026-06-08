@@ -2,6 +2,7 @@ import { TransactionType } from '@prisma/client';
 
 export interface FinanceTransaction {
   date: Date;
+  applicationDate?: Date;
   amountCents: number;
   type: TransactionType;
   status?: 'confirmed' | 'pending';
@@ -16,6 +17,14 @@ export function normalizeAmountCents(value: number): number {
 export function transactionImpactCents(transaction: FinanceTransaction): number {
   const amount = normalizeAmountCents(transaction.amountCents);
   if (transaction.type === 'income') return amount;
+  if (transaction.type === 'expense') return -amount;
+  return 0;
+}
+
+export function accountBalanceImpactCents(transaction: FinanceTransaction): number {
+  const amount = normalizeAmountCents(transaction.amountCents);
+  if (transaction.type === 'income') return amount;
+  if (transaction.type === 'expense' && transaction.account?.type === 'credit_card') return amount;
   if (transaction.type === 'expense') return -amount;
   return 0;
 }
@@ -38,8 +47,24 @@ export function creditCardExpenseCents(transactions: FinanceTransaction[]): numb
     .reduce((total, transaction) => total + normalizeAmountCents(transaction.amountCents), 0);
 }
 
+export function accountCreditCents(transactions: FinanceTransaction[]): number {
+  return transactions
+    .filter((transaction) => transaction.type === 'income' || (transaction.type === 'expense' && transaction.account?.type === 'credit_card'))
+    .reduce((total, transaction) => total + normalizeAmountCents(transaction.amountCents), 0);
+}
+
+export function accountDebitCents(transactions: FinanceTransaction[]): number {
+  return transactions
+    .filter((transaction) => transaction.type === 'expense' && transaction.account?.type !== 'credit_card')
+    .reduce((total, transaction) => total + normalizeAmountCents(transaction.amountCents), 0);
+}
+
 export function netCents(transactions: FinanceTransaction[]): number {
   return transactions.reduce((total, transaction) => total + transactionImpactCents(transaction), 0);
+}
+
+export function accountBalanceCents(transactions: FinanceTransaction[]): number {
+  return transactions.reduce((total, transaction) => total + accountBalanceImpactCents(transaction), 0);
 }
 
 export function closingBalanceCents(openingBalanceCents: number, transactions: FinanceTransaction[]): number {
@@ -54,9 +79,33 @@ export function cumulativeDailyBalances(
   const impactsByDay = new Array<number>(numberOfDays).fill(0);
 
   for (const transaction of transactions) {
-    const dayIndex = transaction.date.getUTCDate() - 1;
+    const dayIndex = operationalDate(transaction).getUTCDate() - 1;
     if (dayIndex >= 0 && dayIndex < numberOfDays) {
       impactsByDay[dayIndex] += transactionImpactCents(transaction);
+    }
+  }
+
+  const balances: number[] = [];
+  let balance = openingBalanceCents;
+  for (const impact of impactsByDay) {
+    balance += impact;
+    balances.push(balance);
+  }
+
+  return balances;
+}
+
+export function cumulativeAccountDailyBalances(
+  openingBalanceCents: number,
+  transactions: FinanceTransaction[],
+  numberOfDays: number,
+): number[] {
+  const impactsByDay = new Array<number>(numberOfDays).fill(0);
+
+  for (const transaction of transactions) {
+    const dayIndex = operationalDate(transaction).getUTCDate() - 1;
+    if (dayIndex >= 0 && dayIndex < numberOfDays) {
+      impactsByDay[dayIndex] += accountBalanceImpactCents(transaction);
     }
   }
 
@@ -74,7 +123,7 @@ export function dailyExpenseSeries(transactions: FinanceTransaction[], numberOfD
   const values = new Array<number>(numberOfDays).fill(0);
   for (const transaction of transactions) {
     if (transaction.type !== 'expense') continue;
-    const dayIndex = transaction.date.getUTCDate() - 1;
+    const dayIndex = operationalDate(transaction).getUTCDate() - 1;
     if (dayIndex >= 0 && dayIndex < numberOfDays) {
       values[dayIndex] += normalizeAmountCents(transaction.amountCents);
     }
@@ -86,10 +135,14 @@ export function dailyCreditCardSeries(transactions: FinanceTransaction[], number
   const values = new Array<number>(numberOfDays).fill(0);
   for (const transaction of transactions) {
     if (transaction.type !== 'expense' || transaction.account?.type !== 'credit_card') continue;
-    const dayIndex = transaction.date.getUTCDate() - 1;
+    const dayIndex = operationalDate(transaction).getUTCDate() - 1;
     if (dayIndex >= 0 && dayIndex < numberOfDays) {
       values[dayIndex] += normalizeAmountCents(transaction.amountCents);
     }
   }
   return values;
+}
+
+function operationalDate(transaction: FinanceTransaction): Date {
+  return transaction.applicationDate ?? transaction.date;
 }

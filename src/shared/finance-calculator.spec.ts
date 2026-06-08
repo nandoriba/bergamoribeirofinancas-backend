@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  accountBalanceCents,
+  accountCreditCents,
+  cumulativeAccountDailyBalances,
   closingBalanceCents,
   creditCardExpenseCents,
   cumulativeDailyBalances,
+  dailyExpenseSeries,
   expenseCents,
   incomeCents,
   netCents,
@@ -41,7 +45,26 @@ describe('finance-calculator', () => {
     expect(creditCardExpenseCents(transactions)).toBe(80_00);
   });
 
+  it('counts credit card expenses as positive credit in account balance cards', () => {
+    expect(accountCreditCents(transactions)).toBe(580_00);
+    expect(accountBalanceCents(transactions)).toBe(460_00);
+    expect(cumulativeAccountDailyBalances(1_000_00, transactions, 3)).toEqual([1_500_00, 1_460_00, 1_460_00]);
+  });
+
   it('builds cumulative balances by UTC day', () => {
     expect(cumulativeDailyBalances(1_000_00, transactions, 3)).toEqual([1_500_00, 1_300_00, 1_300_00]);
+  });
+
+  it('uses application date for daily operational series', () => {
+    const futureBookkeeping: FinanceTransaction[] = [
+      {
+        date: new Date('2026-07-20T00:00:00.000Z'),
+        applicationDate: new Date('2026-06-05T00:00:00.000Z'),
+        type: 'expense',
+        amountCents: 75_00,
+      },
+    ];
+
+    expect(dailyExpenseSeries(futureBookkeeping, 30)[4]).toBe(75_00);
   });
 });

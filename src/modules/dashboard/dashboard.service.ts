@@ -5,21 +5,21 @@ import { PrismaService } from '../../prisma/prisma.service';
 import {
   addMonths,
   daysInMonth,
+  endOfDay,
   endOfMonth,
-  isSameUtcMonth,
   monthKey,
   parseMonth,
   startOfMonth,
 } from '../../shared/date-range';
 import {
-  closingBalanceCents,
+  accountBalanceCents,
+  accountCreditCents,
   creditCardExpenseCents,
-  cumulativeDailyBalances,
+  cumulativeAccountDailyBalances,
   dailyCreditCardSeries,
   dailyExpenseSeries,
   expenseCents,
   incomeCents,
-  netCents,
   normalizeAmountCents,
 } from '../../shared/finance-calculator';
 import type { AuthenticatedUser } from '../auth/auth.types';
@@ -39,7 +39,7 @@ type DashboardInvoice = Prisma.InvoiceGetPayload<{ include: { account: true } }>
 type DashboardRecurring = Prisma.RecurringTemplateGetPayload<Record<string, never>>;
 
 interface DashboardQuery {
-  month?: string;
+  referenceMonth?: string;
   profileId?: string;
   family: boolean;
 }
@@ -52,16 +52,15 @@ export class DashboardService {
   ) {}
 
   async getDashboard(user: AuthenticatedUser, query: DashboardQuery) {
-    const reference = parseMonth(query.month);
+    const reference = parseMonth(query.referenceMonth);
     const monthStart = startOfMonth(reference);
     const monthEnd = endOfMonth(reference);
     const profileIds = await this.resolveProfileIds(user, query);
 
     await this.recurringService.materializeForProfiles(profileIds, reference);
 
-    const [openingBalanceCents, monthTransactions, previousMonthTransactions, importRows, installments, invoices, recurring] =
+    const [monthTransactions, previousMonthTransactions, importRows, installments, invoices, recurring] =
       await Promise.all([
-        this.getOpeningBalanceCents(profileIds, monthStart),
         this.getTransactions(profileIds, monthStart, monthEnd),
         this.getTransactions(profileIds, startOfMonth(addMonths(reference, -1)), endOfMonth(addMonths(reference, -1))),
         this.getImportPreviewRows(profileIds),
@@ -93,23 +92,32 @@ export class DashboardService {
       ]);
 
     const today = new Date();
-    const currentCutoff = isSameUtcMonth(reference, today)
-      ? new Date(Date.UTC(reference.getUTCFullYear(), reference.getUTCMonth(), today.getUTCDate(), 23, 59, 59, 999))
-      : monthEnd;
-    const currentTransactions = monthTransactions.filter((transaction) => transaction.date <= currentCutoff);
+    const todayEnd = endOfDay(today);
+    const currentTransactions = monthTransactions.filter(
+      (transaction) => transaction.status === 'confirmed' && transaction.applicationDate <= todayEnd,
+    );
     const numberOfDays = daysInMonth(reference);
-    const saldoDiario = cumulativeDailyBalances(openingBalanceCents, monthTransactions, numberOfDays);
+    const saldoDiarioAtual = cumulativeAccountDailyBalances(0, currentTransactions, numberOfDays);
+    const saldoDiarioProjetado = cumulativeAccountDailyBalances(0, monthTransactions, numberOfDays);
+    const despesaDiariaAtualSpark = dailyExpenseSeries(currentTransactions, numberOfDays);
+    const despesaDiariaProjetadaSpark = dailyExpenseSeries(monthTransactions, numberOfDays);
+    const cartaoDiariaAtualSpark = dailyCreditCardSeries(currentTransactions, numberOfDays);
+    const cartaoDiariaProjetadaSpark = dailyCreditCardSeries(monthTransactions, numberOfDays);
     const despesaFuturo = expenseCents(monthTransactions);
     const categoryTotals = this.groupExpenseCategories(monthTransactions);
+    const confirmedInstallments = this.summarizeCreditCardInstallments(currentTransactions);
+    const projectedInstallments = this.summarizeCreditCardInstallments(monthTransactions);
 
     return {
       monthRef: monthKey(reference),
       monthShort: this.formatMonth(reference),
       today: this.formatShortDate(today),
-      saldoAtual: closingBalanceCents(openingBalanceCents, currentTransactions),
-      saldoFuturo: closingBalanceCents(openingBalanceCents, monthTransactions),
-      saldoAnt: openingBalanceCents,
-      saldoMaxMes: Math.max(openingBalanceCents, ...saldoDiario),
+      saldoAtual: accountBalanceCents(currentTransactions),
+      saldoFuturo: accountBalanceCents(monthTransactions),
+      saldoAtualTotal: accountCreditCents(currentTransactions),
+      saldoProjetadoTotal: accountCreditCents(monthTransactions),
+      saldoAnt: 0,
+      saldoMaxMes: Math.max(0, ...saldoDiarioProjetado),
       despesaAtual: expenseCents(currentTransactions),
       despesaFuturo,
       despesaAntMes: expenseCents(previousMonthTransactions),
@@ -117,6 +125,10 @@ export class DashboardService {
       cartaoFuturo: creditCardExpenseCents(monthTransactions),
       cartaoAntMes: creditCardExpenseCents(previousMonthTransactions),
       receitaPrevista: incomeCents(monthTransactions),
+      parcelasConfirmadasQuantidade: confirmedInstallments.count,
+      parcelasConfirmadasValorCents: confirmedInstallments.amountCents,
+      parcelasProjetadasQuantidade: projectedInstallments.count,
+      parcelasProjetadasValorCents: projectedInstallments.amountCents,
       top5: categoryTotals.top5,
       outrosCat: categoryTotals.others,
       avisos: this.buildAlerts(invoices, recurring),
@@ -128,9 +140,15 @@ export class DashboardService {
         restante: Math.max(plan.totalInstallments - plan.paidInstallments, 0) * plan.monthlyAmountCents,
       })),
       saldoMensal: await this.buildMonthlyBalances(profileIds, reference),
-      saldoDiario,
-      despesaDiariaSpark: dailyExpenseSeries(monthTransactions, numberOfDays),
-      cartaoDiariaSpark: dailyCreditCardSeries(monthTransactions, numberOfDays),
+      saldoDiario: saldoDiarioProjetado,
+      saldoDiarioAtual,
+      saldoDiarioProjetado,
+      despesaDiariaSpark: despesaDiariaProjetadaSpark,
+      despesaDiariaAtualSpark,
+      despesaDiariaProjetadaSpark,
+      cartaoDiariaSpark: cartaoDiariaProjetadaSpark,
+      cartaoDiariaAtualSpark,
+      cartaoDiariaProjetadaSpark,
       donutSlices: categoryTotals.donutSlices,
       despesaTotalMes: despesaFuturo,
       transactions: monthTransactions.slice(0, 12).map((transaction) => this.mapTransaction(transaction)),
@@ -175,7 +193,7 @@ export class DashboardService {
         referenceMonth: { gte: start, lte: end },
       },
       include: transactionInclude,
-      orderBy: [{ referenceMonth: 'desc' }, { date: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ referenceMonth: 'desc' }, { applicationDate: 'desc' }, { createdAt: 'desc' }],
     });
   }
 
@@ -194,6 +212,7 @@ export class DashboardService {
           referenceMonth: { lt: monthStart },
           status: 'confirmed',
         },
+        include: { account: true },
       }),
     ]);
 
@@ -210,7 +229,7 @@ export class DashboardService {
     for (const transaction of priorTransactions) {
       priorNetByProfile.set(
         transaction.memberProfileId,
-        (priorNetByProfile.get(transaction.memberProfileId) ?? 0) + netCents([transaction]),
+        (priorNetByProfile.get(transaction.memberProfileId) ?? 0) + accountBalanceCents([transaction]),
       );
     }
 
@@ -263,7 +282,7 @@ export class DashboardService {
       const month = addMonths(firstMonth, index);
       const key = monthKey(month);
       const monthTransactions = transactions.filter((transaction) => monthKey(transaction.referenceMonth) === key);
-      runningBalance += netCents(monthTransactions);
+      runningBalance += accountBalanceCents(monthTransactions);
       points.push({ m: SHORT_MONTHS[month.getUTCMonth()], v: runningBalance });
     }
     return points;
@@ -294,7 +313,7 @@ export class DashboardService {
   private mapTransaction(transaction: DashboardTransaction) {
     return {
       id: transaction.id,
-      date: this.formatShortDate(transaction.date),
+      date: this.formatShortDate(transaction.applicationDate),
       description: transaction.description,
       account: transaction.account?.name ?? 'Sem conta',
       category: transaction.category?.name ?? 'Sem categoria',
@@ -302,6 +321,20 @@ export class DashboardService {
       type: transaction.type === 'income' ? 'income' : 'expense',
       value: normalizeAmountCents(transaction.amountCents),
       status: transaction.status,
+    };
+  }
+
+  private summarizeCreditCardInstallments(transactions: DashboardTransaction[]) {
+    const installments = transactions.filter(
+      (transaction) =>
+        transaction.type === 'expense' &&
+        transaction.account?.type === 'credit_card' &&
+        transaction.installmentNumber !== null &&
+        transaction.installmentNumber !== undefined,
+    );
+    return {
+      count: installments.length,
+      amountCents: expenseCents(installments),
     };
   }
 

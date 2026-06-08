@@ -1,8 +1,9 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { ImportRowStatus, Prisma, TransactionType } from '@prisma/client';
+import { ImportRowStatus, Prisma } from '@prisma/client';
+import type { Account, ImportType, TransactionType } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { startOfMonth } from '../../shared/date-range';
+import { clampDayForMonth, startOfMonth } from '../../shared/date-range';
 import { normalizeAmountCents } from '../../shared/finance-calculator';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { InstallmentsService } from '../installments/installments.service';
@@ -60,7 +61,7 @@ export class ImportsService {
               description: row.description,
               amountCents: row.amountCents,
               externalId: row.externalId,
-              suggestedCategory: this.resolveSuggestedCategory(row, categories),
+              suggestedCategory: this.resolveSuggestedCategory(row, categories, parsed.type),
               status,
             };
           }),
@@ -97,13 +98,21 @@ export class ImportsService {
       ? await this.prisma.account.findFirst({ where: { id: dto.accountId, memberProfileId: user.profileId } })
       : null;
     if (dto.accountId && !account) throw new BadRequestException('Conta inválida');
+    if (batch.type === 'nubank_credit_card' && (!account || account.type !== 'credit_card')) {
+      throw new BadRequestException('Selecione o cartão desta fatura para confirmar a importação');
+    }
 
     const created = [];
     const bookkeepingDate = new Date();
     for (const row of importableRows) {
       const signedAmount = row.amountCents ?? 0;
-      const type: TransactionType = signedAmount >= 0 ? 'income' : 'expense';
-      const categoryId = row.suggestedCategory ? categoryByName.get(`${type}:${row.suggestedCategory}`) : undefined;
+      if (batch.type === 'nubank_credit_card' && isCreditCardAdjustment(row.description)) {
+        await this.prisma.importRow.update({ where: { id: row.id }, data: { status: ImportRowStatus.review } });
+        continue;
+      }
+
+      const type = this.resolveTransactionType(batch.type, signedAmount);
+      const categoryId = this.resolveCategoryId(categories, categoryByName, type, row.suggestedCategory);
       const installment = readInstallment(row.raw);
 
       if (installment && account?.type === 'credit_card' && type === 'expense' && row.date) {
@@ -132,6 +141,7 @@ export class ImportsService {
           monthlyAmountCents: normalizeAmountCents(signedAmount),
           totalAmountCents: normalizeAmountCents(signedAmount) * installment.total,
           startsAt: bookkeepingDate.toISOString(),
+          firstApplicationDate: row.date.toISOString(),
           firstReferenceMonth: referenceMonth.toISOString(),
           accountId: account.id,
           categoryId,
@@ -145,7 +155,7 @@ export class ImportsService {
 
       const invoiceId =
         account?.type === 'credit_card' && row.date
-          ? await this.findOrCreateInvoice(account.id, user.profileId, startOfMonth(row.date))
+          ? await this.findOrCreateInvoice(account, user.profileId, startOfMonth(row.date))
           : undefined;
 
       const transaction = await this.prisma.transaction.upsert({
@@ -158,6 +168,7 @@ export class ImportsService {
         update: {},
         create: {
           date: bookkeepingDate,
+          applicationDate: row.date as Date,
           referenceMonth: startOfMonth(row.date as Date),
           description: row.description ?? 'Importado',
           amountCents: normalizeAmountCents(signedAmount),
@@ -217,20 +228,22 @@ export class ImportsService {
     };
   }
 
-  private async findOrCreateInvoice(accountId: string, memberProfileId: string, referenceMonth: Date) {
+  private async findOrCreateInvoice(account: Account, memberProfileId: string, referenceMonth: Date) {
     const invoice = await this.prisma.invoice.upsert({
       where: {
         accountId_referenceMonth: {
-          accountId,
+          accountId: account.id,
           referenceMonth,
         },
       },
       update: {},
       create: {
-        accountId,
+        accountId: account.id,
         memberProfileId,
         referenceMonth,
         status: 'open',
+        closingDate: account.closingDay ? clampDayForMonth(referenceMonth, account.closingDay) : undefined,
+        dueDate: account.dueDay ? clampDayForMonth(referenceMonth, account.dueDay) : undefined,
       },
     });
     return invoice.id;
@@ -255,13 +268,33 @@ export class ImportsService {
   private resolveSuggestedCategory(
     row: ParsedImportRow,
     categories: Awaited<ReturnType<PrismaService['category']['findMany']>>,
+    importType: ImportType,
   ): string {
-    const type = (row.amountCents ?? 0) >= 0 ? 'income' : 'expense';
+    if (row.suggestedCategory === 'Revisar') return 'Revisar';
+    const type = importType === 'nubank_credit_card' ? 'expense' : (row.amountCents ?? 0) >= 0 ? 'income' : 'expense';
     const requested = row.suggestedCategory;
     if (requested && categories.some((category) => category.type === type && category.name === requested)) {
       return requested;
     }
     return categories.find((category) => category.type === type && category.name === 'Outros')?.name ?? 'Outros';
+  }
+
+  private resolveTransactionType(importType: ImportType, amountCents: number): TransactionType {
+    if (importType === 'nubank_credit_card') return 'expense';
+    return amountCents >= 0 ? 'income' : 'expense';
+  }
+
+  private resolveCategoryId(
+    categories: Awaited<ReturnType<PrismaService['category']['findMany']>>,
+    categoryByName: Map<string, string>,
+    type: TransactionType,
+    suggestedCategory?: string | null,
+  ) {
+    if (suggestedCategory) {
+      const requested = categoryByName.get(`${type}:${suggestedCategory}`);
+      if (requested) return requested;
+    }
+    return categories.find((category) => category.type === type && category.name === 'Outros')?.id;
   }
 
   private mapPreviewRow(
@@ -304,4 +337,16 @@ function stripInstallment(description: string) {
     .replace(/(?:parcela\s*)?\d{1,2}\s*\/\s*\d{1,2}/gi, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+function isCreditCardAdjustment(description?: string | null): boolean {
+  const text = normalizeText(description ?? '');
+  return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
+}
+
+function normalizeText(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase();
 }
