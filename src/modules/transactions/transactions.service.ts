@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
@@ -38,13 +38,14 @@ export class TransactionsService {
   async create(user: AuthenticatedUser, dto: CreateTransactionDto) {
     await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
     const applicationDate = new Date(dto.applicationDate);
+    await this.validateDuplicate(user, dto, applicationDate);
     return this.prisma.transaction.create({
       data: {
         date: new Date(),
         applicationDate,
         referenceMonth: startOfMonth(new Date(dto.referenceMonth ?? dto.applicationDate)),
-        description: dto.description,
-        amountCents: dto.amountCents,
+        description: dto.description.trim(),
+        amountCents: Math.abs(dto.amountCents),
         type: dto.type,
         status: this.resolveManualStatus(applicationDate, dto.status),
         recurrenceType: dto.recurrenceType ?? 'none',
@@ -69,13 +70,21 @@ export class TransactionsService {
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateTransactionDto) {
     const current = await this.ensureTransaction(user, id);
-    await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
+    const { allowDuplicate: _allowDuplicate, ...updateData } = dto;
+    await this.validateRelations(
+      user,
+      dto.accountId ?? current.accountId ?? undefined,
+      dto.categoryId,
+      dto.invoiceId ?? current.invoiceId ?? undefined,
+    );
     const applicationDate = dto.applicationDate ? new Date(dto.applicationDate) : current.applicationDate;
     return this.prisma.transaction.update({
       where: { id },
       data: {
-        ...dto,
+        ...updateData,
         date: undefined,
+        description: dto.description?.trim(),
+        amountCents: dto.amountCents !== undefined ? Math.abs(dto.amountCents) : undefined,
         applicationDate: dto.applicationDate ? applicationDate : undefined,
         referenceMonth: dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined,
         status: dto.status || dto.applicationDate ? this.resolveManualStatus(applicationDate, dto.status) : undefined,
@@ -97,7 +106,7 @@ export class TransactionsService {
 
   private async ensureTransaction(user: AuthenticatedUser, id: string) {
     const transaction = await this.prisma.transaction.findFirst({
-      where: { id, memberProfile: { familyId: user.familyId } },
+      where: { id, memberProfileId: user.profileId },
     });
     if (!transaction) {
       throw new NotFoundException('Lançamento não encontrado');
@@ -111,11 +120,14 @@ export class TransactionsService {
     categoryId?: string,
     invoiceId?: string,
   ) {
-    if (accountId) {
-      const account = await this.prisma.account.findFirst({
-        where: { id: accountId, memberProfileId: user.profileId },
-      });
-      if (!account) throw new BadRequestException('Conta inválida');
+    const account = accountId
+      ? await this.prisma.account.findFirst({
+          where: { id: accountId, memberProfileId: user.profileId },
+        })
+      : null;
+
+    if (accountId && !account) {
+      throw new BadRequestException('Conta inválida');
     }
 
     if (categoryId) {
@@ -130,8 +142,14 @@ export class TransactionsService {
         where: { id: invoiceId, memberProfileId: user.profileId },
       });
       if (!invoice) throw new BadRequestException('Fatura inválida');
-      if (accountId && invoice.accountId !== accountId) {
+      if (!accountId) {
+        throw new BadRequestException('Informe a conta da fatura');
+      }
+      if (invoice.accountId !== accountId) {
         throw new BadRequestException('Fatura não pertence à conta selecionada');
+      }
+      if (account?.type !== 'credit_card') {
+        throw new BadRequestException('Fatura só pode ser vinculada a cartão de crédito');
       }
     }
   }
@@ -140,4 +158,62 @@ export class TransactionsService {
     if (applicationDate <= endOfDay(new Date())) return 'confirmed';
     return requested ?? 'pending';
   }
+
+  private async validateDuplicate(user: AuthenticatedUser, dto: CreateTransactionDto, applicationDate: Date) {
+    const sameValueAndDate = await this.prisma.transaction.findMany({
+      where: {
+        memberProfileId: user.profileId,
+        applicationDate,
+        amountCents: Math.abs(dto.amountCents),
+      },
+      select: {
+        id: true,
+        description: true,
+        amountCents: true,
+        applicationDate: true,
+      },
+      take: 5,
+    });
+
+    if (sameValueAndDate.length === 0) return;
+
+    const description = normalizeDescription(dto.description);
+    const strongDuplicate = sameValueAndDate.find(
+      (transaction) => normalizeDescription(transaction.description) === description,
+    );
+
+    if (strongDuplicate) {
+      throw new BadRequestException({
+        code: 'STRONG_DUPLICATE',
+        message: 'Já existe um lançamento com o mesmo valor, data de aplicação e descrição.',
+        duplicate: this.mapDuplicate(strongDuplicate),
+      });
+    }
+
+    if (!dto.allowDuplicate) {
+      throw new ConflictException({
+        code: 'FALSE_DUPLICATE',
+        message: 'Já existe um lançamento com o mesmo valor e data de aplicação.',
+        duplicate: this.mapDuplicate(sameValueAndDate[0]),
+      });
+    }
+  }
+
+  private mapDuplicate(transaction: { id: string; description: string; amountCents: number; applicationDate: Date }) {
+    return {
+      id: transaction.id,
+      description: transaction.description,
+      amountCents: transaction.amountCents,
+      applicationDate: transaction.applicationDate.toISOString(),
+    };
+  }
+}
+
+function normalizeDescription(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
 }

@@ -72,18 +72,27 @@ export class InvoicesService {
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateInvoiceDto) {
     const invoice = await this.ensureInvoice(user, id);
-    if (dto.accountId) {
-      const account = await this.prisma.account.findFirst({
-        where: { id: dto.accountId, memberProfileId: user.profileId, type: 'credit_card' },
-      });
-      if (!account) throw new BadRequestException('Cartão inválido');
-    }
+    const nextAccountId = dto.accountId ?? invoice.accountId;
+    const account = await this.prisma.account.findFirst({
+      where: { id: nextAccountId, memberProfileId: user.profileId, type: 'credit_card' },
+    });
+    if (!account) throw new BadRequestException('Cartão inválido');
 
     if (dto.status === 'paid' && invoice.status === 'open') {
       throw new BadRequestException('Feche a fatura antes de marcar como paga');
     }
 
     const nextReferenceMonth = dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined;
+    if (nextReferenceMonth || dto.accountId) {
+      const existing = await this.prisma.invoice.findFirst({
+        where: {
+          accountId: nextAccountId,
+          referenceMonth: nextReferenceMonth ?? invoice.referenceMonth,
+          id: { not: id },
+        },
+      });
+      if (existing) throw new BadRequestException('Fatura já existe para este cartão e mês');
+    }
     const totalCents = dto.status === 'closed' ? await this.calculateInvoiceTotalCents(id) : undefined;
 
     return this.prisma.invoice.update({
@@ -107,7 +116,7 @@ export class InvoicesService {
 
   private async ensureInvoice(user: AuthenticatedUser, id: string) {
     const invoice = await this.prisma.invoice.findFirst({
-      where: { id, memberProfile: { familyId: user.familyId } },
+      where: { id, memberProfileId: user.profileId },
     });
     if (!invoice) throw new NotFoundException('Fatura não encontrada');
     return invoice;

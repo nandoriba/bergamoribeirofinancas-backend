@@ -23,10 +23,11 @@ export class RecurringService {
 
   async create(user: AuthenticatedUser, dto: CreateRecurringDto) {
     await this.validateRelations(user, dto.accountId, dto.categoryId);
+    this.validatePeriod(dto.startsAt, dto.endsAt);
     return this.prisma.recurringTemplate.create({
       data: {
-        description: dto.description,
-        amountCents: dto.amountCents,
+        description: dto.description.trim(),
+        amountCents: Math.abs(dto.amountCents),
         type: dto.type,
         dayOfMonth: dto.dayOfMonth,
         startsAt: new Date(dto.startsAt),
@@ -44,12 +45,15 @@ export class RecurringService {
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateRecurringDto) {
-    await this.ensure(user, id);
+    const current = await this.ensure(user, id);
     await this.validateRelations(user, dto.accountId, dto.categoryId);
+    this.validatePeriod(dto.startsAt ?? current.startsAt.toISOString(), dto.endsAt ?? current.endsAt?.toISOString());
     return this.prisma.recurringTemplate.update({
       where: { id },
       data: {
         ...dto,
+        description: dto.description?.trim(),
+        amountCents: dto.amountCents !== undefined ? Math.abs(dto.amountCents) : undefined,
         startsAt: dto.startsAt ? new Date(dto.startsAt) : undefined,
         endsAt: dto.endsAt ? new Date(dto.endsAt) : undefined,
       },
@@ -122,7 +126,7 @@ export class RecurringService {
 
   private async ensure(user: AuthenticatedUser, id: string) {
     const template = await this.prisma.recurringTemplate.findFirst({
-      where: { id, memberProfile: { familyId: user.familyId } },
+      where: { id, memberProfileId: user.profileId },
     });
     if (!template) throw new NotFoundException('Recorrente não encontrado');
     return template;
@@ -141,6 +145,13 @@ export class RecurringService {
         where: { id: categoryId, familyId: user.familyId },
       });
       if (!category) throw new BadRequestException('Categoria inválida');
+    }
+  }
+
+  private validatePeriod(startsAt?: string, endsAt?: string | null) {
+    if (!startsAt || !endsAt) return;
+    if (new Date(endsAt) < new Date(startsAt)) {
+      throw new BadRequestException('Data final não pode ser anterior à data inicial');
     }
   }
 }

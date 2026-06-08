@@ -28,11 +28,13 @@ export class AllExceptionsFilter implements ExceptionFilter {
       this.logger.error(exception instanceof Error ? exception.stack : String(exception));
     }
 
+    const details = typeof payload === 'object' && payload !== null ? payload : {};
+
     response.status(status).json({
+      ...details,
       statusCode: status,
       message,
       timestamp: new Date().toISOString(),
     });
   }
 }
-

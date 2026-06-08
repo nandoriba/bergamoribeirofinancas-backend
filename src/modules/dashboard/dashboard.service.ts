@@ -161,6 +161,7 @@ export class DashboardService {
         suggestedCategory: row.suggestedCategory ?? 'Revisar',
         value: row.amountCents ?? 0,
         status: row.status,
+        falseDuplicate: row.falseDuplicate,
       })),
     };
   }

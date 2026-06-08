@@ -42,9 +42,12 @@ export class InstallmentsService {
   }
 
   async create(user: AuthenticatedUser, dto: CreateInstallmentDto) {
+    this.validateInstallmentShape(dto);
     const account = await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
     const firstReferenceMonth = startOfMonth(new Date(dto.firstReferenceMonth));
     const firstInstallmentReference = addMonths(firstReferenceMonth, 1 - dto.firstInstallmentNumber);
+    const monthlyAmountCents = Math.abs(dto.monthlyAmountCents);
+    const totalAmountCents = monthlyAmountCents * dto.totalInstallments;
     const candidates = await this.findLinkCandidates(user, dto, firstInstallmentReference);
 
     if (candidates.length > 0 && !dto.confirmExistingLinks) {
@@ -64,15 +67,15 @@ export class InstallmentsService {
       );
       const plan = await tx.installmentPlan.create({
         data: {
-          description: dto.description,
+          description: dto.description.trim(),
           totalInstallments: dto.totalInstallments,
           firstInstallmentNumber: dto.firstInstallmentNumber,
           firstReferenceMonth,
           paidInstallments:
             dto.paidInstallments ??
             installmentApplicationDates.filter((applicationDate) => applicationDate <= todayEnd).length,
-          monthlyAmountCents: dto.monthlyAmountCents,
-          totalAmountCents: dto.totalAmountCents,
+          monthlyAmountCents,
+          totalAmountCents,
           startsAt: bookkeepingDate,
           memberProfileId: user.profileId,
         },
@@ -107,8 +110,8 @@ export class InstallmentsService {
             date: bookkeepingDate,
             applicationDate,
             referenceMonth,
-            description: `${dto.description} - Parcela ${installmentNumber}/${dto.totalInstallments}`,
-            amountCents: dto.monthlyAmountCents,
+            description: `${dto.description.trim()} - Parcela ${installmentNumber}/${dto.totalInstallments}`,
+            amountCents: monthlyAmountCents,
             type: 'expense',
             status: 'confirmed',
             recurrenceType: 'none',
@@ -144,16 +147,25 @@ export class InstallmentsService {
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateInstallmentDto) {
-    await this.ensure(user, id);
+    const current = await this.ensure(user, id);
+    this.validateInstallmentShape({
+      description: dto.description ?? current.description,
+      totalInstallments: dto.totalInstallments ?? current.totalInstallments,
+      firstInstallmentNumber: dto.firstInstallmentNumber ?? current.firstInstallmentNumber,
+      paidInstallments: dto.paidInstallments ?? current.paidInstallments,
+      monthlyAmountCents: dto.monthlyAmountCents ?? current.monthlyAmountCents,
+    });
+    const totalAmountCents =
+      Math.abs(dto.monthlyAmountCents ?? current.monthlyAmountCents) * (dto.totalInstallments ?? current.totalInstallments);
     const updated = await this.prisma.installmentPlan.update({
       where: { id },
       data: {
-        description: dto.description,
+        description: dto.description?.trim(),
         totalInstallments: dto.totalInstallments,
         paidInstallments: dto.paidInstallments,
         firstInstallmentNumber: dto.firstInstallmentNumber,
-        monthlyAmountCents: dto.monthlyAmountCents,
-        totalAmountCents: dto.totalAmountCents,
+        monthlyAmountCents: dto.monthlyAmountCents !== undefined ? Math.abs(dto.monthlyAmountCents) : undefined,
+        totalAmountCents,
         startsAt: dto.startsAt ? new Date(dto.startsAt) : undefined,
         firstReferenceMonth: dto.firstReferenceMonth ? new Date(dto.firstReferenceMonth) : undefined,
       },
@@ -188,7 +200,7 @@ export class InstallmentsService {
 
   private async ensure(user: AuthenticatedUser, id: string) {
     const plan = await this.prisma.installmentPlan.findFirst({
-      where: { id, memberProfile: { familyId: user.familyId } },
+      where: { id, memberProfileId: user.profileId },
     });
     if (!plan) throw new NotFoundException('Parcelamento não encontrado');
     return plan;
@@ -223,8 +235,14 @@ export class InstallmentsService {
         where: { id: invoiceId, memberProfileId: user.profileId },
       });
       if (!invoice) throw new BadRequestException('Fatura inválida');
-      if (accountId && invoice.accountId !== accountId) {
+      if (!accountId) {
+        throw new BadRequestException('Informe a conta da fatura');
+      }
+      if (invoice.accountId !== accountId) {
         throw new BadRequestException('Fatura não pertence à conta selecionada');
+      }
+      if (account?.type !== 'credit_card') {
+        throw new BadRequestException('Fatura só pode ser vinculada a cartão de crédito');
       }
     }
 
@@ -233,6 +251,7 @@ export class InstallmentsService {
 
   private async findLinkCandidates(user: AuthenticatedUser, dto: CreateInstallmentDto, firstInstallmentReference: Date) {
     const normalizedDescription = normalizeText(dto.description);
+    const monthlyAmountCents = Math.abs(dto.monthlyAmountCents);
     const candidates = [];
 
     for (let installmentNumber = 1; installmentNumber <= dto.totalInstallments; installmentNumber += 1) {
@@ -241,7 +260,7 @@ export class InstallmentsService {
         where: {
           memberProfileId: user.profileId,
           referenceMonth,
-          amountCents: dto.monthlyAmountCents,
+          amountCents: monthlyAmountCents,
           installmentPlanId: null,
           type: 'expense',
         },
@@ -295,6 +314,21 @@ export class InstallmentsService {
     });
 
     return invoice.id;
+  }
+
+  private validateInstallmentShape(dto: Pick<CreateInstallmentDto, 'description' | 'firstInstallmentNumber' | 'monthlyAmountCents' | 'paidInstallments' | 'totalInstallments'>) {
+    if (!dto.description.trim()) {
+      throw new BadRequestException('Descrição obrigatória');
+    }
+    if (dto.firstInstallmentNumber > dto.totalInstallments) {
+      throw new BadRequestException('Parcela atual não pode ser maior que o total de parcelas');
+    }
+    if ((dto.paidInstallments ?? 0) > dto.totalInstallments) {
+      throw new BadRequestException('Parcelas pagas não podem ser maiores que o total de parcelas');
+    }
+    if (dto.monthlyAmountCents <= 0) {
+      throw new BadRequestException('Valor da parcela deve ser maior que zero');
+    }
   }
 }
 

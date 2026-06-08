@@ -338,6 +338,7 @@ model ImportRow {
   externalId        String?
   suggestedCategory String?
   status            ImportRowStatus @default(new)
+  falseDuplicate    Boolean         @default(false)
   importBatchId     String
   importBatch       ImportBatch     @relation(fields: [importBatchId], references: [id])
   transaction        Transaction?

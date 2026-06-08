@@ -50,12 +50,19 @@ describe('InstallmentsService', () => {
       totalInstallments: 3,
       firstInstallmentNumber: 2,
       monthlyAmountCents: 100_00,
-      totalAmountCents: 300_00,
+      totalAmountCents: 999_00,
       startsAt: '2026-06-08T12:00:00.000Z',
       firstApplicationDate: '2026-06-05',
       firstReferenceMonth: '2026-06-01',
     });
 
+    expect(tx.installmentPlan.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          totalAmountCents: 300_00,
+        }),
+      }),
+    );
     expect(transactionCreates).toEqual([
       expect.objectContaining({
         referenceMonth: new Date('2026-05-01T00:00:00.000Z'),
@@ -73,5 +80,31 @@ describe('InstallmentsService', () => {
         status: 'confirmed',
       }),
     ]);
+  });
+
+  it('rejects current installment number above total installments before writing', async () => {
+    const prisma = {
+      $transaction: vi.fn(),
+      transaction: { findFirst: vi.fn() },
+    };
+    const service = new InstallmentsService(prisma as never);
+
+    await expect(
+      service.create(user, {
+        description: 'Compra',
+        totalInstallments: 3,
+        firstInstallmentNumber: 4,
+        monthlyAmountCents: 100_00,
+        totalAmountCents: 300_00,
+        startsAt: '2026-06-08T12:00:00.000Z',
+        firstApplicationDate: '2026-06-05',
+        firstReferenceMonth: '2026-06-01',
+      }),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        message: 'Parcela atual não pode ser maior que o total de parcelas',
+      }),
+    });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 });

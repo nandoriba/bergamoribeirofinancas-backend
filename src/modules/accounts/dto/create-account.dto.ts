@@ -1,8 +1,10 @@
 import { AccountType } from '@prisma/client';
-import { IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
 
 export class CreateAccountDto {
   @IsString()
+  @IsNotEmpty()
+  @MaxLength(80)
   name!: string;
 
   @IsEnum(AccountType)
@@ -10,10 +12,12 @@ export class CreateAccountDto {
 
   @IsOptional()
   @IsString()
+  @MaxLength(80)
   institution?: string;
 
   @IsOptional()
   @IsString()
+  @Matches(/^\d{4}$/)
   lastFourDigits?: string;
 
   @IsOptional()
@@ -32,4 +36,3 @@ export class CreateAccountDto {
   @IsInt()
   initialBalanceCents?: number;
 }
-

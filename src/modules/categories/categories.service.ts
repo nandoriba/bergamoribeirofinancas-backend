@@ -20,7 +20,8 @@ export class CategoriesService {
     return this.prisma.category.create({
       data: {
         ...dto,
-        aliases: dto.aliases ?? [],
+        name: dto.name.trim(),
+        aliases: normalizeAliases(dto.aliases),
         familyId: user.familyId,
       },
     });
@@ -28,7 +29,14 @@ export class CategoriesService {
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateCategoryDto) {
     await this.ensureCategory(user, id);
-    return this.prisma.category.update({ where: { id }, data: dto });
+    return this.prisma.category.update({
+      where: { id },
+      data: {
+        ...dto,
+        name: dto.name?.trim(),
+        aliases: dto.aliases ? normalizeAliases(dto.aliases) : undefined,
+      },
+    });
   }
 
   async remove(user: AuthenticatedUser, id: string) {
@@ -45,3 +53,6 @@ export class CategoriesService {
   }
 }
 
+function normalizeAliases(aliases?: string[]) {
+  return aliases?.map((alias) => alias.trim()).filter(Boolean) ?? [];
+}

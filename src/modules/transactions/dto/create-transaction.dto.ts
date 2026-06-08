@@ -1,5 +1,5 @@
 import { RecurrenceType, TransactionStatus, TransactionType } from '@prisma/client';
-import { IsDateString, IsEnum, IsInt, IsOptional, IsString, IsUUID, Min } from 'class-validator';
+import { IsBoolean, IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, IsUUID, MaxLength, Min } from 'class-validator';
 
 export class CreateTransactionDto {
   @IsOptional()
@@ -14,9 +14,12 @@ export class CreateTransactionDto {
   referenceMonth?: string;
 
   @IsString()
+  @IsNotEmpty()
+  @MaxLength(140)
   description!: string;
 
   @IsInt()
+  @Min(1)
   amountCents!: number;
 
   @IsEnum(TransactionType)
@@ -58,4 +61,8 @@ export class CreateTransactionDto {
   @IsInt()
   @Min(1)
   installmentNumber?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  allowDuplicate?: boolean;
 }

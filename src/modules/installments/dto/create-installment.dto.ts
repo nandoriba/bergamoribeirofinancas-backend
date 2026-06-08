@@ -1,7 +1,9 @@
-import { IsBoolean, IsDateString, IsInt, IsOptional, IsString, IsUUID, Min } from 'class-validator';
+import { IsBoolean, IsDateString, IsInt, IsNotEmpty, IsOptional, IsString, IsUUID, MaxLength, Min } from 'class-validator';
 
 export class CreateInstallmentDto {
   @IsString()
+  @IsNotEmpty()
+  @MaxLength(140)
   description!: string;
 
   @IsInt()
@@ -17,9 +19,11 @@ export class CreateInstallmentDto {
   paidInstallments?: number = 0;
 
   @IsInt()
+  @Min(1)
   monthlyAmountCents!: number;
 
   @IsInt()
+  @Min(1)
   totalAmountCents!: number;
 
   @IsDateString()

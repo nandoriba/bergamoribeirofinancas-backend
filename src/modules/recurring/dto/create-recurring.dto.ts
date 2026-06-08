@@ -1,11 +1,14 @@
 import { RecurringStatus, TransactionType } from '@prisma/client';
-import { IsDateString, IsEnum, IsInt, IsOptional, IsString, IsUUID, Max, Min } from 'class-validator';
+import { IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, IsUUID, Max, MaxLength, Min } from 'class-validator';
 
 export class CreateRecurringDto {
   @IsString()
+  @IsNotEmpty()
+  @MaxLength(140)
   description!: string;
 
   @IsInt()
+  @Min(1)
   amountCents!: number;
 
   @IsEnum(TransactionType)
@@ -35,4 +38,3 @@ export class CreateRecurringDto {
   @IsUUID()
   categoryId?: string;
 }
-
