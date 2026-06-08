@@ -10,6 +10,16 @@ export class ConfirmImportDto {
   rowIds?: string[];
 
   @IsOptional()
+  @IsArray()
+  @IsUUID('4', { each: true })
+  acceptedPossibleDuplicateRowIds?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsUUID('4', { each: true })
+  confirmedDuplicateRowIds?: string[];
+
+  @IsOptional()
   @IsUUID()
   accountId?: string;
 }

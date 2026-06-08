@@ -158,4 +158,62 @@ describe('DashboardService', () => {
       }),
     );
   });
+
+  it('rebuilds possible duplicate candidates when preview rows have no stored evidence', async () => {
+    const prisma = {
+      importRow: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'preview-row-1',
+            description: 'Compra parecida',
+            date: new Date('2026-08-02T00:00:00.000Z'),
+            amountCents: 1990,
+          },
+        ]),
+      },
+      transaction: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'transaction-1',
+            description: 'Compra existente',
+            applicationDate: new Date('2026-08-02T00:00:00.000Z'),
+            amountCents: 1990,
+            account: { name: 'Nubank Cartão' },
+          },
+        ]),
+      },
+    };
+    const service = new DashboardService(prisma as never, {} as never);
+    const candidates = await (
+      service as unknown as {
+        resolveImportDuplicateCandidates(row: unknown): Promise<unknown[]>;
+      }
+    ).resolveImportDuplicateCandidates({
+      id: 'preview-row-2',
+      importBatchId: 'batch-1',
+      importBatch: { memberProfileId: 'profile-1' },
+      status: 'duplicate',
+      falseDuplicate: true,
+      date: new Date('2026-08-02T00:00:00.000Z'),
+      description: 'Passei Direto - Parcela 12/12',
+      amountCents: 1990,
+      duplicateCandidates: null,
+    });
+
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        description: 'Compra existente',
+        applicationDate: '2026-08-02',
+        amountCents: 1990,
+        source: 'Sistema',
+        accountName: 'Nubank Cartão',
+      }),
+      expect.objectContaining({
+        description: 'Compra parecida',
+        applicationDate: '2026-08-02',
+        amountCents: 1990,
+        source: 'Prévia atual',
+      }),
+    ]);
+  });
 });

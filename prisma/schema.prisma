@@ -339,6 +339,7 @@ model ImportRow {
   suggestedCategory String?
   status            ImportRowStatus @default(new)
   falseDuplicate    Boolean         @default(false)
+  duplicateCandidates Json?
   importBatchId     String
   importBatch       ImportBatch     @relation(fields: [importBatchId], references: [id])
   transaction        Transaction?

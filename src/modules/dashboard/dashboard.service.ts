@@ -37,6 +37,17 @@ const transactionInclude = {
 type DashboardTransaction = Prisma.TransactionGetPayload<{ include: typeof transactionInclude }>;
 type DashboardInvoice = Prisma.InvoiceGetPayload<{ include: { account: true } }>;
 type DashboardRecurring = Prisma.RecurringTemplateGetPayload<Record<string, never>>;
+type DashboardImportRow = Prisma.ImportRowGetPayload<{ include: { importBatch: true } }>;
+export type ImportPreviewStatus = 'new' | 'duplicate' | 'possible_duplicate' | 'review';
+
+export interface ImportDuplicateCandidate {
+  id?: string;
+  description: string;
+  applicationDate: string;
+  amountCents: number;
+  source: string;
+  accountName?: string | null;
+}
 
 interface DashboardQuery {
   referenceMonth?: string;
@@ -107,6 +118,7 @@ export class DashboardService {
     const categoryTotals = this.groupExpenseCategories(monthTransactions);
     const confirmedInstallments = this.summarizeCreditCardInstallments(currentTransactions);
     const projectedInstallments = this.summarizeCreditCardInstallments(monthTransactions);
+    const importPreview = await this.mapImportPreviewRows(importRows);
 
     return {
       monthRef: monthKey(reference),
@@ -152,17 +164,7 @@ export class DashboardService {
       donutSlices: categoryTotals.donutSlices,
       despesaTotalMes: despesaFuturo,
       transactions: monthTransactions.slice(0, 12).map((transaction) => this.mapTransaction(transaction)),
-      importPreview: importRows.map((row) => ({
-        id: row.id,
-        batchId: row.importBatch.id,
-        date: row.date ? this.formatShortDate(row.date) : '-',
-        description: row.description ?? 'Linha sem descrição',
-        source: row.importBatch.type,
-        suggestedCategory: row.suggestedCategory ?? 'Revisar',
-        value: row.amountCents ?? 0,
-        status: row.status,
-        falseDuplicate: row.falseDuplicate,
-      })),
+      importPreview,
     };
   }
 
@@ -351,6 +353,93 @@ export class DashboardService {
     });
   }
 
+  private async mapImportPreviewRows(rows: DashboardImportRow[]) {
+    return Promise.all(
+      rows.map(async (row) => ({
+        id: row.id,
+        batchId: row.importBatch.id,
+        date: row.date ? this.formatShortDate(row.date) : '-',
+        description: row.description ?? 'Linha sem descrição',
+        applicationDate: row.date ? toDateKey(row.date) : null,
+        source: row.importBatch.type,
+        suggestedCategory: row.suggestedCategory ?? 'Revisar',
+        value: row.amountCents ?? 0,
+        status: mapImportPreviewStatus(row.status, row.falseDuplicate),
+        duplicateCandidates: await this.resolveImportDuplicateCandidates(row),
+      })),
+    );
+  }
+
+  private async resolveImportDuplicateCandidates(row: DashboardImportRow): Promise<ImportDuplicateCandidate[]> {
+    const persisted = readImportDuplicateCandidates(row.duplicateCandidates);
+    if (persisted.length > 0) return persisted;
+    if (row.status !== ImportRowStatus.duplicate || !row.falseDuplicate || !row.date || row.amountCents === null) {
+      return [];
+    }
+
+    const amountCents = normalizeAmountCents(row.amountCents);
+    const description = normalizeText(row.description ?? '');
+    const [transactions, batchRows] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where: {
+          memberProfileId: row.importBatch.memberProfileId,
+          applicationDate: row.date,
+          amountCents,
+        },
+        select: {
+          id: true,
+          description: true,
+          applicationDate: true,
+          amountCents: true,
+          account: { select: { name: true } },
+        },
+      }),
+      this.prisma.importRow.findMany({
+        where: {
+          importBatchId: row.importBatchId,
+          date: row.date,
+          id: { not: row.id },
+        },
+        select: {
+          id: true,
+          description: true,
+          date: true,
+          amountCents: true,
+        },
+      }),
+    ]);
+
+    const transactionCandidates = transactions
+      .filter((transaction) => normalizeText(transaction.description) !== description)
+      .map((transaction) => ({
+        id: transaction.id,
+        description: transaction.description,
+        applicationDate: toDateKey(transaction.applicationDate),
+        amountCents: normalizeAmountCents(transaction.amountCents),
+        source: 'Sistema',
+        accountName: transaction.account?.name,
+      }));
+
+    const previewCandidates = batchRows
+      .filter(
+        (candidate) =>
+          candidate.date &&
+          candidate.description &&
+          candidate.amountCents !== null &&
+          normalizeAmountCents(candidate.amountCents) === amountCents &&
+          normalizeText(candidate.description) !== description,
+      )
+      .map((candidate) => ({
+        id: candidate.id,
+        description: candidate.description as string,
+        applicationDate: toDateKey(candidate.date as Date),
+        amountCents: normalizeAmountCents(candidate.amountCents as number),
+        source: 'Prévia atual',
+      }));
+
+    return [...transactionCandidates, ...previewCandidates];
+  }
+
   private formatMonth(date: Date): string {
     return `${SHORT_MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`;
   }
@@ -362,4 +451,54 @@ export class DashboardService {
   private formatMoney(cents: number): string {
     return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(cents / 100);
   }
+}
+
+function mapImportPreviewStatus(status: ImportRowStatus, falseDuplicate: boolean): ImportPreviewStatus {
+  if (status === ImportRowStatus.duplicate && falseDuplicate) return 'possible_duplicate';
+  if (status === ImportRowStatus.duplicate) return 'duplicate';
+  if (status === ImportRowStatus.review) return 'review';
+  return 'new';
+}
+
+function readImportDuplicateCandidates(value: Prisma.JsonValue | null): ImportDuplicateCandidate[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    const parsed = parseImportDuplicateCandidate(candidate);
+    return parsed ? [parsed] : [];
+  });
+}
+
+function parseImportDuplicateCandidate(value: Prisma.JsonValue): ImportDuplicateCandidate | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.description !== 'string' ||
+    typeof candidate.applicationDate !== 'string' ||
+    typeof candidate.amountCents !== 'number' ||
+    typeof candidate.source !== 'string'
+  ) {
+    return null;
+  }
+
+  return {
+    id: typeof candidate.id === 'string' ? candidate.id : undefined,
+    description: candidate.description,
+    applicationDate: candidate.applicationDate,
+    amountCents: candidate.amountCents,
+    source: candidate.source,
+    accountName: typeof candidate.accountName === 'string' ? candidate.accountName : undefined,
+  };
+}
+
+function toDateKey(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function normalizeText(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
 }

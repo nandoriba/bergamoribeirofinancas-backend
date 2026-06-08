@@ -19,7 +19,19 @@ export interface UploadedCsvFile {
 interface DuplicateClassification {
   status: ImportRowStatus;
   falseDuplicate: boolean;
+  candidates: DuplicateCandidate[];
 }
+
+export interface DuplicateCandidate {
+  id?: string;
+  description: string;
+  applicationDate: string;
+  amountCents: number;
+  source: string;
+  accountName?: string | null;
+}
+
+export type ImportPreviewStatus = 'new' | 'duplicate' | 'possible_duplicate' | 'review';
 
 @Injectable()
 export class ImportsService {
@@ -76,6 +88,9 @@ export class ImportsService {
               suggestedCategory: this.resolveSuggestedCategory(row, categories, parsed.type),
               status: duplicate.status,
               falseDuplicate: duplicate.falseDuplicate,
+              duplicateCandidates: duplicate.candidates.length
+                ? (duplicate.candidates as unknown as Prisma.InputJsonValue)
+                : undefined,
             };
           }),
         },
@@ -101,12 +116,48 @@ export class ImportsService {
     const selectedRows = dto.rowIds?.length
       ? batch.rows.filter((row) => dto.rowIds?.includes(row.id))
       : batch.rows;
+    const acceptedPossibleDuplicateRowIds = new Set(dto.acceptedPossibleDuplicateRowIds ?? []);
+    const confirmedDuplicateRowIds = new Set(dto.confirmedDuplicateRowIds ?? []);
+    const conflictingPossibleDuplicateDecisions = selectedRows.filter(
+      (row) =>
+        row.status === 'duplicate' &&
+        row.falseDuplicate &&
+        acceptedPossibleDuplicateRowIds.has(row.id) &&
+        confirmedDuplicateRowIds.has(row.id),
+    );
+    if (conflictingPossibleDuplicateDecisions.length > 0) {
+      throw new BadRequestException({
+        code: 'POSSIBLE_DUPLICATES_CONFLICTING_DECISION',
+        message: 'Escolha apenas uma decisão por possível duplicidade',
+        rowIds: conflictingPossibleDuplicateDecisions.map((row) => row.id),
+      });
+    }
+
+    const missingPossibleDuplicateDecisions = selectedRows.filter(
+      (row) =>
+        row.status === 'duplicate' &&
+        row.falseDuplicate &&
+        !acceptedPossibleDuplicateRowIds.has(row.id) &&
+        !confirmedDuplicateRowIds.has(row.id),
+    );
+    if (missingPossibleDuplicateDecisions.length > 0) {
+      throw new BadRequestException({
+        code: 'POSSIBLE_DUPLICATES_REQUIRE_DECISION',
+        message: 'Escolha se cada possível duplicidade deve ser importada ou ignorada',
+        rowIds: missingPossibleDuplicateDecisions.map((row) => row.id),
+      });
+    }
+
     const importableRows = selectedRows.filter(
       (row) =>
-        (row.status === 'new' || (row.status === 'duplicate' && row.falseDuplicate)) &&
+        (row.status === 'new' ||
+          (row.status === 'duplicate' && row.falseDuplicate && acceptedPossibleDuplicateRowIds.has(row.id))) &&
         row.date &&
         row.description &&
         row.amountCents !== null,
+    );
+    const duplicateRowsToConfirm = selectedRows.filter(
+      (row) => row.status === 'duplicate' && row.falseDuplicate && confirmedDuplicateRowIds.has(row.id),
     );
 
     const categories = await this.prisma.category.findMany({ where: { familyId: user.familyId } });
@@ -212,6 +263,13 @@ export class ImportsService {
       created.push(transaction);
     }
 
+    if (duplicateRowsToConfirm.length > 0) {
+      await this.prisma.importRow.updateMany({
+        where: { id: { in: duplicateRowsToConfirm.map((row) => row.id) } },
+        data: { status: ImportRowStatus.duplicate, falseDuplicate: false },
+      });
+    }
+
     await this.prisma.importBatch.update({
       where: { id: batch.id },
       data: { status: 'confirmed' },
@@ -286,7 +344,7 @@ export class ImportsService {
         amountCents: normalizeAmountCents(row.amountCents ?? 0),
       }));
 
-    if (filters.length === 0) return new Map<string, Set<string>>();
+    if (filters.length === 0) return new Map<string, DuplicateCandidate[]>();
 
     const uniqueFilters = [...new Map(filters.map((filter) => [duplicateKey(filter.applicationDate, filter.amountCents), filter])).values()];
     const transactions = await this.prisma.transaction.findMany({
@@ -295,15 +353,24 @@ export class ImportsService {
         OR: uniqueFilters,
       },
       select: {
+        id: true,
         applicationDate: true,
         amountCents: true,
         description: true,
+        account: { select: { name: true } },
       },
     });
 
-    const candidates = new Map<string, Set<string>>();
+    const candidates = new Map<string, DuplicateCandidate[]>();
     for (const transaction of transactions) {
-      addDuplicateCandidate(candidates, transaction.applicationDate, transaction.amountCents, transaction.description);
+      addDuplicateCandidate(candidates, {
+        id: transaction.id,
+        applicationDate: toDateKey(transaction.applicationDate),
+        amountCents: normalizeAmountCents(transaction.amountCents),
+        description: transaction.description,
+        source: 'Sistema',
+        accountName: transaction.account?.name,
+      });
     }
     return candidates;
   }
@@ -312,36 +379,47 @@ export class ImportsService {
     row: ParsedImportRow,
     existingExternalIds: Set<string>,
     seenExternalIds: Set<string>,
-    seenValueDateDescriptions: Map<string, Set<string>>,
+    seenValueDateDescriptions: Map<string, DuplicateCandidate[]>,
   ): DuplicateClassification {
-    if (row.status === 'review') return { status: ImportRowStatus.review, falseDuplicate: false };
+    if (row.status === 'review') return { status: ImportRowStatus.review, falseDuplicate: false, candidates: [] };
 
     if (row.externalId && (existingExternalIds.has(row.externalId) || seenExternalIds.has(row.externalId))) {
-      return { status: ImportRowStatus.duplicate, falseDuplicate: false };
+      return { status: ImportRowStatus.duplicate, falseDuplicate: false, candidates: [] };
     }
 
     if (row.externalId) seenExternalIds.add(row.externalId);
 
     if (!row.date || row.amountCents === undefined || !row.description) {
-      return { status: ImportRowStatus.review, falseDuplicate: false };
+      return { status: ImportRowStatus.review, falseDuplicate: false, candidates: [] };
     }
 
     const amountCents = normalizeAmountCents(row.amountCents);
     const key = duplicateKey(row.date, amountCents);
-    const descriptions = seenValueDateDescriptions.get(key);
+    const candidates = seenValueDateDescriptions.get(key);
     const description = normalizeText(row.description);
+    const currentCandidate = {
+      applicationDate: toDateKey(row.date),
+      amountCents,
+      description: row.description,
+      source: 'Prévia atual',
+    };
 
-    if (descriptions?.has(description)) {
-      return { status: ImportRowStatus.duplicate, falseDuplicate: false };
+    if (candidates?.some((candidate) => normalizeText(candidate.description) === description)) {
+      return { status: ImportRowStatus.duplicate, falseDuplicate: false, candidates };
     }
 
-    if (descriptions && descriptions.size > 0) {
-      descriptions.add(description);
-      return { status: ImportRowStatus.duplicate, falseDuplicate: true };
+    if (candidates && candidates.length > 0) {
+      const possibleDuplicateCandidates = [...candidates];
+      candidates.push(currentCandidate);
+      return {
+        status: ImportRowStatus.duplicate,
+        falseDuplicate: true,
+        candidates: possibleDuplicateCandidates,
+      };
     }
 
-    seenValueDateDescriptions.set(key, new Set([description]));
-    return { status: ImportRowStatus.new, falseDuplicate: false };
+    seenValueDateDescriptions.set(key, [currentCandidate]);
+    return { status: ImportRowStatus.new, falseDuplicate: false, candidates: [] };
   }
 
   private resolveSuggestedCategory(
@@ -385,11 +463,13 @@ export class ImportsService {
       suggestedCategory: string | null;
       status: ImportRowStatus;
       falseDuplicate: boolean;
+      duplicateCandidates: Prisma.JsonValue | null;
     },
     source: string,
   ) {
     return {
       id: row.id,
+      applicationDate: row.date ? toDateKey(row.date) : null,
       date: row.date
         ? `${String(row.date.getUTCDate()).padStart(2, '0')}/${String(row.date.getUTCMonth() + 1).padStart(2, '0')}`
         : '-',
@@ -397,8 +477,8 @@ export class ImportsService {
       source,
       suggestedCategory: row.suggestedCategory ?? 'Revisar',
       value: row.amountCents ?? 0,
-      status: row.status,
-      falseDuplicate: row.falseDuplicate,
+      status: mapPreviewStatus(row.status, row.falseDuplicate),
+      duplicateCandidates: readDuplicateCandidates(row.duplicateCandidates),
     };
   }
 }
@@ -438,14 +518,50 @@ function duplicateKey(applicationDate: Date, amountCents: number) {
   return `${applicationDate.toISOString().slice(0, 10)}:${normalizeAmountCents(amountCents)}`;
 }
 
-function addDuplicateCandidate(
-  candidates: Map<string, Set<string>>,
-  applicationDate: Date,
-  amountCents: number,
-  description: string,
-) {
-  const key = duplicateKey(applicationDate, amountCents);
-  const descriptions = candidates.get(key) ?? new Set<string>();
-  descriptions.add(normalizeText(description));
-  candidates.set(key, descriptions);
+function addDuplicateCandidate(candidates: Map<string, DuplicateCandidate[]>, candidate: DuplicateCandidate) {
+  const key = `${candidate.applicationDate}:${normalizeAmountCents(candidate.amountCents)}`;
+  const items = candidates.get(key) ?? [];
+  items.push(candidate);
+  candidates.set(key, items);
+}
+
+function mapPreviewStatus(status: ImportRowStatus, falseDuplicate: boolean): ImportPreviewStatus {
+  if (status === ImportRowStatus.duplicate && falseDuplicate) return 'possible_duplicate';
+  if (status === ImportRowStatus.duplicate) return 'duplicate';
+  if (status === ImportRowStatus.review) return 'review';
+  return 'new';
+}
+
+function toDateKey(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function readDuplicateCandidates(value: Prisma.JsonValue | null): DuplicateCandidate[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    const parsed = parseDuplicateCandidate(candidate);
+    return parsed ? [parsed] : [];
+  });
+}
+
+function parseDuplicateCandidate(value: Prisma.JsonValue): DuplicateCandidate | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.description !== 'string' ||
+    typeof candidate.applicationDate !== 'string' ||
+    typeof candidate.amountCents !== 'number' ||
+    typeof candidate.source !== 'string'
+  ) {
+    return null;
+  }
+
+  return {
+    id: typeof candidate.id === 'string' ? candidate.id : undefined,
+    description: candidate.description,
+    applicationDate: candidate.applicationDate,
+    amountCents: candidate.amountCents,
+    source: candidate.source,
+    accountName: typeof candidate.accountName === 'string' ? candidate.accountName : undefined,
+  };
 }

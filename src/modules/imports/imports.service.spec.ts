@@ -27,8 +27,19 @@ describe('ImportsService', () => {
       ),
     });
 
-    expect(preview.rows[0]).toMatchObject({ status: 'new', falseDuplicate: false });
-    expect(preview.rows[1]).toMatchObject({ status: 'duplicate', falseDuplicate: true });
+    expect(preview.rows[0]).toMatchObject({ status: 'new' });
+    expect(preview.rows[1]).toMatchObject({
+      status: 'possible_duplicate',
+      duplicateCandidates: [
+        expect.objectContaining({
+          description: 'Mercado',
+          applicationDate: '2026-06-08',
+          amountCents: 10000,
+          source: 'Prévia atual',
+        }),
+      ],
+    });
+    expect(preview.rows[1]).not.toHaveProperty('falseDuplicate');
   });
 
   it('flags same amount, application date and description as blocking duplicate', async () => {
@@ -45,8 +56,90 @@ describe('ImportsService', () => {
       ),
     });
 
-    expect(preview.rows[0]).toMatchObject({ status: 'new', falseDuplicate: false });
-    expect(preview.rows[1]).toMatchObject({ status: 'duplicate', falseDuplicate: false });
+    expect(preview.rows[0]).toMatchObject({ status: 'new' });
+    expect(preview.rows[1]).toMatchObject({ status: 'duplicate' });
+    expect(preview.rows[1]).not.toHaveProperty('falseDuplicate');
+  });
+
+  it('blocks confirming possible duplicates without an explicit decision', async () => {
+    const service = new ImportsService(
+      {
+        importBatch: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: 'batch-1',
+            type: 'nubank_account',
+            rows: [
+              {
+                id: 'row-1',
+                status: 'duplicate',
+                falseDuplicate: true,
+                date: new Date('2026-06-08T00:00:00.000Z'),
+                description: 'Farmácia',
+                amountCents: -10000,
+              },
+            ],
+          }),
+        },
+      } as never,
+      new ImportParserService(),
+      {} as never,
+    );
+
+    await expect(service.confirm(user, { batchId: 'batch-1' })).rejects.toMatchObject({
+      response: expect.objectContaining({
+        code: 'POSSIBLE_DUPLICATES_REQUIRE_DECISION',
+        rowIds: ['row-1'],
+      }),
+    });
+  });
+
+  it('allows confirming a possible duplicate as duplicate without importing it', async () => {
+    const importRowUpdateMany = vi.fn().mockResolvedValue({ count: 1 });
+    const importBatchUpdate = vi.fn().mockResolvedValue({});
+    const transactionUpsert = vi.fn();
+    const service = new ImportsService(
+      {
+        account: { findFirst: vi.fn() },
+        category: { findMany: vi.fn().mockResolvedValue([]) },
+        importBatch: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: 'batch-1',
+            type: 'nubank_account',
+            rows: [
+              {
+                id: 'row-1',
+                status: 'duplicate',
+                falseDuplicate: true,
+                date: new Date('2026-06-08T00:00:00.000Z'),
+                description: 'Farmácia',
+                amountCents: -10000,
+              },
+            ],
+          }),
+          update: importBatchUpdate,
+        },
+        importRow: { updateMany: importRowUpdateMany },
+        transaction: { upsert: transactionUpsert },
+      } as never,
+      new ImportParserService(),
+      {} as never,
+    );
+
+    const result = await service.confirm(user, {
+      batchId: 'batch-1',
+      confirmedDuplicateRowIds: ['row-1'],
+    });
+
+    expect(transactionUpsert).not.toHaveBeenCalled();
+    expect(importRowUpdateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['row-1'] } },
+      data: { status: 'duplicate', falseDuplicate: false },
+    });
+    expect(importBatchUpdate).toHaveBeenCalledWith({
+      where: { id: 'batch-1' },
+      data: { status: 'confirmed' },
+    });
+    expect(result).toMatchObject({ imported: 0, ignored: 1 });
   });
 });
 
