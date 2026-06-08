@@ -365,6 +365,7 @@ export class DashboardService {
         suggestedCategory: row.suggestedCategory ?? 'Revisar',
         value: row.amountCents ?? 0,
         status: mapImportPreviewStatus(row.status, row.falseDuplicate),
+        reviewReason: resolveImportReviewReason(row.status, row.description, row.importBatch.type),
         duplicateCandidates: await this.resolveImportDuplicateCandidates(row),
       })),
     );
@@ -501,4 +502,17 @@ function normalizeText(value: string) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, ' ');
+}
+
+function resolveImportReviewReason(status: ImportRowStatus, description: string | null, source: string): string | null {
+  if (status !== ImportRowStatus.review) return null;
+  if (source === 'nubank_credit_card' && isCreditCardAdjustment(description)) {
+    return 'Pagamento ou ajuste da fatura. Não será importado como compra.';
+  }
+  return 'Linha sem dados suficientes para importação automática.';
+}
+
+function isCreditCardAdjustment(description?: string | null): boolean {
+  const text = normalizeText(description ?? '');
+  return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
 }

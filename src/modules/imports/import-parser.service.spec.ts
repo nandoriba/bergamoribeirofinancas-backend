@@ -45,7 +45,7 @@ describe('ImportParserService', () => {
     const parsed = parser.parse('Nubank_2026-06-01.csv', 'date,title,amount\n2026-06-07,Pagamento recebido,-4341.62');
 
     expect(parsed.rows[0]).toMatchObject({
-      suggestedCategory: 'Revisar',
+      suggestedCategory: 'Ajuste de fatura',
       status: 'review',
     });
   });

@@ -427,7 +427,9 @@ export class ImportsService {
     categories: Awaited<ReturnType<PrismaService['category']['findMany']>>,
     importType: ImportType,
   ): string {
-    if (row.suggestedCategory === 'Revisar') return 'Revisar';
+    if (row.suggestedCategory === 'Revisar' || row.suggestedCategory === 'Ajuste de fatura') {
+      return row.suggestedCategory;
+    }
     const type = importType === 'nubank_credit_card' ? 'expense' : (row.amountCents ?? 0) >= 0 ? 'income' : 'expense';
     const requested = row.suggestedCategory;
     if (requested && categories.some((category) => category.type === type && category.name === requested)) {
@@ -478,6 +480,7 @@ export class ImportsService {
       suggestedCategory: row.suggestedCategory ?? 'Revisar',
       value: row.amountCents ?? 0,
       status: mapPreviewStatus(row.status, row.falseDuplicate),
+      reviewReason: resolveReviewReason(row.status, row.description, source),
       duplicateCandidates: readDuplicateCandidates(row.duplicateCandidates),
     };
   }
@@ -530,6 +533,14 @@ function mapPreviewStatus(status: ImportRowStatus, falseDuplicate: boolean): Imp
   if (status === ImportRowStatus.duplicate) return 'duplicate';
   if (status === ImportRowStatus.review) return 'review';
   return 'new';
+}
+
+function resolveReviewReason(status: ImportRowStatus, description: string | null, source: string): string | null {
+  if (status !== ImportRowStatus.review) return null;
+  if (source === 'nubank_credit_card' && isCreditCardAdjustment(description)) {
+    return 'Pagamento ou ajuste da fatura. Não será importado como compra.';
+  }
+  return 'Linha sem dados suficientes para importação automática.';
 }
 
 function toDateKey(date: Date) {

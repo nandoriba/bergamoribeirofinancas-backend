@@ -82,7 +82,7 @@ export class ImportParserService {
       description,
       amountCents,
       externalId,
-      suggestedCategory: adjustment ? 'Revisar' : suggestCategory(description, categoryAmount),
+      suggestedCategory: adjustment ? 'Ajuste de fatura' : suggestCategory(description, categoryAmount),
       status: adjustment ? 'review' : 'new',
     });
   }
