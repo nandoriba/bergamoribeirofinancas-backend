@@ -117,20 +117,19 @@ export class ImportsService {
     const selectedRows = dto.rowIds?.length
       ? batch.rows.filter((row) => dto.rowIds?.includes(row.id))
       : batch.rows;
-    const acceptedPossibleDuplicateRowIds = new Set(dto.acceptedPossibleDuplicateRowIds ?? []);
+    const acceptedDuplicateRowIds = new Set(dto.acceptedPossibleDuplicateRowIds ?? []);
     const confirmedDuplicateRowIds = new Set(dto.confirmedDuplicateRowIds ?? []);
-    const conflictingPossibleDuplicateDecisions = selectedRows.filter(
+    const conflictingDuplicateDecisions = selectedRows.filter(
       (row) =>
         row.status === 'duplicate' &&
-        row.falseDuplicate &&
-        acceptedPossibleDuplicateRowIds.has(row.id) &&
+        acceptedDuplicateRowIds.has(row.id) &&
         confirmedDuplicateRowIds.has(row.id),
     );
-    if (conflictingPossibleDuplicateDecisions.length > 0) {
+    if (conflictingDuplicateDecisions.length > 0) {
       throw new BadRequestException({
         code: 'POSSIBLE_DUPLICATES_CONFLICTING_DECISION',
-        message: 'Escolha apenas uma decisão por possível duplicidade',
-        rowIds: conflictingPossibleDuplicateDecisions.map((row) => row.id),
+        message: 'Escolha apenas uma decisão por duplicidade',
+        rowIds: conflictingDuplicateDecisions.map((row) => row.id),
       });
     }
 
@@ -138,7 +137,7 @@ export class ImportsService {
       (row) =>
         row.status === 'duplicate' &&
         row.falseDuplicate &&
-        !acceptedPossibleDuplicateRowIds.has(row.id) &&
+        !acceptedDuplicateRowIds.has(row.id) &&
         !confirmedDuplicateRowIds.has(row.id),
     );
     if (missingPossibleDuplicateDecisions.length > 0) {
@@ -152,7 +151,7 @@ export class ImportsService {
     const importableRows = selectedRows.filter(
       (row) =>
         (row.status === 'new' ||
-          (row.status === 'duplicate' && row.falseDuplicate && acceptedPossibleDuplicateRowIds.has(row.id))) &&
+          (row.status === 'duplicate' && acceptedDuplicateRowIds.has(row.id))) &&
         row.date &&
         row.description &&
         row.amountCents !== null,
@@ -174,6 +173,7 @@ export class ImportsService {
     const created = [];
     const bookkeepingDate = new Date();
     for (const row of importableRows) {
+      const forcedDuplicateImport = row.status === 'duplicate' && acceptedDuplicateRowIds.has(row.id);
       const signedAmount = row.amountCents ?? 0;
       if (batch.type === 'nubank_credit_card' && isCreditCardAdjustment(row.description)) {
         await this.prisma.importRow.update({ where: { id: row.id }, data: { status: ImportRowStatus.review } });
@@ -187,16 +187,18 @@ export class ImportsService {
       if (installment && account?.type === 'credit_card' && type === 'expense' && row.date) {
         const baseDescription = stripInstallment(row.description ?? 'Importado');
         const referenceMonth = startOfMonth(row.date);
-        const existingProjected = await this.prisma.transaction.findFirst({
-          where: {
-            memberProfileId: user.profileId,
-            accountId: account.id,
-            referenceMonth,
-            amountCents: normalizeAmountCents(signedAmount),
-            installmentNumber: installment.current,
-            description: { contains: baseDescription, mode: 'insensitive' },
-          },
-        });
+        const existingProjected = forcedDuplicateImport
+          ? null
+          : await this.prisma.transaction.findFirst({
+              where: {
+                memberProfileId: user.profileId,
+                accountId: account.id,
+                referenceMonth,
+                amountCents: normalizeAmountCents(signedAmount),
+                installmentNumber: installment.current,
+                description: { contains: baseDescription, mode: 'insensitive' },
+              },
+            });
 
         if (existingProjected) {
           await this.prisma.importRow.update({
@@ -220,7 +222,10 @@ export class ImportsService {
           confirmExistingLinks: true,
         });
 
-        await this.prisma.importRow.update({ where: { id: row.id }, data: { status: ImportRowStatus.imported } });
+        await this.prisma.importRow.update({
+          where: { id: row.id },
+          data: { status: ImportRowStatus.imported, falseDuplicate: forcedDuplicateImport ? true : undefined },
+        });
         created.push(plan);
         continue;
       }
@@ -229,12 +234,13 @@ export class ImportsService {
         account?.type === 'credit_card' && row.date
           ? await this.findOrCreateInvoice(account, user.profileId, startOfMonth(row.date))
           : undefined;
+      const externalId = forcedDuplicateImport ? row.id : row.externalId ?? row.id;
 
       const transaction = await this.prisma.transaction.upsert({
         where: {
           memberProfileId_externalId: {
             memberProfileId: user.profileId,
-            externalId: row.externalId ?? row.id,
+            externalId,
           },
         },
         update: {},
@@ -248,7 +254,8 @@ export class ImportsService {
           status: 'confirmed',
           recurrenceType: 'none',
           source: batch.type,
-          externalId: row.externalId ?? row.id,
+          externalId,
+          isInvoicePayment: isInvoicePaymentFromImport(batch.type, row.description),
           accountId: account?.id,
           invoiceId,
           categoryId,
@@ -259,7 +266,7 @@ export class ImportsService {
 
       await this.prisma.importRow.update({
         where: { id: row.id },
-        data: { status: ImportRowStatus.imported },
+        data: { status: ImportRowStatus.imported, falseDuplicate: forcedDuplicateImport ? true : undefined },
       });
       created.push(transaction);
     }
@@ -513,6 +520,12 @@ function stripInstallment(description: string) {
 function isCreditCardAdjustment(description?: string | null): boolean {
   const text = normalizeText(description ?? '');
   return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
+}
+
+function isInvoicePaymentFromImport(importType: ImportType, description?: string | null): boolean {
+  if (importType !== 'nubank_account') return false;
+  const text = normalizeText(description ?? '');
+  return text.includes('pagamento') && text.includes('fatura');
 }
 
 function normalizeText(value: string) {

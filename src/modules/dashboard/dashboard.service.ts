@@ -28,6 +28,7 @@ import { RecurringService } from '../recurring/recurring.service';
 
 const SHORT_MONTHS = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
 const CATEGORY_COLORS = ['#3d6cb0', '#5c89c4', '#7aa5d4', '#9abfe2', '#b8d3ec', '#3a4a66'];
+const CREDIT_CARD_CATEGORY = { name: 'Cartão', color: '#d99090' };
 
 const transactionInclude = {
   account: true,
@@ -108,15 +109,20 @@ export class DashboardService {
     const currentTransactions = monthTransactions.filter(
       (transaction) => transaction.status === 'confirmed' && transaction.applicationDate <= todayEnd,
     );
+    const currentSpendingTransactions = currentTransactions.filter((transaction) => !isInvoicePaymentTransaction(transaction));
+    const monthSpendingTransactions = monthTransactions.filter((transaction) => !isInvoicePaymentTransaction(transaction));
+    const previousMonthSpendingTransactions = previousMonthTransactions.filter(
+      (transaction) => !isInvoicePaymentTransaction(transaction),
+    );
     const numberOfDays = daysInMonth(reference);
     const saldoDiarioAtual = cumulativeAccountDailyBalances(0, currentTransactions, numberOfDays);
     const saldoDiarioProjetado = cumulativeAccountDailyBalances(0, monthTransactions, numberOfDays);
-    const despesaDiariaAtualSpark = dailyExpenseSeries(currentTransactions, numberOfDays);
-    const despesaDiariaProjetadaSpark = dailyExpenseSeries(monthTransactions, numberOfDays);
+    const despesaDiariaAtualSpark = dailyExpenseSeries(currentSpendingTransactions, numberOfDays);
+    const despesaDiariaProjetadaSpark = dailyExpenseSeries(monthSpendingTransactions, numberOfDays);
     const cartaoDiariaAtualSpark = dailyCreditCardSeries(currentTransactions, numberOfDays);
     const cartaoDiariaProjetadaSpark = dailyCreditCardSeries(monthTransactions, numberOfDays);
-    const despesaFuturo = expenseCents(monthTransactions);
-    const categoryTotals = this.groupExpenseCategories(monthTransactions);
+    const despesaFuturo = expenseCents(monthSpendingTransactions);
+    const categoryTotals = this.groupExpenseCategories(monthSpendingTransactions);
     const confirmedInstallments = this.summarizeCreditCardInstallments(currentTransactions);
     const projectedInstallments = this.summarizeCreditCardInstallments(monthTransactions);
     const importPreview = await this.mapImportPreviewRows(importRows);
@@ -131,9 +137,9 @@ export class DashboardService {
       saldoProjetadoTotal: accountCreditCents(monthTransactions),
       saldoAnt: 0,
       saldoMaxMes: Math.max(0, ...saldoDiarioProjetado),
-      despesaAtual: expenseCents(currentTransactions),
+      despesaAtual: expenseCents(currentSpendingTransactions),
       despesaFuturo,
-      despesaAntMes: expenseCents(previousMonthTransactions),
+      despesaAntMes: expenseCents(previousMonthSpendingTransactions),
       cartaoAtual: creditCardExpenseCents(currentTransactions),
       cartaoFuturo: creditCardExpenseCents(monthTransactions),
       cartaoAntMes: creditCardExpenseCents(previousMonthTransactions),
@@ -248,12 +254,13 @@ export class DashboardService {
     const totals = new Map<string, { name: string; value: number; color: string }>();
 
     for (const transaction of transactions) {
-      if (transaction.type !== 'expense') continue;
-      const name = transaction.category?.name ?? 'Sem categoria';
+      if (transaction.type !== 'expense' || isInvoicePaymentTransaction(transaction)) continue;
+      const category = expenseCategoryForDashboard(transaction);
+      const name = category.name;
       const current = totals.get(name) ?? {
         name,
         value: 0,
-        color: transaction.category?.color ?? CATEGORY_COLORS[totals.size % CATEGORY_COLORS.length],
+        color: category.color ?? CATEGORY_COLORS[totals.size % CATEGORY_COLORS.length],
       };
       current.value += normalizeAmountCents(transaction.amountCents);
       totals.set(name, current);
@@ -373,14 +380,20 @@ export class DashboardService {
   }
 
   private async resolveImportDuplicateCandidates(row: DashboardImportRow): Promise<ImportDuplicateCandidate[]> {
-    const persisted = readImportDuplicateCandidates(row.duplicateCandidates);
-    if (persisted.length > 0) return persisted;
-    if (row.status !== ImportRowStatus.duplicate || !row.falseDuplicate || !row.date || row.amountCents === null) {
+    if (row.status !== ImportRowStatus.duplicate || !row.date || row.amountCents === null) {
       return [];
     }
 
     const signedAmountCents = duplicateAmountForImportRow(row.importBatch.type, row.amountCents);
+    const persisted = readImportDuplicateCandidates(row.duplicateCandidates).filter(
+      (candidate) =>
+        candidate.applicationDate === toDateKey(row.date as Date) && Math.round(candidate.amountCents) === signedAmountCents,
+    );
+    if (persisted.length > 0) return persisted;
+
     const description = normalizeText(row.description ?? '');
+    const shouldIncludeCandidate = (candidateDescription: string) =>
+      !row.falseDuplicate || normalizeText(candidateDescription) !== description;
     const [transactions, batchRows] = await Promise.all([
       this.prisma.transaction.findMany({
         where: {
@@ -414,7 +427,7 @@ export class DashboardService {
     ]);
 
     const transactionCandidates = transactions
-      .filter((transaction) => normalizeText(transaction.description) !== description)
+      .filter((transaction) => shouldIncludeCandidate(transaction.description))
       .map((transaction) => ({
         id: transaction.id,
         description: transaction.description,
@@ -431,7 +444,7 @@ export class DashboardService {
           candidate.description &&
           candidate.amountCents !== null &&
           duplicateAmountForImportRow(row.importBatch.type, candidate.amountCents) === signedAmountCents &&
-          normalizeText(candidate.description) !== description,
+          shouldIncludeCandidate(candidate.description),
       )
       .map((candidate) => ({
         id: candidate.id,
@@ -518,6 +531,27 @@ function resolveImportReviewReason(status: ImportRowStatus, description: string 
 function isCreditCardAdjustment(description?: string | null): boolean {
   const text = normalizeText(description ?? '');
   return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
+}
+
+function isInvoicePaymentTransaction(
+  transaction: Pick<DashboardTransaction, 'type' | 'description' | 'isInvoicePayment' | 'account' | 'category'>,
+): boolean {
+  if (transaction.isInvoicePayment) return true;
+  if (transaction.type !== 'expense' || transaction.account?.type === 'credit_card') return false;
+
+  const description = normalizeText(transaction.description);
+  const category = normalizeText(transaction.category?.name ?? '');
+  return category === 'cartao' && description.includes('pagamento') && description.includes('fatura');
+}
+
+function expenseCategoryForDashboard(
+  transaction: Pick<DashboardTransaction, 'account' | 'category'>,
+): { name: string; color?: string | null } {
+  if (transaction.account?.type === 'credit_card') return CREDIT_CARD_CATEGORY;
+  return {
+    name: transaction.category?.name ?? 'Sem categoria',
+    color: transaction.category?.color,
+  };
 }
 
 function duplicateAmountForImportRow(importType: ImportType, amountCents: number): number {

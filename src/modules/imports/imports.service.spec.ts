@@ -42,7 +42,7 @@ describe('ImportsService', () => {
     expect(preview.rows[1]).not.toHaveProperty('falseDuplicate');
   });
 
-  it('flags same amount, application date and description as blocking duplicate', async () => {
+  it('flags same amount, application date and description as duplicate with comparison evidence', async () => {
     const service = new ImportsService(buildPreviewPrismaMock() as never, new ImportParserService(), {} as never);
 
     const preview = await service.preview(user, {
@@ -57,7 +57,17 @@ describe('ImportsService', () => {
     });
 
     expect(preview.rows[0]).toMatchObject({ status: 'new' });
-    expect(preview.rows[1]).toMatchObject({ status: 'duplicate' });
+    expect(preview.rows[1]).toMatchObject({
+      status: 'duplicate',
+      duplicateCandidates: [
+        expect.objectContaining({
+          description: 'Mercado',
+          applicationDate: '2026-06-08',
+          amountCents: -10000,
+          source: 'Prévia atual',
+        }),
+      ],
+    });
     expect(preview.rows[1]).not.toHaveProperty('falseDuplicate');
   });
 
@@ -158,6 +168,127 @@ describe('ImportsService', () => {
       data: { status: 'confirmed' },
     });
     expect(result).toMatchObject({ imported: 0, ignored: 1 });
+  });
+
+  it('allows forcing a strong duplicate import and stores the user decision flag', async () => {
+    const importRowUpdate = vi.fn().mockResolvedValue({});
+    const importBatchUpdate = vi.fn().mockResolvedValue({});
+    const transactionUpsert = vi.fn().mockResolvedValue({ id: 'transaction-1' });
+    const service = new ImportsService(
+      {
+        account: { findFirst: vi.fn() },
+        category: { findMany: vi.fn().mockResolvedValue([]) },
+        importBatch: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: 'batch-1',
+            type: 'nubank_account',
+            rows: [
+              {
+                id: 'row-1',
+                status: 'duplicate',
+                falseDuplicate: false,
+                date: new Date('2026-06-08T00:00:00.000Z'),
+                description: 'Mercado',
+                amountCents: -10000,
+                externalId: 'nubank-account:2026-06-08:mercado:-10000',
+                raw: {},
+              },
+            ],
+          }),
+          update: importBatchUpdate,
+        },
+        importRow: { update: importRowUpdate, updateMany: vi.fn() },
+        transaction: { upsert: transactionUpsert },
+      } as never,
+      new ImportParserService(),
+      {} as never,
+    );
+
+    const result = await service.confirm(user, {
+      batchId: 'batch-1',
+      acceptedPossibleDuplicateRowIds: ['row-1'],
+    });
+
+    expect(transactionUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          memberProfileId_externalId: {
+            memberProfileId: 'profile-1',
+            externalId: 'row-1',
+          },
+        },
+        create: expect.objectContaining({
+          externalId: 'row-1',
+          amountCents: 10000,
+          type: 'expense',
+        }),
+      }),
+    );
+    expect(importRowUpdate).toHaveBeenCalledWith({
+      where: { id: 'row-1' },
+      data: { status: 'imported', falseDuplicate: true },
+    });
+    expect(importBatchUpdate).toHaveBeenCalledWith({
+      where: { id: 'batch-1' },
+      data: { status: 'confirmed' },
+    });
+    expect(result).toMatchObject({ imported: 1, ignored: 0 });
+  });
+
+  it('marks account invoice payments during import', async () => {
+    const importRowUpdate = vi.fn().mockResolvedValue({});
+    const importBatchUpdate = vi.fn().mockResolvedValue({});
+    const transactionUpsert = vi.fn().mockResolvedValue({ id: 'transaction-1' });
+    const service = new ImportsService(
+      {
+        account: { findFirst: vi.fn() },
+        category: { findMany: vi.fn().mockResolvedValue([]) },
+        importBatch: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: 'batch-1',
+            type: 'nubank_account',
+            rows: [
+              {
+                id: 'row-1',
+                status: 'new',
+                falseDuplicate: false,
+                date: new Date('2026-06-07T00:00:00.000Z'),
+                description: 'Pagamento de fatura',
+                amountCents: -434162,
+                externalId: 'payment-row',
+                raw: {},
+              },
+            ],
+          }),
+          update: importBatchUpdate,
+        },
+        importRow: { update: importRowUpdate, updateMany: vi.fn() },
+        transaction: { upsert: transactionUpsert },
+      } as never,
+      new ImportParserService(),
+      {} as never,
+    );
+
+    await service.confirm(user, { batchId: 'batch-1' });
+
+    expect(transactionUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          description: 'Pagamento de fatura',
+          amountCents: 434162,
+          type: 'expense',
+          isInvoicePayment: true,
+        }),
+      }),
+    );
+    expect(importRowUpdate).toHaveBeenCalledWith({
+      where: { id: 'row-1' },
+      data: { status: 'imported', falseDuplicate: undefined },
+    });
+    expect(importBatchUpdate).toHaveBeenCalledWith({
+      where: { id: 'batch-1' },
+      data: { status: 'confirmed' },
+    });
   });
 });
 
