@@ -44,6 +44,7 @@ export class InstallmentsService {
   async create(user: AuthenticatedUser, dto: CreateInstallmentDto) {
     this.validateInstallmentShape(dto);
     const account = await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
+    const description = cleanInstallmentDescription(dto.description);
     const firstReferenceMonth = startOfMonth(new Date(dto.firstReferenceMonth));
     const firstInstallmentReference = addMonths(firstReferenceMonth, 1 - dto.firstInstallmentNumber);
     const monthlyAmountCents = Math.abs(dto.monthlyAmountCents);
@@ -67,7 +68,7 @@ export class InstallmentsService {
       );
       const plan = await tx.installmentPlan.create({
         data: {
-          description: dto.description.trim(),
+          description,
           totalInstallments: dto.totalInstallments,
           firstInstallmentNumber: dto.firstInstallmentNumber,
           firstReferenceMonth,
@@ -110,7 +111,7 @@ export class InstallmentsService {
             date: bookkeepingDate,
             applicationDate,
             referenceMonth,
-            description: `${dto.description.trim()} - Parcela ${installmentNumber}/${dto.totalInstallments}`,
+            description: `${description} - Parcela ${installmentNumber}/${dto.totalInstallments}`,
             amountCents: monthlyAmountCents,
             type: 'expense',
             status: 'confirmed',
@@ -148,8 +149,9 @@ export class InstallmentsService {
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateInstallmentDto) {
     const current = await this.ensure(user, id);
+    const description = dto.description === undefined ? undefined : cleanInstallmentDescription(dto.description);
     this.validateInstallmentShape({
-      description: dto.description ?? current.description,
+      description: description ?? current.description,
       totalInstallments: dto.totalInstallments ?? current.totalInstallments,
       firstInstallmentNumber: dto.firstInstallmentNumber ?? current.firstInstallmentNumber,
       paidInstallments: dto.paidInstallments ?? current.paidInstallments,
@@ -160,7 +162,7 @@ export class InstallmentsService {
     const updated = await this.prisma.installmentPlan.update({
       where: { id },
       data: {
-        description: dto.description?.trim(),
+        description,
         totalInstallments: dto.totalInstallments,
         paidInstallments: dto.paidInstallments,
         firstInstallmentNumber: dto.firstInstallmentNumber,
@@ -317,7 +319,7 @@ export class InstallmentsService {
   }
 
   private validateInstallmentShape(dto: Pick<CreateInstallmentDto, 'description' | 'firstInstallmentNumber' | 'monthlyAmountCents' | 'paidInstallments' | 'totalInstallments'>) {
-    if (!dto.description.trim()) {
+    if (!cleanInstallmentDescription(dto.description)) {
       throw new BadRequestException('Descrição obrigatória');
     }
     if (dto.firstInstallmentNumber > dto.totalInstallments) {
@@ -330,6 +332,13 @@ export class InstallmentsService {
       throw new BadRequestException('Valor da parcela deve ser maior que zero');
     }
   }
+}
+
+function cleanInstallmentDescription(description: string) {
+  return description
+    .replace(/\s+/g, ' ')
+    .replace(/\s*[-–—]+\s*$/g, '')
+    .trim();
 }
 
 function normalizeText(value: string) {

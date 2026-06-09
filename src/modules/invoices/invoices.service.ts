@@ -125,9 +125,16 @@ export class InvoicesService {
   private async calculateInvoiceTotalCents(invoiceId: string) {
     const transactions = await this.prisma.transaction.findMany({
       where: { invoiceId, isInvoicePayment: false },
-      select: { amountCents: true },
+      select: { amountCents: true, invoiceAmountCents: true, isInvoiceAdjustment: true },
     });
-    return transactions.reduce((sum, transaction) => sum + normalizeAmountCents(transaction.amountCents), 0);
+    return transactions.reduce(
+      (sum, transaction) =>
+        sum +
+        (transaction.isInvoiceAdjustment
+          ? (transaction.invoiceAmountCents ?? 0)
+          : normalizeAmountCents(transaction.amountCents)),
+      0,
+    );
   }
 
   private dateFromAccountDay(referenceMonth: Date, day?: number | null) {

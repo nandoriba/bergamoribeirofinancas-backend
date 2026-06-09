@@ -9,6 +9,8 @@ export interface ParsedImportRow {
   amountCents?: number;
   externalId?: string;
   suggestedCategory?: string;
+  invoiceAdjustmentCandidate?: boolean;
+  invoiceAdjustmentDefault?: boolean;
   status: 'new' | 'review';
 }
 
@@ -72,18 +74,27 @@ export class ImportParserService {
     const description = row.title || row.descricao || row.description;
     const installment = extractInstallment(description);
     const externalId = buildSyntheticExternalId('nubank-card', date, description, amountCents);
-    const adjustment = isCreditCardAdjustment(description);
+    const invoiceAdjustmentCandidate = isCreditCardInvoiceAdjustmentCandidate(description);
+    const invoiceAdjustmentDefault = isCreditCardPaymentReceived(description);
     const categoryAmount = amountCents === undefined ? undefined : -Math.abs(amountCents);
+    const rawWithMetadata: Record<string, string> = { ...raw };
+    if (installment) rawWithMetadata.installment = installment;
+    if (invoiceAdjustmentCandidate) {
+      rawWithMetadata.invoiceAdjustmentCandidate = 'true';
+      rawWithMetadata.invoiceAdjustmentDefault = invoiceAdjustmentDefault ? 'true' : 'false';
+    }
 
     return this.withReviewStatus({
       rowIndex,
-      raw: installment ? { ...raw, installment } : raw,
+      raw: rawWithMetadata,
       date,
       description,
       amountCents,
       externalId,
-      suggestedCategory: adjustment ? 'Ajuste de fatura' : suggestCategory(description, categoryAmount),
-      status: adjustment ? 'review' : 'new',
+      suggestedCategory: invoiceAdjustmentDefault ? 'Ajuste de fatura' : suggestCategory(description, categoryAmount),
+      invoiceAdjustmentCandidate,
+      invoiceAdjustmentDefault,
+      status: 'new',
     });
   }
 
@@ -252,7 +263,15 @@ function extractInstallment(description?: string): string | undefined {
   return match ? `${match[1]}/${match[2]}` : undefined;
 }
 
-function isCreditCardAdjustment(description?: string): boolean {
+function isCreditCardPaymentReceived(description?: string): boolean {
   const text = normalizeKey(description ?? '');
-  return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
+  return text.includes('pagamento_recebido');
+}
+
+function isCreditCardInvoiceAdjustmentCandidate(description?: string): boolean {
+  const text = normalizeKey(description ?? '');
+  return (
+    isCreditCardPaymentReceived(description) ||
+    ['estorno', 'credito', 'reembolso'].some((token) => text.includes(token))
+  );
 }

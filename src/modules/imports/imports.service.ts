@@ -119,6 +119,7 @@ export class ImportsService {
       : batch.rows;
     const acceptedDuplicateRowIds = new Set(dto.acceptedPossibleDuplicateRowIds ?? []);
     const confirmedDuplicateRowIds = new Set(dto.confirmedDuplicateRowIds ?? []);
+    const invoiceAdjustmentRowIds = new Set(dto.invoiceAdjustmentRowIds ?? []);
     const conflictingDuplicateDecisions = selectedRows.filter(
       (row) =>
         row.status === 'duplicate' &&
@@ -151,7 +152,8 @@ export class ImportsService {
     const importableRows = selectedRows.filter(
       (row) =>
         (row.status === 'new' ||
-          (row.status === 'duplicate' && acceptedDuplicateRowIds.has(row.id))) &&
+          (row.status === 'duplicate' && acceptedDuplicateRowIds.has(row.id)) ||
+          isLegacyCreditCardAdjustmentReview(batch.type, row)) &&
         row.date &&
         row.description &&
         row.amountCents !== null,
@@ -175,8 +177,47 @@ export class ImportsService {
     for (const row of importableRows) {
       const forcedDuplicateImport = row.status === 'duplicate' && acceptedDuplicateRowIds.has(row.id);
       const signedAmount = row.amountCents ?? 0;
-      if (batch.type === 'nubank_credit_card' && isCreditCardAdjustment(row.description)) {
-        await this.prisma.importRow.update({ where: { id: row.id }, data: { status: ImportRowStatus.review } });
+      const importAsInvoiceAdjustment =
+        batch.type === 'nubank_credit_card' &&
+        invoiceAdjustmentRowIds.has(row.id) &&
+        isCreditCardInvoiceAdjustmentCandidate(row.description);
+
+      if (importAsInvoiceAdjustment && account?.type === 'credit_card' && row.date) {
+        const invoiceId = await this.findOrCreateInvoice(account, user.profileId, startOfMonth(row.date));
+        const externalId = forcedDuplicateImport ? row.id : row.externalId ?? row.id;
+        const transaction = await this.prisma.transaction.upsert({
+          where: {
+            memberProfileId_externalId: {
+              memberProfileId: user.profileId,
+              externalId,
+            },
+          },
+          update: {},
+          create: {
+            date: bookkeepingDate,
+            applicationDate: row.date,
+            referenceMonth: startOfMonth(row.date),
+            description: row.description ?? 'Ajuste de fatura',
+            amountCents: normalizeAmountCents(signedAmount),
+            type: 'expense',
+            status: 'confirmed',
+            recurrenceType: 'none',
+            source: batch.type,
+            externalId,
+            isInvoiceAdjustment: true,
+            invoiceAmountCents: Math.round(signedAmount),
+            accountId: account.id,
+            invoiceId,
+            memberProfileId: user.profileId,
+            importRowId: row.id,
+          },
+        });
+
+        await this.prisma.importRow.update({
+          where: { id: row.id },
+          data: { status: ImportRowStatus.imported, falseDuplicate: forcedDuplicateImport ? true : undefined },
+        });
+        created.push(transaction);
         continue;
       }
 
@@ -380,7 +421,7 @@ export class ImportsService {
         id: transaction.id,
         applicationDate: toDateKey(transaction.applicationDate),
         amountCents: signedTransactionAmountCents(transaction),
-        description: transaction.description,
+        description: cleanRepeatedSeparators(transaction.description),
         source: 'Sistema',
         accountName: transaction.account?.name,
       });
@@ -414,7 +455,7 @@ export class ImportsService {
     const currentCandidate = {
       applicationDate: toDateKey(row.date),
       amountCents,
-      description: row.description,
+      description: cleanRepeatedSeparators(row.description),
       source: 'Prévia atual',
     };
 
@@ -480,9 +521,18 @@ export class ImportsService {
       status: ImportRowStatus;
       falseDuplicate: boolean;
       duplicateCandidates: Prisma.JsonValue | null;
+      raw: Prisma.JsonValue;
     },
     source: string,
   ) {
+    const invoiceAdjustmentCandidate = isInvoiceAdjustmentPreviewCandidate(source, row);
+    const invoiceAdjustmentDefault = invoiceAdjustmentCandidate && isInvoiceAdjustmentDefault(row);
+    const legacyReviewAdjustment =
+      row.status === ImportRowStatus.review &&
+      invoiceAdjustmentCandidate &&
+      Boolean(row.date) &&
+      row.amountCents !== null;
+
     return {
       id: row.id,
       applicationDate: row.date ? toDateKey(row.date) : null,
@@ -493,9 +543,11 @@ export class ImportsService {
       source,
       suggestedCategory: row.suggestedCategory ?? 'Revisar',
       value: row.amountCents ?? 0,
-      status: mapPreviewStatus(row.status, row.falseDuplicate),
-      reviewReason: resolveReviewReason(row.status, row.description, source),
+      status: legacyReviewAdjustment ? 'new' : mapPreviewStatus(row.status, row.falseDuplicate),
+      reviewReason: legacyReviewAdjustment ? null : resolveReviewReason(row.status),
       duplicateCandidates: readDuplicateCandidates(row.duplicateCandidates),
+      invoiceAdjustmentCandidate,
+      invoiceAdjustmentDefault,
     };
   }
 }
@@ -511,15 +563,41 @@ function readInstallment(raw: Prisma.JsonValue): { current: number; total: numbe
 }
 
 function stripInstallment(description: string) {
+  return cleanDescriptionSeparators(
+    description
+      .replace(/(?:parcela\s*)?\d{1,2}\s*\/\s*\d{1,2}/gi, ''),
+  );
+}
+
+function cleanDescriptionSeparators(description: string) {
   return description
-    .replace(/(?:parcela\s*)?\d{1,2}\s*\/\s*\d{1,2}/gi, '')
-    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*[-–—]+\s*$/g, '')
     .trim();
 }
 
-function isCreditCardAdjustment(description?: string | null): boolean {
+function isCreditCardPaymentReceived(description?: string | null): boolean {
   const text = normalizeText(description ?? '');
-  return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
+  return text.includes('pagamento recebido');
+}
+
+function isCreditCardInvoiceAdjustmentCandidate(description?: string | null): boolean {
+  const text = normalizeText(description ?? '');
+  return (
+    isCreditCardPaymentReceived(description) ||
+    ['estorno', 'credito', 'reembolso'].some((token) => text.includes(token))
+  );
+}
+
+function isLegacyCreditCardAdjustmentReview(
+  importType: ImportType,
+  row: { status: ImportRowStatus; description: string | null },
+): boolean {
+  return (
+    importType === 'nubank_credit_card' &&
+    row.status === ImportRowStatus.review &&
+    isCreditCardInvoiceAdjustmentCandidate(row.description)
+  );
 }
 
 function isInvoicePaymentFromImport(importType: ImportType, description?: string | null): boolean {
@@ -566,12 +644,32 @@ function mapPreviewStatus(status: ImportRowStatus, falseDuplicate: boolean): Imp
   return 'new';
 }
 
-function resolveReviewReason(status: ImportRowStatus, description: string | null, source: string): string | null {
+function resolveReviewReason(status: ImportRowStatus): string | null {
   if (status !== ImportRowStatus.review) return null;
-  if (source === 'nubank_credit_card' && isCreditCardAdjustment(description)) {
-    return 'Pagamento ou ajuste da fatura. Não será importado como compra.';
-  }
   return 'Linha sem dados suficientes para importação automática.';
+}
+
+function isInvoiceAdjustmentPreviewCandidate(
+  source: string,
+  row: { raw: Prisma.JsonValue; description: string | null },
+): boolean {
+  if (source !== 'nubank_credit_card') return false;
+  return readRawBoolean(row.raw, 'invoiceAdjustmentCandidate') ?? isCreditCardInvoiceAdjustmentCandidate(row.description);
+}
+
+function isInvoiceAdjustmentDefault(row: { raw: Prisma.JsonValue; description: string | null }): boolean {
+  return readRawBoolean(row.raw, 'invoiceAdjustmentDefault') ?? isCreditCardPaymentReceived(row.description);
+}
+
+function readRawBoolean(raw: Prisma.JsonValue, key: string): boolean | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !(key in raw)) return null;
+  const value = (raw as Record<string, unknown>)[key];
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (value.toLowerCase() === 'true') return true;
+    if (value.toLowerCase() === 'false') return false;
+  }
+  return null;
 }
 
 function toDateKey(date: Date) {
@@ -600,10 +698,14 @@ function parseDuplicateCandidate(value: Prisma.JsonValue): DuplicateCandidate | 
 
   return {
     id: typeof candidate.id === 'string' ? candidate.id : undefined,
-    description: candidate.description,
+    description: cleanRepeatedSeparators(candidate.description),
     applicationDate: candidate.applicationDate,
     amountCents: candidate.amountCents,
     source: candidate.source,
     accountName: typeof candidate.accountName === 'string' ? candidate.accountName : undefined,
   };
+}
+
+function cleanRepeatedSeparators(description: string) {
+  return description.replace(/\s*[-–—]+\s*[-–—]+\s*Parcela/gi, ' - Parcela').trim();
 }

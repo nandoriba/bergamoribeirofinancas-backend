@@ -20,6 +20,11 @@ export class ConfirmImportDto {
   confirmedDuplicateRowIds?: string[];
 
   @IsOptional()
+  @IsArray()
+  @IsUUID('4', { each: true })
+  invoiceAdjustmentRowIds?: string[];
+
+  @IsOptional()
   @IsUUID()
   accountId?: string;
 }

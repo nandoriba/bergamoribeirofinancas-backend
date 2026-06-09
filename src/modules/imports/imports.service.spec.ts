@@ -290,6 +290,155 @@ describe('ImportsService', () => {
       data: { status: 'confirmed' },
     });
   });
+
+  it('cleans installment base descriptions imported from card statements before materializing installments', async () => {
+    const importRowUpdate = vi.fn().mockResolvedValue({});
+    const importBatchUpdate = vi.fn().mockResolvedValue({});
+    const installmentCreate = vi.fn().mockResolvedValue({ id: 'plan-1' });
+    const service = new ImportsService(
+      {
+        account: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: 'card-1',
+            type: 'credit_card',
+            closingDay: 5,
+            dueDay: 10,
+          }),
+        },
+        category: { findMany: vi.fn().mockResolvedValue([]) },
+        importBatch: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: 'batch-1',
+            type: 'nubank_credit_card',
+            rows: [
+              {
+                id: 'row-1',
+                status: 'new',
+                falseDuplicate: false,
+                date: new Date('2026-04-05T00:00:00.000Z'),
+                description: 'Dm *Hostingercombr - Parcela 7/12',
+                amountCents: 5272,
+                externalId: 'card-installment-row',
+                raw: { installment: '7/12' },
+              },
+            ],
+          }),
+          update: importBatchUpdate,
+        },
+        importRow: { update: importRowUpdate, updateMany: vi.fn() },
+        transaction: { findFirst: vi.fn().mockResolvedValue(null), upsert: vi.fn() },
+      } as never,
+      new ImportParserService(),
+      { create: installmentCreate } as never,
+    );
+
+    const result = await service.confirm(user, {
+      batchId: 'batch-1',
+      accountId: 'card-1',
+    });
+
+    expect(installmentCreate).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({
+        description: 'Dm *Hostingercombr',
+      }),
+    );
+    expect(importRowUpdate).toHaveBeenCalledWith({
+      where: { id: 'row-1' },
+      data: { status: 'imported', falseDuplicate: undefined },
+    });
+    expect(importBatchUpdate).toHaveBeenCalledWith({
+      where: { id: 'batch-1' },
+      data: { status: 'confirmed' },
+    });
+    expect(result).toMatchObject({ imported: 1, ignored: 0 });
+  });
+
+  it('imports selected credit card adjustment candidates as invoice-only transactions', async () => {
+    const importRowUpdate = vi.fn().mockResolvedValue({});
+    const importBatchUpdate = vi.fn().mockResolvedValue({});
+    const transactionUpsert = vi.fn().mockResolvedValue({ id: 'transaction-1' });
+    const invoiceUpsert = vi.fn().mockResolvedValue({ id: 'invoice-1' });
+    const service = new ImportsService(
+      {
+        account: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: 'card-1',
+            type: 'credit_card',
+            closingDay: 5,
+            dueDay: 10,
+          }),
+        },
+        category: { findMany: vi.fn().mockResolvedValue([]) },
+        importBatch: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: 'batch-1',
+            type: 'nubank_credit_card',
+            rows: [
+              {
+                id: 'row-1',
+                status: 'new',
+                falseDuplicate: false,
+                date: new Date('2026-06-03T00:00:00.000Z'),
+                description: 'Crédito de Bunnycdn',
+                amountCents: -5259,
+                externalId: 'card-credit-row',
+                raw: {
+                  invoiceAdjustmentCandidate: 'true',
+                  invoiceAdjustmentDefault: 'false',
+                },
+              },
+            ],
+          }),
+          update: importBatchUpdate,
+        },
+        importRow: { update: importRowUpdate, updateMany: vi.fn() },
+        invoice: { upsert: invoiceUpsert },
+        transaction: { upsert: transactionUpsert },
+      } as never,
+      new ImportParserService(),
+      {} as never,
+    );
+
+    const result = await service.confirm(user, {
+      batchId: 'batch-1',
+      accountId: 'card-1',
+      invoiceAdjustmentRowIds: ['row-1'],
+    });
+
+    expect(invoiceUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          accountId_referenceMonth: {
+            accountId: 'card-1',
+            referenceMonth: new Date('2026-06-01T00:00:00.000Z'),
+          },
+        },
+      }),
+    );
+    expect(transactionUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          description: 'Crédito de Bunnycdn',
+          amountCents: 5259,
+          type: 'expense',
+          isInvoiceAdjustment: true,
+          invoiceAmountCents: -5259,
+          accountId: 'card-1',
+          invoiceId: 'invoice-1',
+        }),
+      }),
+    );
+    expect(importRowUpdate).toHaveBeenCalledWith({
+      where: { id: 'row-1' },
+      data: { status: 'imported', falseDuplicate: undefined },
+    });
+    expect(importBatchUpdate).toHaveBeenCalledWith({
+      where: { id: 'batch-1' },
+      data: { status: 'confirmed' },
+    });
+    expect(result).toMatchObject({ imported: 1, ignored: 0 });
+  });
 });
 
 function buildPreviewPrismaMock() {

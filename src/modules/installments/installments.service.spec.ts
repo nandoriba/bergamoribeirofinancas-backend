@@ -46,7 +46,7 @@ describe('InstallmentsService', () => {
     const service = new InstallmentsService(prisma as never);
 
     await service.create(user, {
-      description: 'Farmamed',
+      description: 'Farmamed -',
       totalInstallments: 3,
       firstInstallmentNumber: 2,
       monthlyAmountCents: 100_00,
@@ -59,22 +59,26 @@ describe('InstallmentsService', () => {
     expect(tx.installmentPlan.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
+          description: 'Farmamed',
           totalAmountCents: 300_00,
         }),
       }),
     );
     expect(transactionCreates).toEqual([
       expect.objectContaining({
+        description: 'Farmamed - Parcela 1/3',
         referenceMonth: new Date('2026-05-01T00:00:00.000Z'),
         applicationDate: new Date('2026-05-05T00:00:00.000Z'),
         status: 'confirmed',
       }),
       expect.objectContaining({
+        description: 'Farmamed - Parcela 2/3',
         referenceMonth: new Date('2026-06-01T00:00:00.000Z'),
         applicationDate: new Date('2026-06-05T00:00:00.000Z'),
         status: 'confirmed',
       }),
       expect.objectContaining({
+        description: 'Farmamed - Parcela 3/3',
         referenceMonth: new Date('2026-07-01T00:00:00.000Z'),
         applicationDate: new Date('2026-07-05T00:00:00.000Z'),
         status: 'confirmed',

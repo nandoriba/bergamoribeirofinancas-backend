@@ -7,6 +7,7 @@ export interface FinanceTransaction {
   type: TransactionType;
   status?: 'confirmed' | 'pending';
   isInvoicePayment?: boolean;
+  isInvoiceAdjustment?: boolean;
   account?: { type?: string | null } | null;
 }
 
@@ -15,6 +16,7 @@ export function normalizeAmountCents(value: number): number {
 }
 
 export function transactionImpactCents(transaction: FinanceTransaction): number {
+  if (transaction.isInvoiceAdjustment) return 0;
   const amount = normalizeAmountCents(transaction.amountCents);
   if (transaction.type === 'income') return amount;
   if (transaction.type === 'expense') return -amount;
@@ -22,6 +24,7 @@ export function transactionImpactCents(transaction: FinanceTransaction): number 
 }
 
 export function accountBalanceImpactCents(transaction: FinanceTransaction): number {
+  if (transaction.isInvoiceAdjustment) return 0;
   const amount = normalizeAmountCents(transaction.amountCents);
   if (transaction.type === 'income') return amount;
   if (transaction.type === 'expense' && transaction.account?.type === 'credit_card') return amount;
@@ -31,31 +34,46 @@ export function accountBalanceImpactCents(transaction: FinanceTransaction): numb
 
 export function incomeCents(transactions: FinanceTransaction[]): number {
   return transactions
-    .filter((transaction) => transaction.type === 'income')
+    .filter((transaction) => !transaction.isInvoiceAdjustment && transaction.type === 'income')
     .reduce((total, transaction) => total + normalizeAmountCents(transaction.amountCents), 0);
 }
 
 export function expenseCents(transactions: FinanceTransaction[]): number {
   return transactions
-    .filter((transaction) => transaction.type === 'expense')
+    .filter((transaction) => !transaction.isInvoiceAdjustment && transaction.type === 'expense')
     .reduce((total, transaction) => total + normalizeAmountCents(transaction.amountCents), 0);
 }
 
 export function creditCardExpenseCents(transactions: FinanceTransaction[]): number {
   return transactions
-    .filter((transaction) => transaction.type === 'expense' && transaction.account?.type === 'credit_card')
+    .filter(
+      (transaction) =>
+        !transaction.isInvoiceAdjustment &&
+        transaction.type === 'expense' &&
+        transaction.account?.type === 'credit_card',
+    )
     .reduce((total, transaction) => total + normalizeAmountCents(transaction.amountCents), 0);
 }
 
 export function accountCreditCents(transactions: FinanceTransaction[]): number {
   return transactions
-    .filter((transaction) => transaction.type === 'income' || (transaction.type === 'expense' && transaction.account?.type === 'credit_card'))
+    .filter(
+      (transaction) =>
+        !transaction.isInvoiceAdjustment &&
+        (transaction.type === 'income' ||
+          (transaction.type === 'expense' && transaction.account?.type === 'credit_card')),
+    )
     .reduce((total, transaction) => total + normalizeAmountCents(transaction.amountCents), 0);
 }
 
 export function accountDebitCents(transactions: FinanceTransaction[]): number {
   return transactions
-    .filter((transaction) => transaction.type === 'expense' && transaction.account?.type !== 'credit_card')
+    .filter(
+      (transaction) =>
+        !transaction.isInvoiceAdjustment &&
+        transaction.type === 'expense' &&
+        transaction.account?.type !== 'credit_card',
+    )
     .reduce((total, transaction) => total + normalizeAmountCents(transaction.amountCents), 0);
 }
 
@@ -79,6 +97,7 @@ export function cumulativeDailyBalances(
   const impactsByDay = new Array<number>(numberOfDays).fill(0);
 
   for (const transaction of transactions) {
+    if (transaction.isInvoiceAdjustment) continue;
     const dayIndex = operationalDate(transaction).getUTCDate() - 1;
     if (dayIndex >= 0 && dayIndex < numberOfDays) {
       impactsByDay[dayIndex] += transactionImpactCents(transaction);
@@ -103,6 +122,7 @@ export function cumulativeAccountDailyBalances(
   const impactsByDay = new Array<number>(numberOfDays).fill(0);
 
   for (const transaction of transactions) {
+    if (transaction.isInvoiceAdjustment) continue;
     const dayIndex = operationalDate(transaction).getUTCDate() - 1;
     if (dayIndex >= 0 && dayIndex < numberOfDays) {
       impactsByDay[dayIndex] += accountBalanceImpactCents(transaction);
@@ -122,6 +142,7 @@ export function cumulativeAccountDailyBalances(
 export function dailyExpenseSeries(transactions: FinanceTransaction[], numberOfDays: number): number[] {
   const values = new Array<number>(numberOfDays).fill(0);
   for (const transaction of transactions) {
+    if (transaction.isInvoiceAdjustment) continue;
     if (transaction.type !== 'expense') continue;
     const dayIndex = operationalDate(transaction).getUTCDate() - 1;
     if (dayIndex >= 0 && dayIndex < numberOfDays) {
@@ -134,6 +155,7 @@ export function dailyExpenseSeries(transactions: FinanceTransaction[], numberOfD
 export function dailyCreditCardSeries(transactions: FinanceTransaction[], numberOfDays: number): number[] {
   const values = new Array<number>(numberOfDays).fill(0);
   for (const transaction of transactions) {
+    if (transaction.isInvoiceAdjustment) continue;
     if (transaction.type !== 'expense' || transaction.account?.type !== 'credit_card') continue;
     const dayIndex = operationalDate(transaction).getUTCDate() - 1;
     if (dayIndex >= 0 && dayIndex < numberOfDays) {

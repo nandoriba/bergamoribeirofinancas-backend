@@ -4,7 +4,7 @@ import { IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, IsUUID, 
 export class CreateRecurringDto {
   @IsString()
   @IsNotEmpty()
-  @MaxLength(140)
+  @MaxLength(200)
   description!: string;
 
   @IsInt()

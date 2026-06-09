@@ -3,7 +3,7 @@ import { IsBoolean, IsDateString, IsInt, IsNotEmpty, IsOptional, IsString, IsUUI
 export class CreateInstallmentDto {
   @IsString()
   @IsNotEmpty()
-  @MaxLength(140)
+  @MaxLength(200)
   description!: string;
 
   @IsInt()

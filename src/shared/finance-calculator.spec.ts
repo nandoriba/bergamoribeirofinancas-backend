@@ -67,4 +67,23 @@ describe('finance-calculator', () => {
 
     expect(dailyExpenseSeries(futureBookkeeping, 30)[4]).toBe(75_00);
   });
+
+  it('ignores invoice-only adjustments in operational financial totals', () => {
+    const invoiceAdjustment: FinanceTransaction = {
+      date: new Date('2026-06-03T00:00:00.000Z'),
+      applicationDate: new Date('2026-06-03T00:00:00.000Z'),
+      type: 'expense',
+      amountCents: 4_341_62,
+      isInvoiceAdjustment: true,
+      account: { type: 'credit_card' },
+    };
+    const withAdjustment = [...transactions, invoiceAdjustment];
+
+    expect(incomeCents(withAdjustment)).toBe(incomeCents(transactions));
+    expect(expenseCents(withAdjustment)).toBe(expenseCents(transactions));
+    expect(creditCardExpenseCents(withAdjustment)).toBe(creditCardExpenseCents(transactions));
+    expect(netCents(withAdjustment)).toBe(netCents(transactions));
+    expect(accountBalanceCents(withAdjustment)).toBe(accountBalanceCents(transactions));
+    expect(dailyExpenseSeries(withAdjustment, 30)[2]).toBe(0);
+  });
 });

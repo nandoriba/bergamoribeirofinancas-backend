@@ -222,6 +222,14 @@ function mapTransactionResponse(transaction: TransactionWithRelations) {
 }
 
 function resolveOperationalCategory(transaction: TransactionWithRelations) {
+  if (transaction.isInvoiceAdjustment) {
+    return {
+      key: 'system:invoice_adjustment',
+      name: 'Ajuste de fatura',
+      color: '#e0c278',
+    };
+  }
+
   if (isInvoicePaymentTransaction(transaction)) {
     return {
       key: 'system:invoice_payment',

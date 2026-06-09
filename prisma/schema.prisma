@@ -223,6 +223,8 @@ model Transaction {
   externalId          String?
   notes               String?
   isInvoicePayment    Boolean           @default(false)
+  isInvoiceAdjustment Boolean           @default(false)
+  invoiceAmountCents  Int?
   memberProfileId     String
   memberProfile       MemberProfile     @relation(fields: [memberProfileId], references: [id])
   accountId           String?

@@ -42,12 +42,13 @@ export class ReportsService {
       },
       orderBy: [{ referenceMonth: 'asc' }, { applicationDate: 'asc' }],
     });
+    const financialTransactions = transactions.filter((transaction) => !transaction.isInvoiceAdjustment);
 
     const profiles = new Map<string, { id: string; name: string; incomeCents: number; expenseCents: number; netCents: number }>();
     const categories = new Map<string, { name: string; type: string; valueCents: number; color: string }>();
     const accounts = new Map<string, { name: string; type: string; valueCents: number }>();
 
-    for (const transaction of transactions) {
+    for (const transaction of financialTransactions) {
       const profile = profiles.get(transaction.memberProfile.id) ?? {
         id: transaction.memberProfile.id,
         name: transaction.memberProfile.displayName,
@@ -84,9 +85,9 @@ export class ReportsService {
     return {
       month: monthKey(reference),
       totals: {
-        incomeCents: incomeCents(transactions),
-        expenseCents: expenseCents(transactions),
-        netCents: netCents(transactions),
+        incomeCents: incomeCents(financialTransactions),
+        expenseCents: expenseCents(financialTransactions),
+        netCents: netCents(financialTransactions),
       },
       profiles: [...profiles.values()].sort((a, b) => a.name.localeCompare(b.name)),
       categories: [...categories.values()].sort((a, b) => b.valueCents - a.valueCents),

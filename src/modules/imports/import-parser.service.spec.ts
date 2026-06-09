@@ -41,12 +41,32 @@ describe('ImportParserService', () => {
     });
   });
 
-  it('keeps credit card payment-like rows in review', () => {
+  it('marks received credit card payments as invoice adjustment candidates by default', () => {
     const parsed = parser.parse('Nubank_2026-06-01.csv', 'date,title,amount\n2026-06-07,Pagamento recebido,-4341.62');
 
     expect(parsed.rows[0]).toMatchObject({
       suggestedCategory: 'Ajuste de fatura',
-      status: 'review',
+      invoiceAdjustmentCandidate: true,
+      invoiceAdjustmentDefault: true,
+      status: 'new',
+    });
+    expect(parsed.rows[0].raw).toMatchObject({
+      invoiceAdjustmentCandidate: 'true',
+      invoiceAdjustmentDefault: 'true',
+    });
+  });
+
+  it('marks card refunds and credits as optional invoice adjustment candidates', () => {
+    const parsed = parser.parse('Nubank_2026-06-01.csv', 'date,title,amount\n2026-06-03,Crédito de Bunnycdn,-52.59');
+
+    expect(parsed.rows[0]).toMatchObject({
+      invoiceAdjustmentCandidate: true,
+      invoiceAdjustmentDefault: false,
+      status: 'new',
+    });
+    expect(parsed.rows[0].raw).toMatchObject({
+      invoiceAdjustmentCandidate: 'true',
+      invoiceAdjustmentDefault: 'false',
     });
   });
 });

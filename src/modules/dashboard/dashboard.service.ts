@@ -113,9 +113,14 @@ export class DashboardService {
     const currentTransactions = monthTransactions.filter(
       (transaction) => transaction.status === 'confirmed' && transaction.applicationDate <= todayEnd,
     );
-    const currentSpendingTransactions = currentTransactions.filter((transaction) => !isInvoicePaymentTransaction(transaction));
-    const monthSpendingTransactions = monthTransactions.filter((transaction) => !isInvoicePaymentTransaction(transaction));
-    const previousMonthSpendingTransactions = previousMonthTransactions.filter(
+    const currentFinancialTransactions = currentTransactions.filter((transaction) => !transaction.isInvoiceAdjustment);
+    const monthFinancialTransactions = monthTransactions.filter((transaction) => !transaction.isInvoiceAdjustment);
+    const previousMonthFinancialTransactions = previousMonthTransactions.filter(
+      (transaction) => !transaction.isInvoiceAdjustment,
+    );
+    const currentSpendingTransactions = currentFinancialTransactions.filter((transaction) => !isInvoicePaymentTransaction(transaction));
+    const monthSpendingTransactions = monthFinancialTransactions.filter((transaction) => !isInvoicePaymentTransaction(transaction));
+    const previousMonthSpendingTransactions = previousMonthFinancialTransactions.filter(
       (transaction) => !isInvoicePaymentTransaction(transaction),
     );
     const numberOfDays = daysInMonth(reference);
@@ -123,17 +128,17 @@ export class DashboardService {
     const saldoDiarioProjetado = cumulativeDailyBalances(0, monthSpendingTransactions, numberOfDays);
     const despesaDiariaAtualSpark = dailyExpenseSeries(currentSpendingTransactions, numberOfDays);
     const despesaDiariaProjetadaSpark = dailyExpenseSeries(monthSpendingTransactions, numberOfDays);
-    const cartaoDiariaAtualSpark = dailyCreditCardSeries(currentTransactions, numberOfDays);
-    const cartaoDiariaProjetadaSpark = dailyCreditCardSeries(monthTransactions, numberOfDays);
+    const cartaoDiariaAtualSpark = dailyCreditCardSeries(currentFinancialTransactions, numberOfDays);
+    const cartaoDiariaProjetadaSpark = dailyCreditCardSeries(monthFinancialTransactions, numberOfDays);
     const despesaFuturo = expenseCents(monthSpendingTransactions);
     const categoryTotals = this.groupExpenseCategories(monthSpendingTransactions);
-    const confirmedInstallments = this.summarizeCreditCardInstallments(currentTransactions);
-    const projectedInstallments = this.summarizeCreditCardInstallments(monthTransactions);
-    const saldoAtualTotal = incomeCents(currentTransactions);
-    const saldoProjetadoTotal = incomeCents(monthTransactions);
+    const confirmedInstallments = this.summarizeCreditCardInstallments(currentFinancialTransactions);
+    const projectedInstallments = this.summarizeCreditCardInstallments(monthFinancialTransactions);
+    const saldoAtualTotal = incomeCents(currentFinancialTransactions);
+    const saldoProjetadoTotal = incomeCents(monthFinancialTransactions);
     const despesaAtual = expenseCents(currentSpendingTransactions);
-    const cartaoAtual = creditCardExpenseCents(currentTransactions);
-    const cartaoFuturo = creditCardExpenseCents(monthTransactions);
+    const cartaoAtual = creditCardExpenseCents(currentFinancialTransactions);
+    const cartaoFuturo = creditCardExpenseCents(monthFinancialTransactions);
     const saldoComposicaoConfirmada = buildBalanceComposition({
       title: 'Composição confirmada',
       totalLabel: 'CONFIRMADO',
@@ -171,8 +176,8 @@ export class DashboardService {
       despesaAntMes: expenseCents(previousMonthSpendingTransactions),
       cartaoAtual,
       cartaoFuturo,
-      cartaoAntMes: creditCardExpenseCents(previousMonthTransactions),
-      receitaPrevista: incomeCents(monthTransactions),
+      cartaoAntMes: creditCardExpenseCents(previousMonthFinancialTransactions),
+      receitaPrevista: incomeCents(monthFinancialTransactions),
       parcelasConfirmadasQuantidade: confirmedInstallments.count,
       parcelasConfirmadasValorCents: confirmedInstallments.amountCents,
       parcelasProjetadasQuantidade: projectedInstallments.count,
@@ -285,7 +290,7 @@ export class DashboardService {
     const totals = new Map<string, { name: string; value: number; color: string }>();
 
     for (const transaction of transactions) {
-      if (transaction.type !== 'expense' || isInvoicePaymentTransaction(transaction)) continue;
+      if (transaction.isInvoiceAdjustment || transaction.type !== 'expense' || isInvoicePaymentTransaction(transaction)) continue;
       const category = expenseCategoryForDashboard(transaction);
       const name = category.name;
       const current = totals.get(name) ?? {
@@ -370,6 +375,7 @@ export class DashboardService {
     const installments = transactions.filter(
       (transaction) =>
         transaction.type === 'expense' &&
+        !transaction.isInvoiceAdjustment &&
         transaction.account?.type === 'credit_card' &&
         transaction.installmentNumber !== null &&
         transaction.installmentNumber !== undefined,
@@ -394,19 +400,31 @@ export class DashboardService {
 
   private async mapImportPreviewRows(rows: DashboardImportRow[]) {
     return Promise.all(
-      rows.map(async (row) => ({
-        id: row.id,
-        batchId: row.importBatch.id,
-        date: row.date ? this.formatShortDate(row.date) : '-',
-        description: row.description ?? 'Linha sem descrição',
-        applicationDate: row.date ? toDateKey(row.date) : null,
-        source: row.importBatch.type,
-        suggestedCategory: row.suggestedCategory ?? 'Revisar',
-        value: row.amountCents ?? 0,
-        status: mapImportPreviewStatus(row.status, row.falseDuplicate),
-        reviewReason: resolveImportReviewReason(row.status, row.description, row.importBatch.type),
-        duplicateCandidates: await this.resolveImportDuplicateCandidates(row),
-      })),
+      rows.map(async (row) => {
+        const invoiceAdjustmentCandidate = isInvoiceAdjustmentPreviewCandidate(row.importBatch.type, row);
+        const invoiceAdjustmentDefault = invoiceAdjustmentCandidate && isInvoiceAdjustmentDefault(row);
+        const legacyReviewAdjustment =
+          row.status === ImportRowStatus.review &&
+          invoiceAdjustmentCandidate &&
+          Boolean(row.date) &&
+          row.amountCents !== null;
+
+        return {
+          id: row.id,
+          batchId: row.importBatch.id,
+          date: row.date ? this.formatShortDate(row.date) : '-',
+          description: row.description ?? 'Linha sem descrição',
+          applicationDate: row.date ? toDateKey(row.date) : null,
+          source: row.importBatch.type,
+          suggestedCategory: row.suggestedCategory ?? 'Revisar',
+          value: row.amountCents ?? 0,
+          status: legacyReviewAdjustment ? 'new' : mapImportPreviewStatus(row.status, row.falseDuplicate),
+          reviewReason: legacyReviewAdjustment ? null : resolveImportReviewReason(row.status),
+          duplicateCandidates: await this.resolveImportDuplicateCandidates(row),
+          invoiceAdjustmentCandidate,
+          invoiceAdjustmentDefault,
+        };
+      }),
     );
   }
 
@@ -461,7 +479,7 @@ export class DashboardService {
       .filter((transaction) => shouldIncludeCandidate(transaction.description))
       .map((transaction) => ({
         id: transaction.id,
-        description: transaction.description,
+        description: cleanRepeatedSeparators(transaction.description),
         applicationDate: toDateKey(transaction.applicationDate),
         amountCents: signedTransactionAmountCents(transaction),
         source: 'Sistema',
@@ -479,7 +497,7 @@ export class DashboardService {
       )
       .map((candidate) => ({
         id: candidate.id,
-        description: candidate.description as string,
+        description: cleanRepeatedSeparators(candidate.description as string),
         applicationDate: toDateKey(candidate.date as Date),
         amountCents: duplicateAmountForImportRow(row.importBatch.type, candidate.amountCents as number),
         source: 'Prévia atual',
@@ -530,12 +548,16 @@ function parseImportDuplicateCandidate(value: Prisma.JsonValue): ImportDuplicate
 
   return {
     id: typeof candidate.id === 'string' ? candidate.id : undefined,
-    description: candidate.description,
+    description: cleanRepeatedSeparators(candidate.description),
     applicationDate: candidate.applicationDate,
     amountCents: candidate.amountCents,
     source: candidate.source,
     accountName: typeof candidate.accountName === 'string' ? candidate.accountName : undefined,
   };
+}
+
+function cleanRepeatedSeparators(description: string) {
+  return description.replace(/\s*[-–—]+\s*[-–—]+\s*Parcela/gi, ' - Parcela').trim();
 }
 
 function toDateKey(date: Date) {
@@ -551,17 +573,45 @@ function normalizeText(value: string) {
     .replace(/\s+/g, ' ');
 }
 
-function resolveImportReviewReason(status: ImportRowStatus, description: string | null, source: string): string | null {
+function resolveImportReviewReason(status: ImportRowStatus): string | null {
   if (status !== ImportRowStatus.review) return null;
-  if (source === 'nubank_credit_card' && isCreditCardAdjustment(description)) {
-    return 'Pagamento ou ajuste da fatura. Não será importado como compra.';
-  }
   return 'Linha sem dados suficientes para importação automática.';
 }
 
-function isCreditCardAdjustment(description?: string | null): boolean {
+function isCreditCardPaymentReceived(description?: string | null): boolean {
   const text = normalizeText(description ?? '');
-  return ['pagamento', 'estorno', 'credito', 'reembolso'].some((token) => text.includes(token));
+  return text.includes('pagamento recebido');
+}
+
+function isCreditCardInvoiceAdjustmentCandidate(description?: string | null): boolean {
+  const text = normalizeText(description ?? '');
+  return (
+    isCreditCardPaymentReceived(description) ||
+    ['estorno', 'credito', 'reembolso'].some((token) => text.includes(token))
+  );
+}
+
+function isInvoiceAdjustmentPreviewCandidate(
+  source: string,
+  row: { raw?: Prisma.JsonValue; description: string | null },
+): boolean {
+  if (source !== 'nubank_credit_card') return false;
+  return readRawBoolean(row.raw, 'invoiceAdjustmentCandidate') ?? isCreditCardInvoiceAdjustmentCandidate(row.description);
+}
+
+function isInvoiceAdjustmentDefault(row: { raw?: Prisma.JsonValue; description: string | null }): boolean {
+  return readRawBoolean(row.raw, 'invoiceAdjustmentDefault') ?? isCreditCardPaymentReceived(row.description);
+}
+
+function readRawBoolean(raw: Prisma.JsonValue | undefined, key: string): boolean | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !(key in raw)) return null;
+  const value = (raw as Record<string, unknown>)[key];
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (value.toLowerCase() === 'true') return true;
+    if (value.toLowerCase() === 'false') return false;
+  }
+  return null;
 }
 
 function isInvoicePaymentTransaction(
