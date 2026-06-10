@@ -120,13 +120,31 @@ describe('DashboardService', () => {
       if (start === '2025-07' && end === '2026-06') return transactions;
       return [];
     });
+    const openInstallments = Array.from({ length: 6 }, (_, index) => ({
+      id: `open-installment-${index + 1}`,
+      description: `Parcelamento aberto ${index + 1}`,
+      paidInstallments: index,
+      totalInstallments: index + 2,
+      monthlyAmountCents: 10_00 + index,
+    }));
 
     const prisma = {
       account: {
         findMany: vi.fn().mockResolvedValue([{ memberProfileId: 'profile-1', initialBalanceCents: 1_000_00 }]),
       },
       importRow: { findMany: vi.fn().mockResolvedValue([]) },
-      installmentPlan: { findMany: vi.fn().mockResolvedValue([]) },
+      installmentPlan: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'closed-installment',
+            description: 'Parcelamento quitado',
+            paidInstallments: 3,
+            totalInstallments: 3,
+            monthlyAmountCents: 99_00,
+          },
+          ...openInstallments,
+        ]),
+      },
       invoice: { findMany: vi.fn().mockResolvedValue([]) },
       memberProfile: { findMany: vi.fn().mockResolvedValue([{ id: 'profile-1' }]) },
       monthlyOpening: { findMany: vi.fn().mockResolvedValue([]) },
@@ -183,6 +201,17 @@ describe('DashboardService', () => {
     expect(data.parcelasConfirmadasValorCents).toBe(100_00);
     expect(data.parcelasProjetadasQuantidade).toBe(2);
     expect(data.parcelasProjetadasValorCents).toBe(150_00);
+    expect(data.parcelas).toHaveLength(6);
+    expect(data.parcelas).toEqual(
+      openInstallments.map((plan) => ({
+        id: plan.id,
+        name: plan.description,
+        pago: plan.paidInstallments,
+        total: plan.totalInstallments,
+        mensal: plan.monthlyAmountCents,
+        restante: (plan.totalInstallments - plan.paidInstallments) * plan.monthlyAmountCents,
+      })),
+    );
     expect(data.saldoDiarioAtual[19]).toBe(330_00);
     expect(data.saldoDiarioProjetado[19]).toBe(240_00);
     expect(data.despesaDiariaAtualSpark[19]).toBe(0);

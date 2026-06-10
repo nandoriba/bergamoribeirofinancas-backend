@@ -43,6 +43,7 @@ const transactionInclude = {
 type DashboardTransaction = Prisma.TransactionGetPayload<{ include: typeof transactionInclude }>;
 type DashboardInvoice = Prisma.InvoiceGetPayload<{ include: { account: true } }>;
 type DashboardRecurring = Prisma.RecurringTemplateGetPayload<Record<string, never>>;
+type DashboardInstallmentPlan = Prisma.InstallmentPlanGetPayload<Record<string, never>>;
 type DashboardImportRow = Prisma.ImportRowGetPayload<{ include: { importBatch: true } }>;
 export type ImportPreviewStatus = 'new' | 'duplicate' | 'possible_duplicate' | 'review';
 
@@ -84,7 +85,6 @@ export class DashboardService {
         this.prisma.installmentPlan.findMany({
           where: { memberProfileId: { in: profileIds } },
           orderBy: { createdAt: 'desc' },
-          take: 5,
         }),
         this.prisma.invoice.findMany({
           where: {
@@ -185,7 +185,8 @@ export class DashboardService {
       top5: categoryTotals.top5,
       outrosCat: categoryTotals.others,
       avisos: this.buildAlerts(invoices, recurring),
-      parcelas: installments.map((plan) => ({
+      parcelas: installments.filter(isOpenInstallmentPlan).map((plan) => ({
+        id: plan.id,
         name: plan.description,
         pago: plan.paidInstallments,
         total: plan.totalInstallments,
@@ -517,6 +518,10 @@ export class DashboardService {
   private formatMoney(cents: number): string {
     return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(cents / 100);
   }
+}
+
+function isOpenInstallmentPlan(plan: Pick<DashboardInstallmentPlan, 'paidInstallments' | 'totalInstallments'>): boolean {
+  return plan.paidInstallments < plan.totalInstallments;
 }
 
 function mapImportPreviewStatus(status: ImportRowStatus, falseDuplicate: boolean): ImportPreviewStatus {
