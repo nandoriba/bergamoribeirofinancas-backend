@@ -138,6 +138,62 @@ describe('TransactionsService', () => {
     expect(create).toHaveBeenCalledTimes(1);
   });
 
+  it('creates credit card invoice from closing day when reference month is omitted', async () => {
+    const create = vi.fn(async (args) => ({
+      ...args.data,
+      account: { type: 'credit_card' },
+      category: null,
+      invoice: null,
+      installmentPlan: null,
+    }));
+    const findMany = vi.fn().mockResolvedValue([]);
+    const accountFindFirst = vi.fn().mockResolvedValue({
+      id: 'card-1',
+      type: 'credit_card',
+      closingDay: 25,
+      dueDay: 2,
+    });
+    const invoiceUpsert = vi.fn().mockResolvedValue({ id: 'invoice-july' });
+    const service = new TransactionsService({
+      account: { findFirst: accountFindFirst },
+      invoice: { upsert: invoiceUpsert },
+      transaction: { create, findMany },
+    } as never);
+
+    await service.create(user, {
+      applicationDate: '2026-06-26',
+      description: 'Compra no cartão',
+      amountCents: 100_00,
+      type: 'expense',
+      accountId: 'card-1',
+    });
+
+    const julyReference = new Date('2026-07-01T00:00:00.000Z');
+    expect(invoiceUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          accountId_referenceMonth: {
+            accountId: 'card-1',
+            referenceMonth: julyReference,
+          },
+        },
+        create: expect.objectContaining({
+          referenceMonth: julyReference,
+          closingDate: new Date('2026-07-25T00:00:00.000Z'),
+          dueDate: new Date('2026-07-02T00:00:00.000Z'),
+        }),
+      }),
+    );
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          referenceMonth: julyReference,
+          invoiceId: 'invoice-july',
+        }),
+      }),
+    );
+  });
+
   it('blocks manual strong duplicates by amount, application date and description', async () => {
     const create = vi.fn(async (args) => args.data);
     const findMany = vi.fn().mockResolvedValue([

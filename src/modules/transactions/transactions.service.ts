@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
+import { dateFromAccountDay, resolveCreditCardReferenceMonth } from '../../shared/credit-card-invoice';
 import { endOfDay, endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
@@ -16,6 +17,7 @@ const transactionInclude = {
 } satisfies Prisma.TransactionInclude;
 
 type TransactionWithRelations = Prisma.TransactionGetPayload<{ include: typeof transactionInclude }>;
+type PrismaExecutor = PrismaService | Prisma.TransactionClient;
 
 @Injectable()
 export class TransactionsService {
@@ -41,14 +43,28 @@ export class TransactionsService {
   }
 
   async create(user: AuthenticatedUser, dto: CreateTransactionDto) {
-    await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
+    return this.createInTransaction(this.prisma, user, dto);
+  }
+
+  async createInTransaction(client: PrismaExecutor, user: AuthenticatedUser, dto: CreateTransactionDto) {
+    const account = await this.validateRelations(client, user, dto.accountId, dto.categoryId, dto.invoiceId);
     const applicationDate = new Date(dto.applicationDate);
-    await this.validateDuplicate(user, dto, applicationDate);
-    const transaction = await this.prisma.transaction.create({
+    await this.validateDuplicate(client, user, dto, applicationDate);
+    const fallbackReferenceMonth = startOfMonth(new Date(dto.referenceMonth ?? dto.applicationDate));
+    const referenceMonth =
+      account?.type === 'credit_card' && !dto.referenceMonth
+        ? (resolveCreditCardReferenceMonth(account, applicationDate) ?? fallbackReferenceMonth)
+        : fallbackReferenceMonth;
+    const invoiceId =
+      account?.type === 'credit_card'
+        ? await this.findOrCreateInvoice(client, user, account, referenceMonth, dto.invoiceId)
+        : dto.invoiceId;
+
+    const transaction = await client.transaction.create({
       data: {
         date: new Date(),
         applicationDate,
-        referenceMonth: startOfMonth(new Date(dto.referenceMonth ?? dto.applicationDate)),
+        referenceMonth,
         description: dto.description.trim(),
         amountCents: Math.abs(dto.amountCents),
         type: dto.type,
@@ -59,7 +75,7 @@ export class TransactionsService {
         notes: dto.notes,
         accountId: dto.accountId,
         categoryId: dto.categoryId,
-        invoiceId: dto.invoiceId,
+        invoiceId,
         installmentNumber: dto.installmentNumber,
         memberProfileId: user.profileId,
       },
@@ -70,8 +86,10 @@ export class TransactionsService {
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateTransactionDto) {
     const current = await this.ensureTransaction(user, id);
-    const { allowDuplicate: _allowDuplicate, ...updateData } = dto;
+    const updateData = { ...dto };
+    delete updateData.allowDuplicate;
     await this.validateRelations(
+      this.prisma,
       user,
       dto.accountId ?? current.accountId ?? undefined,
       dto.categoryId,
@@ -110,13 +128,14 @@ export class TransactionsService {
   }
 
   private async validateRelations(
+    client: PrismaExecutor,
     user: AuthenticatedUser,
     accountId?: string,
     categoryId?: string,
     invoiceId?: string,
   ) {
     const account = accountId
-      ? await this.prisma.account.findFirst({
+      ? await client.account.findFirst({
           where: { id: accountId, memberProfileId: user.profileId },
         })
       : null;
@@ -126,14 +145,14 @@ export class TransactionsService {
     }
 
     if (categoryId) {
-      const category = await this.prisma.category.findFirst({
+      const category = await client.category.findFirst({
         where: { id: categoryId, familyId: user.familyId },
       });
       if (!category) throw new BadRequestException('Categoria inválida');
     }
 
     if (invoiceId) {
-      const invoice = await this.prisma.invoice.findFirst({
+      const invoice = await client.invoice.findFirst({
         where: { id: invoiceId, memberProfileId: user.profileId },
       });
       if (!invoice) throw new BadRequestException('Fatura inválida');
@@ -147,6 +166,8 @@ export class TransactionsService {
         throw new BadRequestException('Fatura só pode ser vinculada a cartão de crédito');
       }
     }
+
+    return account;
   }
 
   private resolveManualStatus(applicationDate: Date, requested?: 'confirmed' | 'pending') {
@@ -154,8 +175,13 @@ export class TransactionsService {
     return requested ?? 'pending';
   }
 
-  private async validateDuplicate(user: AuthenticatedUser, dto: CreateTransactionDto, applicationDate: Date) {
-    const sameValueAndDate = await this.prisma.transaction.findMany({
+  private async validateDuplicate(
+    client: PrismaExecutor,
+    user: AuthenticatedUser,
+    dto: CreateTransactionDto,
+    applicationDate: Date,
+  ) {
+    const sameValueAndDate = await client.transaction.findMany({
       where: {
         memberProfileId: user.profileId,
         applicationDate,
@@ -202,6 +228,36 @@ export class TransactionsService {
       amountCents: transaction.amountCents,
       applicationDate: transaction.applicationDate.toISOString(),
     };
+  }
+
+  private async findOrCreateInvoice(
+    client: PrismaExecutor,
+    user: AuthenticatedUser,
+    account: { id: string; closingDay: number | null; dueDay: number | null },
+    referenceMonth: Date,
+    preferredInvoiceId?: string,
+  ) {
+    if (preferredInvoiceId) return preferredInvoiceId;
+
+    const invoice = await client.invoice.upsert({
+      where: {
+        accountId_referenceMonth: {
+          accountId: account.id,
+          referenceMonth,
+        },
+      },
+      update: {},
+      create: {
+        accountId: account.id,
+        memberProfileId: user.profileId,
+        referenceMonth,
+        status: 'open',
+        closingDate: dateFromAccountDay(referenceMonth, account.closingDay),
+        dueDate: dateFromAccountDay(referenceMonth, account.dueDay),
+      },
+    });
+
+    return invoice.id;
   }
 }
 

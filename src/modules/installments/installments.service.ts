@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import type { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
+import { dateFromAccountDay } from '../../shared/credit-card-invoice';
 import { addMonths, clampDayForMonth, endOfDay, startOfMonth } from '../../shared/date-range';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateInstallmentDto } from './dto/create-installment.dto';
@@ -43,13 +44,18 @@ export class InstallmentsService {
 
   async create(user: AuthenticatedUser, dto: CreateInstallmentDto) {
     this.validateInstallmentShape(dto);
-    const account = await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
+    return this.prisma.$transaction((tx) => this.createInTransaction(tx, user, dto));
+  }
+
+  async createInTransaction(tx: Prisma.TransactionClient, user: AuthenticatedUser, dto: CreateInstallmentDto) {
+    this.validateInstallmentShape(dto);
+    const account = await this.validateRelations(tx, user, dto.accountId, dto.categoryId, dto.invoiceId);
     const description = cleanInstallmentDescription(dto.description);
     const firstReferenceMonth = startOfMonth(new Date(dto.firstReferenceMonth));
     const firstInstallmentReference = addMonths(firstReferenceMonth, 1 - dto.firstInstallmentNumber);
     const monthlyAmountCents = Math.abs(dto.monthlyAmountCents);
     const totalAmountCents = monthlyAmountCents * dto.totalInstallments;
-    const candidates = await this.findLinkCandidates(user, dto, firstInstallmentReference);
+    const candidates = await this.findLinkCandidates(tx, user, dto, firstInstallmentReference);
 
     if (candidates.length > 0 && !dto.confirmExistingLinks) {
       throw new ConflictException({
@@ -62,89 +68,87 @@ export class InstallmentsService {
     const baseApplicationDate = new Date(dto.firstApplicationDate ?? dto.startsAt);
     const todayEnd = endOfDay(new Date());
 
-    return this.prisma.$transaction(async (tx) => {
-      const installmentApplicationDates = Array.from({ length: dto.totalInstallments }, (_, index) =>
-        dateWithDay(addMonths(firstInstallmentReference, index), baseApplicationDate.getUTCDate()),
-      );
-      const plan = await tx.installmentPlan.create({
+    const installmentApplicationDates = Array.from({ length: dto.totalInstallments }, (_, index) =>
+      dateWithDay(addMonths(firstInstallmentReference, index), baseApplicationDate.getUTCDate()),
+    );
+    const plan = await tx.installmentPlan.create({
+      data: {
+        description,
+        totalInstallments: dto.totalInstallments,
+        firstInstallmentNumber: dto.firstInstallmentNumber,
+        firstReferenceMonth,
+        paidInstallments:
+          dto.paidInstallments ??
+          installmentApplicationDates.filter((applicationDate) => applicationDate <= todayEnd).length,
+        monthlyAmountCents,
+        totalAmountCents,
+        startsAt: bookkeepingDate,
+        memberProfileId: user.profileId,
+      },
+    });
+
+    for (let installmentNumber = 1; installmentNumber <= dto.totalInstallments; installmentNumber += 1) {
+      const referenceMonth = addMonths(firstInstallmentReference, installmentNumber - 1);
+      const applicationDate = installmentApplicationDates[installmentNumber - 1];
+      const invoiceId = account?.type === 'credit_card'
+        ? await this.findOrCreateInvoice(tx, user, account, referenceMonth, dto.invoiceId)
+        : undefined;
+      const candidate = candidates.find((item) => item.installmentNumber === installmentNumber);
+
+      if (candidate) {
+        await tx.transaction.update({
+          where: { id: candidate.candidateTransactionId },
+          data: {
+            installmentPlanId: plan.id,
+            installmentNumber,
+            applicationDate,
+            status: 'confirmed',
+            linkedToPlanAt: new Date(),
+            linkedToPlanByUserId: user.id,
+            invoiceId,
+          },
+        });
+        continue;
+      }
+
+      await tx.transaction.create({
         data: {
-          description,
-          totalInstallments: dto.totalInstallments,
-          firstInstallmentNumber: dto.firstInstallmentNumber,
-          firstReferenceMonth,
-          paidInstallments:
-            dto.paidInstallments ??
-            installmentApplicationDates.filter((applicationDate) => applicationDate <= todayEnd).length,
-          monthlyAmountCents,
-          totalAmountCents,
-          startsAt: bookkeepingDate,
+          date: bookkeepingDate,
+          applicationDate,
+          referenceMonth,
+          description: `${description} - Parcela ${installmentNumber}/${dto.totalInstallments}`,
+          amountCents: monthlyAmountCents,
+          type: 'expense',
+          status: 'confirmed',
+          recurrenceType: 'none',
+          source: 'installment',
+          accountId: dto.accountId,
+          categoryId: dto.categoryId,
+          invoiceId,
+          installmentPlanId: plan.id,
+          installmentNumber,
           memberProfileId: user.profileId,
         },
       });
+    }
 
-      for (let installmentNumber = 1; installmentNumber <= dto.totalInstallments; installmentNumber += 1) {
-        const referenceMonth = addMonths(firstInstallmentReference, installmentNumber - 1);
-        const applicationDate = installmentApplicationDates[installmentNumber - 1];
-        const invoiceId = account?.type === 'credit_card'
-          ? await this.findOrCreateInvoice(tx, user, account, referenceMonth, dto.invoiceId)
-          : undefined;
-        const candidate = candidates.find((item) => item.installmentNumber === installmentNumber);
-
-        if (candidate) {
-          await tx.transaction.update({
-            where: { id: candidate.candidateTransactionId },
-            data: {
-              installmentPlanId: plan.id,
-              installmentNumber,
-              applicationDate,
-              status: 'confirmed',
-              linkedToPlanAt: new Date(),
-              linkedToPlanByUserId: user.id,
-              invoiceId,
-            },
-          });
-          continue;
-        }
-
-        await tx.transaction.create({
-          data: {
-            date: bookkeepingDate,
-            applicationDate,
-            referenceMonth,
-            description: `${description} - Parcela ${installmentNumber}/${dto.totalInstallments}`,
-            amountCents: monthlyAmountCents,
-            type: 'expense',
-            status: 'confirmed',
-            recurrenceType: 'none',
-            source: 'installment',
-            accountId: dto.accountId,
-            categoryId: dto.categoryId,
-            invoiceId,
-            installmentPlanId: plan.id,
-            installmentNumber,
-            memberProfileId: user.profileId,
+    const created = await tx.installmentPlan.findUniqueOrThrow({
+      where: { id: plan.id },
+      include: {
+        transactions: {
+          include: {
+            account: true,
+            category: true,
+            invoice: { include: { account: true } },
+            memberProfile: { select: { id: true, displayName: true } },
           },
-        });
-      }
-
-      const created = await tx.installmentPlan.findUniqueOrThrow({
-        where: { id: plan.id },
-        include: {
-          transactions: {
-            include: {
-              account: true,
-              category: true,
-              invoice: { include: { account: true } },
-              memberProfile: { select: { id: true, displayName: true } },
-            },
-            orderBy: [{ referenceMonth: 'asc' }, { installmentNumber: 'asc' }],
-          },
-          memberProfile: { select: { id: true, displayName: true } },
+          orderBy: [{ referenceMonth: 'asc' }, { installmentNumber: 'asc' }],
         },
-      });
-
-      return this.withComputedAmounts(created);
+        memberProfile: { select: { id: true, displayName: true } },
+      },
     });
+
+    return this.withComputedAmounts(created);
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateInstallmentDto) {
@@ -200,6 +204,16 @@ export class InstallmentsService {
     return this.prisma.installmentPlan.delete({ where: { id } });
   }
 
+  async removeTelegramCreatedPlanInTransaction(tx: Prisma.TransactionClient, user: AuthenticatedUser, id: string) {
+    const plan = await tx.installmentPlan.findFirst({
+      where: { id, memberProfileId: user.profileId },
+    });
+    if (!plan) throw new NotFoundException('Parcelamento não encontrado');
+
+    await tx.transaction.deleteMany({ where: { installmentPlanId: id } });
+    return tx.installmentPlan.delete({ where: { id } });
+  }
+
   private async ensure(user: AuthenticatedUser, id: string) {
     const plan = await this.prisma.installmentPlan.findFirst({
       where: { id, memberProfileId: user.profileId },
@@ -219,21 +233,27 @@ export class InstallmentsService {
     };
   }
 
-  private async validateRelations(user: AuthenticatedUser, accountId?: string, categoryId?: string, invoiceId?: string) {
+  private async validateRelations(
+    client: PrismaService | Prisma.TransactionClient,
+    user: AuthenticatedUser,
+    accountId?: string,
+    categoryId?: string,
+    invoiceId?: string,
+  ) {
     const account = accountId
-      ? await this.prisma.account.findFirst({ where: { id: accountId, memberProfileId: user.profileId } })
+      ? await client.account.findFirst({ where: { id: accountId, memberProfileId: user.profileId } })
       : null;
     if (accountId && !account) throw new BadRequestException('Conta inválida');
 
     if (categoryId) {
-      const category = await this.prisma.category.findFirst({
+      const category = await client.category.findFirst({
         where: { id: categoryId, familyId: user.familyId },
       });
       if (!category) throw new BadRequestException('Categoria inválida');
     }
 
     if (invoiceId) {
-      const invoice = await this.prisma.invoice.findFirst({
+      const invoice = await client.invoice.findFirst({
         where: { id: invoiceId, memberProfileId: user.profileId },
       });
       if (!invoice) throw new BadRequestException('Fatura inválida');
@@ -251,14 +271,19 @@ export class InstallmentsService {
     return account;
   }
 
-  private async findLinkCandidates(user: AuthenticatedUser, dto: CreateInstallmentDto, firstInstallmentReference: Date) {
+  private async findLinkCandidates(
+    client: PrismaService | Prisma.TransactionClient,
+    user: AuthenticatedUser,
+    dto: CreateInstallmentDto,
+    firstInstallmentReference: Date,
+  ) {
     const normalizedDescription = normalizeText(dto.description);
     const monthlyAmountCents = Math.abs(dto.monthlyAmountCents);
     const candidates = [];
 
     for (let installmentNumber = 1; installmentNumber <= dto.totalInstallments; installmentNumber += 1) {
       const referenceMonth = addMonths(firstInstallmentReference, installmentNumber - 1);
-      const existing = await this.prisma.transaction.findFirst({
+      const existing = await client.transaction.findFirst({
         where: {
           memberProfileId: user.profileId,
           referenceMonth,
@@ -286,7 +311,7 @@ export class InstallmentsService {
   private async findOrCreateInvoice(
     tx: Prisma.TransactionClient,
     user: AuthenticatedUser,
-    account: NonNullable<Awaited<ReturnType<InstallmentsService['validateRelations']>>>,
+    account: { id: string; closingDay: number | null; dueDay: number | null },
     referenceMonth: Date,
     preferredInvoiceId?: string,
   ) {
@@ -310,8 +335,8 @@ export class InstallmentsService {
         memberProfileId: user.profileId,
         referenceMonth,
         status: 'open',
-        closingDate: account.closingDay ? dateWithDay(referenceMonth, account.closingDay) : undefined,
-        dueDate: account.dueDay ? dateWithDay(referenceMonth, account.dueDay) : undefined,
+        closingDate: dateFromAccountDay(referenceMonth, account.closingDay),
+        dueDate: dateFromAccountDay(referenceMonth, account.dueDay),
       },
     });
 
