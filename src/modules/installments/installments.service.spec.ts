@@ -33,6 +33,7 @@ describe('InstallmentsService', () => {
         }),
       },
       transaction: {
+        findFirst: vi.fn().mockResolvedValue(null),
         create: vi.fn(async (args) => {
           transactionCreates.push(args.data);
           return args.data;
@@ -41,7 +42,6 @@ describe('InstallmentsService', () => {
     };
     const prisma = {
       $transaction: vi.fn((callback) => callback(tx)),
-      transaction: { findFirst: vi.fn().mockResolvedValue(null) },
     };
     const service = new InstallmentsService(prisma as never);
 
