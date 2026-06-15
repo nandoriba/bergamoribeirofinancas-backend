@@ -113,8 +113,14 @@ export class TransactionsService {
   }
 
   async remove(user: AuthenticatedUser, id: string) {
-    await this.ensureTransaction(user, id);
-    return this.prisma.transaction.delete({ where: { id } });
+    const transaction = await this.ensureTransaction(user, id);
+    return this.prisma.$transaction(async (tx) => {
+      await tx.telegramFinancialOperation.updateMany({
+        where: { transactionId: transaction.id, status: 'CREATED' },
+        data: { status: 'UNDONE', undoneAt: new Date() },
+      });
+      return tx.transaction.delete({ where: { id } });
+    });
   }
 
   private async ensureTransaction(user: AuthenticatedUser, id: string) {

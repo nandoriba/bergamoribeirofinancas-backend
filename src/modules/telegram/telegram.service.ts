@@ -518,14 +518,14 @@ export class TelegramService {
     const idempotencyKey = `tg:msg:${context.chatId}:${message.message_id}`;
     const operation = await this.tryCreateFinancialOperation(updateId, context, draft, idempotencyKey);
     if (operation.duplicate) {
-      await this.telegram.sendMessage(
+      await this.safeSendMessage(
         context.chatId,
         `Lançamento não criado: já existe um lançamento igual.\n${this.formatDraft(draft, aiContext)}`,
       );
       return true;
     }
 
-    await this.telegram.sendMessage(
+    await this.safeSendMessage(
       context.chatId,
       operation.alreadyExisted ? 'Lançamento já processado anteriormente.' : `Lançamento criado.\n${this.formatDraft(draft, aiContext)}`,
     );
@@ -536,7 +536,7 @@ export class TelegramService {
     const data = callback.data ?? '';
     const match = /^tg:([A-Za-z0-9_-]{8,24}):(confirm|cancel|edit)$/.exec(data);
     if (!match || !callback.message) {
-      await this.telegram.answerCallbackQuery(callback.id);
+      await this.safeAnswerCallbackQuery(callback.id);
       return false;
     }
 
@@ -546,23 +546,23 @@ export class TelegramService {
     const tgUserId = String(callback.from.id);
 
     if (!pending || pending.chatId !== chatId) {
-      await this.telegram.answerCallbackQuery(callback.id, 'Confirmação não encontrada.');
+      await this.safeAnswerCallbackQuery(callback.id, 'Confirmação não encontrada.');
       return false;
     }
 
     if (pending.tgUserId !== tgUserId) {
-      await this.telegram.answerCallbackQuery(callback.id, 'Só quem enviou a mensagem original pode confirmar.', true);
+      await this.safeAnswerCallbackQuery(callback.id, 'Só quem enviou a mensagem original pode confirmar.', true);
       return false;
     }
 
     if (pending.status !== 'PENDING' || pending.expiresAt <= new Date()) {
       await this.expirePendingIfNeeded(pending.id, pending.expiresAt);
-      await this.telegram.answerCallbackQuery(callback.id, 'Confirmação expirada ou já resolvida.');
+      await this.safeAnswerCallbackQuery(callback.id, 'Confirmação expirada ou já resolvida.');
       return false;
     }
 
     if (action === 'edit') {
-      await this.telegram.answerCallbackQuery(callback.id, 'Edição pelo Telegram ainda não está disponível.');
+      await this.safeAnswerCallbackQuery(callback.id, 'Edição pelo Telegram ainda não está disponível.');
       return false;
     }
 
@@ -577,8 +577,8 @@ export class TelegramService {
           data: { status: 'succeeded', processedAt: new Date(), lastError: null },
         });
       });
-      await this.telegram.answerCallbackQuery(callback.id, 'Cancelado.');
-      await this.telegram.editMessageText(chatId, callback.message.message_id, 'Lançamento cancelado.');
+      await this.safeAnswerCallbackQuery(callback.id, 'Cancelado.');
+      await this.safeReplaceMessage(chatId, callback.message.message_id, 'Lançamento cancelado.');
       return true;
     }
 
@@ -590,7 +590,7 @@ export class TelegramService {
 
     const context = await this.resolveLinkedContextFromIds(chatId, tgUserId);
     if (!context || context.memberProfileId !== pending.memberProfileId) {
-      await this.telegram.answerCallbackQuery(callback.id, 'Vínculo não encontrado.');
+      await this.safeAnswerCallbackQuery(callback.id, 'Vínculo não encontrado.');
       return false;
     }
 
@@ -614,8 +614,8 @@ export class TelegramService {
           data: { status: 'succeeded', processedAt: new Date(), lastError: null },
         });
       });
-      await this.telegram.answerCallbackQuery(callback.id, 'Lançamento duplicado.');
-      await this.telegram.editMessageText(
+      await this.safeAnswerCallbackQuery(callback.id, 'Lançamento duplicado.');
+      await this.safeReplaceMessage(
         chatId,
         callback.message.message_id,
         `Lançamento não criado: já existe um lançamento igual.\n${this.formatDraft(payload.draft, aiContext)}`,
@@ -623,8 +623,8 @@ export class TelegramService {
       return true;
     }
 
-    await this.telegram.answerCallbackQuery(callback.id, 'Confirmado.');
-    await this.telegram.editMessageText(
+    await this.safeAnswerCallbackQuery(callback.id, 'Confirmado.');
+    await this.safeReplaceMessage(
       chatId,
       callback.message.message_id,
       `Lançamento criado.\n${this.formatDraft(payload.draft, aiContext)}`,
@@ -642,7 +642,7 @@ export class TelegramService {
     const tgUserId = String(callback.from.id);
     const context = await this.resolveLinkedContextFromIds(chatId, tgUserId);
     if (!context) {
-      await this.telegram.answerCallbackQuery(callback.id, 'Vínculo não encontrado.');
+      await this.safeAnswerCallbackQuery(callback.id, 'Vínculo não encontrado.');
       return;
     }
 
@@ -698,9 +698,9 @@ export class TelegramService {
       });
     });
 
-    await this.telegram.answerCallbackQuery(callback.id, 'Desfeito.');
+    await this.safeAnswerCallbackQuery(callback.id, 'Desfeito.');
     if (callback.message) {
-      await this.telegram.editMessageText(chatId, callback.message.message_id, 'Lançamento desfeito.');
+      await this.safeReplaceMessage(chatId, callback.message.message_id, 'Lançamento desfeito.');
     }
   }
 
@@ -879,7 +879,6 @@ export class TelegramService {
           { text: 'Confirmar', callback_data: `tg:${pending.id}:confirm` },
           { text: 'Cancelar', callback_data: `tg:${pending.id}:cancel` },
         ],
-        [{ text: 'Editar', callback_data: `tg:${pending.id}:edit` }],
       ],
     });
     const messageId = readTelegramMessageId(sent);
@@ -1029,6 +1028,23 @@ export class TelegramService {
     }
   }
 
+  private async safeAnswerCallbackQuery(callbackQueryId: string, text?: string, showAlert = false) {
+    try {
+      await this.telegram.answerCallbackQuery(callbackQueryId, text, showAlert);
+    } catch (error) {
+      this.logger.warn(`Falha ao responder callback Telegram: ${formatError(error)}`);
+    }
+  }
+
+  private async safeReplaceMessage(chatId: string, messageId: number, text: string) {
+    try {
+      await this.telegram.editMessageText(chatId, messageId, text);
+    } catch (error) {
+      this.logger.warn(`Falha ao editar mensagem Telegram: ${formatError(error)}`);
+      await this.safeSendMessage(chatId, text);
+    }
+  }
+
   private async trySendPrivacyNotice(tgUserId: string) {
     await this.safeSendMessage(
       tgUserId,
@@ -1136,6 +1152,13 @@ function readTelegramMessageId(value: unknown) {
 
 function toJsonInput(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function isStrongDuplicateError(error: unknown) {
+  if (!(error instanceof BadRequestException)) return false;
+  const response = error.getResponse();
+  if (!response || typeof response !== 'object' || Array.isArray(response)) return false;
+  return 'code' in response && response.code === 'STRONG_DUPLICATE';
 }
 
 function formatError(error: unknown) {
