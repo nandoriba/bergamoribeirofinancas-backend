@@ -1,111 +1,169 @@
 # Deploy — Sistema Financeiro
 
-Procedimento para subir o sistema (back + front + Postgres) em VPS Hostinger,
-seguindo o mesmo padrão do Psicomportamento (Docker + GHCR + GitHub Actions + nginx host).
+Procedimento para subir o sistema financeiro na mesma VPS Hostinger do
+Psicomportamento, reaproveitando o Postgres existente e mantendo o deploy do
+financeiro isolado em `/app/financeiro`.
 
-## 1. Provisionar a VPS (uma vez)
+## 1. Topologia
 
-Pré-requisitos na VPS Ubuntu:
+Serviços já existentes na VPS:
 
-```bash
-# Docker + compose plugin
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-
-# nginx + certbot
-sudo apt update
-sudo apt install -y nginx certbot python3-certbot-nginx
+```text
+/app/docker-compose.yml        # Stack do Psicocomportamento
+postgres_db                    # Postgres compartilhado
+app_internal                   # Rede Docker compartilhada
 ```
 
-Estrutura na VPS:
+Serviços do financeiro:
 
-```bash
-sudo mkdir -p /app/backups
-sudo chown -R $USER:$USER /app
-cd /app
+```text
+/app/financeiro/docker-compose.yml
+/app/financeiro/.env
+financeiro-api                 # 127.0.0.1:8180
+financeiro-web                 # 127.0.0.1:8181
 ```
 
-Copiar arquivos iniciais (uma vez, antes do primeiro deploy):
+Banco do financeiro no Postgres compartilhado:
 
-```bash
-# Do seu desktop, copiar via scp:
-scp bergamoribeirofinancas-backend/docker-compose.yml      vps:/app/
-scp bergamoribeirofinancas-backend/.env.production.example vps:/app/.env
-scp bergamoribeirofinancas-backend/deploy/backup-postgres.sh vps:/app/scripts/
-scp bergamoribeirofinancas-backend/deploy/nginx-financas.conf vps:/etc/nginx/sites-available/financas.conf
+```text
+Database: db_financeiro
+User: financeiro_user
+Host Docker: postgres_db
 ```
 
-Editar `/app/.env` na VPS preenchendo `POSTGRES_PASSWORD`, `JWT_SECRET`, `WEB_ORIGIN`, etc.
-`BACKEND_TAG` e `FRONTEND_TAG` ficam como `latest` no início — os workflows atualizam.
+Não copie o compose do financeiro para `/app/docker-compose.yml`. Esse arquivo
+pertence ao Psicocomportamento.
 
-## 2. Configurar DNS e TLS
+## 2. Provisionar diretório
 
-Aponte `financas.seu-dominio.com` (A record) para o IP da VPS, então:
+Na VPS:
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/financas.conf /etc/nginx/sites-enabled/
-sudo certbot --nginx -d financas.seu-dominio.com
+mkdir -p /app/financeiro/backups /app/financeiro/scripts
+```
+
+Do desktop, copiar os arquivos iniciais:
+
+```bash
+scp bergamoribeirofinancas-backend/.env.production.example fernando-vps:/app/financeiro/.env
+scp bergamoribeirofinancas-backend/docker-compose.yml fernando-vps:/app/financeiro/docker-compose.yml
+scp bergamoribeirofinancas-backend/deploy/backup-postgres.sh fernando-vps:/app/financeiro/scripts/backup-postgres.sh
+```
+
+Editar `/app/financeiro/.env` na VPS e preencher `GHCR_OWNER`,
+`POSTGRES_PASSWORD`, `DATABASE_URL`, `JWT_SECRET`, usuário admin inicial e tags.
+
+## 3. Criar banco e usuário
+
+Execute no Postgres compartilhado com um usuário administrador do banco:
+
+```sql
+CREATE ROLE financeiro_user LOGIN PASSWORD 'trocar-em-producao';
+CREATE DATABASE db_financeiro OWNER financeiro_user;
+GRANT ALL PRIVILEGES ON DATABASE db_financeiro TO financeiro_user;
+```
+
+O `DATABASE_URL` no `/app/financeiro/.env` deve seguir este formato:
+
+```text
+DATABASE_URL=postgresql://financeiro_user:SENHA@postgres_db:5432/db_financeiro?schema=public
+```
+
+## 4. Configurar GitHub
+
+Nos dois repositórios (`bergamoribeirofinancas-backend` e
+`bergamoribeirofinancas-frontend`), configurar:
+
+| Secret | Valor |
+|---|---|
+| `VPS_HOST` | IP ou hostname da VPS |
+| `VPS_PORT` | porta SSH, geralmente `22` |
+| `VPS_USER` | usuário SSH |
+| `VPS_SSH_KEY` | chave privada SSH |
+| `VPS_APP_DIR` | `/app/financeiro` |
+| `GHCR_USERNAME` | usuário GitHub |
+| `GHCR_PAT` | token com `read:packages` |
+
+Apenas no frontend:
+
+| Secret ou variable | Valor |
+|---|---|
+| `VITE_API_BASE_URL_PRODUCTION` | `https://api.bergamoribeirofinancas.com.br` |
+
+Os workflows falham se `VPS_APP_DIR` for diferente de `/app/financeiro`, para
+evitar sobrescrever a stack do Psicocomportamento.
+
+## 5. Primeiro deploy
+
+Ordem recomendada:
+
+1. Rodar o workflow do backend.
+2. Confirmar healthcheck local na VPS:
+
+```bash
+curl -fsS http://127.0.0.1:8180/health
+```
+
+3. Rodar o workflow do frontend.
+4. Confirmar frontend local na VPS:
+
+```bash
+curl -fsS http://127.0.0.1:8181
+```
+
+Os workflows usam:
+
+```bash
+docker compose -p financeiro -f /app/financeiro/docker-compose.yml up -d <servico>
+```
+
+Não use `--remove-orphans` nessa stack durante deploy automatizado.
+
+## 6. NGINX e TLS
+
+Domínios planejados:
+
+```text
+bergamoribeirofinancas.com.br      -> 127.0.0.1:8181
+api.bergamoribeirofinancas.com.br  -> 127.0.0.1:8180
+```
+
+Depois que o DNS apontar para a VPS, habilite uma configuração nginx para esses
+dois hosts e rode Certbot:
+
+```bash
+sudo certbot --nginx -d bergamoribeirofinancas.com.br -d api.bergamoribeirofinancas.com.br
 sudo systemctl reload nginx
 ```
 
-## 3. Configurar GitHub
+## 7. Backup diário
 
-Em cada repo (`bergamoribeirofinancas-backend` e `bergamoribeirofinancas-frontend`),
-adicionar **Secrets** em Settings → Secrets and variables → Actions:
-
-| Secret | Descrição |
-|---|---|
-| `VPS_HOST` | IP ou hostname da VPS |
-| `VPS_PORT` | porta SSH (omitir → 22) |
-| `VPS_USER` | usuário SSH |
-| `VPS_SSH_KEY` | chave privada SSH (PEM, multilinha) |
-| `VPS_APP_DIR` | `/app` |
-| `GHCR_USERNAME` | seu usuário GitHub |
-| `GHCR_PAT` | Personal Access Token com escopo `read:packages` |
-
-Apenas no repo **frontend**, adicionar também:
-
-| Secret | Valor exemplo |
-|---|---|
-| `VITE_API_BASE_URL_PRODUCTION` | `https://financas.seu-dominio.com/api` |
-
-## 4. Primeiro deploy
-
-Em cada repo, push para `main` dispara o workflow. Ele:
-
-1. Roda lint + typecheck + testes.
-2. Builda a imagem Docker.
-3. Push para `ghcr.io/<owner>/bergamoribeirofinancas-{backend,frontend}`.
-4. SSH na VPS, atualiza `BACKEND_TAG` ou `FRONTEND_TAG` em `/app/.env`.
-5. `docker compose pull <serviço> && docker compose up -d <serviço>`.
-6. Healthcheck pós-deploy.
-
-Ordem recomendada no primeiro deploy: **backend primeiro** (sobe Postgres + roda migrations), depois **frontend**.
-
-## 5. Backup diário
+Na VPS:
 
 ```bash
-chmod +x /app/scripts/backup-postgres.sh
-sudo crontab -e
-# adicionar:
-0 3 * * * /app/scripts/backup-postgres.sh >> /var/log/financas-backup.log 2>&1
+chmod +x /app/financeiro/scripts/backup-postgres.sh
 ```
 
-Restore (teste eventualmente):
+Agendar no cron:
 
 ```bash
-gunzip -c /app/backups/financas-AAAAMMDD-HHMMSS.sql.gz \
-  | docker compose -f /app/docker-compose.yml exec -T postgres \
-    psql -U $POSTGRES_USER -d $POSTGRES_DB
+0 3 * * * APP_DIR=/app/financeiro /app/financeiro/scripts/backup-postgres.sh >> /var/log/financas-backup.log 2>&1
 ```
 
-## 6. Rollback
-
-Cada deploy guarda imagem com tag = SHA. Para voltar:
+Restore:
 
 ```bash
-ssh vps
-cd /app
+gunzip -c /app/financeiro/backups/financas-AAAAMMDD-HHMMSS.sql.gz \
+  | docker exec -i postgres_db psql -U financeiro_user -d db_financeiro
+```
+
+## 8. Rollback
+
+Cada deploy usa tag igual ao SHA do commit. Para voltar:
+
+```bash
+cd /app/financeiro
 sed -i "s/^BACKEND_TAG=.*/BACKEND_TAG=<sha-anterior>/" .env
-docker compose pull backend && docker compose up -d backend
+docker compose -p financeiro -f /app/financeiro/docker-compose.yml pull backend
+docker compose -p financeiro -f /app/financeiro/docker-compose.yml up -d backend
 ```

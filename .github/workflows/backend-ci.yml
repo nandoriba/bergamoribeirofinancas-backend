@@ -97,6 +97,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Diretório isolado na VPS
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          VPS_APP_DIR: ${{ secrets.VPS_APP_DIR }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          envs: VPS_APP_DIR
+          script: |
+            set -eu
+            if [ "$VPS_APP_DIR" != "/app/financeiro" ]; then
+              echo "VPS_APP_DIR deve ser /app/financeiro para não sobrescrever a stack do Psicocomportamento."
+              exit 1
+            fi
+            mkdir -p "$VPS_APP_DIR"
+
       - name: Copiar docker-compose para VPS
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -124,15 +143,33 @@ jobs:
           envs: BACKEND_TAG,GHCR_USERNAME,GHCR_PAT,VPS_APP_DIR
           script: |
             set -eu
+            if [ "$VPS_APP_DIR" != "/app/financeiro" ]; then
+              echo "VPS_APP_DIR deve ser /app/financeiro para não sobrescrever a stack do Psicocomportamento."
+              exit 1
+            fi
             cd "$VPS_APP_DIR"
+            if [ ! -f .env ]; then
+              echo "Arquivo $VPS_APP_DIR/.env não encontrado. Provisione o .env de produção antes do deploy."
+              exit 1
+            fi
+            if [ ! -f docker-compose.yml ]; then
+              echo "Arquivo $VPS_APP_DIR/docker-compose.yml não encontrado."
+              exit 1
+            fi
+            if ! grep -q '^DATABASE_URL=' .env; then
+              echo "DATABASE_URL não encontrado em $VPS_APP_DIR/.env."
+              exit 1
+            fi
+            docker network inspect app_internal > /dev/null
+            docker inspect postgres_db > /dev/null
             echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
             if grep -q '^BACKEND_TAG=' .env; then
               sed -i "s/^BACKEND_TAG=.*/BACKEND_TAG=${BACKEND_TAG}/" .env
             else
               printf '\nBACKEND_TAG=%s\n' "${BACKEND_TAG}" >> .env
             fi
-            docker compose pull backend
-            docker compose up -d --remove-orphans backend
+            docker compose -p financeiro -f "$VPS_APP_DIR/docker-compose.yml" pull backend
+            docker compose -p financeiro -f "$VPS_APP_DIR/docker-compose.yml" up -d backend
             sleep 10
             curl -fsS http://127.0.0.1:8180/health > /dev/null
             docker image prune -f
