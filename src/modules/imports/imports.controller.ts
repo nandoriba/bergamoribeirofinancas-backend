@@ -13,6 +13,7 @@ import { CurrentUser } from '../../shared/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ConfirmImportDto } from './dto/confirm-import.dto';
+import { DiscardImportDto } from './dto/discard-import.dto';
 import { ImportsService, type UploadedCsvFile } from './imports.service';
 
 @UseGuards(JwtAuthGuard)
@@ -34,5 +35,10 @@ export class ImportsController {
   @Post('confirm')
   confirm(@CurrentUser() user: AuthenticatedUser, @Body() dto: ConfirmImportDto) {
     return this.importsService.confirm(user, dto);
+  }
+
+  @Post('discard')
+  discard(@CurrentUser() user: AuthenticatedUser, @Body() dto: DiscardImportDto) {
+    return this.importsService.discard(user, dto);
   }
 }

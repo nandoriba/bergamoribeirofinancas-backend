@@ -13,12 +13,13 @@ export class DashboardController {
   @Get()
   getDashboard(
     @CurrentUser() user: AuthenticatedUser,
+    @Query('referenceMonth') referenceMonth?: string,
     @Query('month') month?: string,
     @Query('profileId') profileId?: string,
     @Query('family') family?: string,
   ) {
     return this.dashboardService.getDashboard(user, {
-      month,
+      referenceMonth: referenceMonth || month,
       profileId,
       family: family !== 'false',
     });

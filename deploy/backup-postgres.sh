@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Backup diário do Postgres do sistema financeiro.
-# Instalar em /app/scripts/backup-postgres.sh e agendar via cron:
-#   0 3 * * * /app/scripts/backup-postgres.sh >> /var/log/financas-backup.log 2>&1
+# Instalar em /app/financeiro/scripts/backup-postgres.sh e agendar via cron:
+#   0 3 * * * APP_DIR=/app/financeiro /app/financeiro/scripts/backup-postgres.sh >> /var/log/financas-backup.log 2>&1
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-/app}"
+APP_DIR="${APP_DIR:-/app/financeiro}"
 BACKUP_DIR="${APP_DIR}/backups"
-RETENTION_DAYS="${RETENTION_DAYS:-7}"
-COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
+DB_CONTAINER="${DB_CONTAINER:-postgres_db}"
 
-# Carrega variáveis (POSTGRES_DB, POSTGRES_USER) do .env do compose
+# Carrega variáveis (POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD) do .env
 set -a
 # shellcheck disable=SC1091
 source "${APP_DIR}/.env"
@@ -22,7 +22,7 @@ FILE="${BACKUP_DIR}/financas-${TIMESTAMP}.sql.gz"
 
 echo "[$(date -Iseconds)] Iniciando backup -> ${FILE}"
 
-docker compose -f "${COMPOSE_FILE}" exec -T postgres \
+docker exec -e PGPASSWORD="${POSTGRES_PASSWORD}" "${DB_CONTAINER}" \
   pg_dump -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" --no-owner --clean --if-exists \
   | gzip > "${FILE}"
 

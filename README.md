@@ -20,7 +20,7 @@ Em `NODE_ENV=development`, o CORS aceita automaticamente origens `http://127.0.0
 
 ## Banco Local
 
-Use o database lógico do projeto: `bergamoribeirofinancas_db`. Não use o database do Psicocomportamento para tabelas do financeiro.
+Use o database lógico local do projeto: `bergamoribeirofinancas_db`. Em produção, na VPS compartilhada, use `db_financeiro` com o usuário dedicado `financeiro_user`. Não use o database do Psicocomportamento para tabelas do financeiro.
 
 O seed cria apenas estrutura inicial: família, admin local, perfil, contas e categorias. Lançamentos demonstrativos e dados de mock não são versionados.
 

@@ -73,6 +73,7 @@ enum InvoiceStatus {
 enum ImportBatchStatus {
   preview
   confirmed
+  discarded
   failed
 }
 
@@ -95,6 +96,35 @@ enum RecurringStatus {
   paused
 }
 
+enum TelegramAuthCodeKind {
+  GROUP
+  MEMBER
+}
+
+enum TelegramUpdateStatus {
+  received
+  processing
+  succeeded
+  failed
+}
+
+enum TelegramPendingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  EXPIRED
+}
+
+enum TelegramFinancialOperationKind {
+  TRANSACTION
+  INSTALLMENT_PLAN
+}
+
+enum TelegramFinancialOperationStatus {
+  CREATED
+  UNDONE
+}
+
 model User {
   id              String          @id @default(uuid())
   email           String          @unique
@@ -108,6 +138,8 @@ model User {
   profile         MemberProfile?
   invitesCreated  MemberInvite[]  @relation("InviteCreator")
   approvalsMade   MemberApproval[] @relation("ApprovalReviewer")
+  telegramAuthorizedGroups TelegramAuthorizedGroup[] @relation("TelegramGroupAuthorizer")
+  telegramAuthCodes TelegramAuthCode[]
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 }
@@ -120,6 +152,7 @@ model Family {
   invites     MemberInvite[]
   approvals   MemberApproval[]
   categories  Category[]
+  telegramAuthorizedGroups TelegramAuthorizedGroup[]
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 }
@@ -139,6 +172,11 @@ model MemberProfile {
   installmentPlans  InstallmentPlan[]
   monthlyOpenings   MonthlyOpening[]
   importBatches     ImportBatch[]
+  telegramUserLinks  TelegramUserLink[]
+  telegramAuthCodes  TelegramAuthCode[]
+  telegramPendingConfirmations TelegramPendingConfirmation[]
+  telegramFinancialOperations TelegramFinancialOperation[]
+  telegramMessageLogs TelegramMessageLog[]
   createdAt         DateTime            @default(now())
   updatedAt         DateTime            @updatedAt
 }
@@ -211,6 +249,8 @@ model Category {
 model Transaction {
   id                  String            @id @default(uuid())
   date                DateTime
+  applicationDate     DateTime
+  referenceMonth      DateTime
   description         String
   amountCents         Int
   type                TransactionType
@@ -220,6 +260,8 @@ model Transaction {
   externalId          String?
   notes               String?
   isInvoicePayment    Boolean           @default(false)
+  isInvoiceAdjustment Boolean           @default(false)
+  invoiceAmountCents  Int?
   memberProfileId     String
   memberProfile       MemberProfile     @relation(fields: [memberProfileId], references: [id])
   accountId           String?
@@ -232,13 +274,20 @@ model Transaction {
   recurringTemplate   RecurringTemplate? @relation(fields: [recurringTemplateId], references: [id])
   installmentPlanId   String?
   installmentPlan     InstallmentPlan?  @relation(fields: [installmentPlanId], references: [id])
+  installmentNumber   Int?
+  linkedToPlanAt      DateTime?
+  linkedToPlanByUserId String?
   importRowId         String?           @unique
   importRow           ImportRow?        @relation(fields: [importRowId], references: [id])
+  telegramFinancialOperation TelegramFinancialOperation?
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
   @@unique([memberProfileId, externalId])
+  @@unique([installmentPlanId, installmentNumber])
   @@index([memberProfileId, date])
+  @@index([memberProfileId, applicationDate])
+  @@index([memberProfileId, referenceMonth])
 }
 
 model Invoice {
@@ -267,6 +316,7 @@ model RecurringTemplate {
   dayOfMonth      Int
   startsAt        DateTime
   endsAt          DateTime?
+  notes           String?
   status          RecurringStatus @default(active)
   memberProfileId String
   memberProfile   MemberProfile   @relation(fields: [memberProfileId], references: [id])
@@ -274,6 +324,7 @@ model RecurringTemplate {
   categoryId      String?
   category        Category?       @relation(fields: [categoryId], references: [id])
   transactions    Transaction[]
+  deletedAt       DateTime?
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 }
@@ -283,12 +334,15 @@ model InstallmentPlan {
   description     String
   totalInstallments Int
   paidInstallments  Int          @default(0)
+  firstInstallmentNumber Int      @default(1)
+  firstReferenceMonth DateTime
   monthlyAmountCents Int
   totalAmountCents Int
   startsAt        DateTime
   memberProfileId String
   memberProfile   MemberProfile  @relation(fields: [memberProfileId], references: [id])
   transactions    Transaction[]
+  telegramFinancialOperation TelegramFinancialOperation?
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 }
@@ -327,6 +381,8 @@ model ImportRow {
   externalId        String?
   suggestedCategory String?
   status            ImportRowStatus @default(new)
+  falseDuplicate    Boolean         @default(false)
+  duplicateCandidates Json?
   importBatchId     String
   importBatch       ImportBatch     @relation(fields: [importBatchId], references: [id])
   transaction        Transaction?
@@ -334,4 +390,123 @@ model ImportRow {
   updatedAt         DateTime        @updatedAt
 
   @@index([externalId])
+}
+
+model TelegramAuthorizedGroup {
+  id                 String    @id @default(uuid())
+  chatId             String    @unique
+  familyId           String
+  family             Family    @relation(fields: [familyId], references: [id])
+  authorizedByUserId String
+  authorizedByUser   User      @relation("TelegramGroupAuthorizer", fields: [authorizedByUserId], references: [id])
+  createdAt          DateTime  @default(now())
+  revokedAt          DateTime?
+
+  @@index([familyId])
+}
+
+model TelegramUserLink {
+  id              String        @id @default(uuid())
+  tgUserId        String
+  chatId          String
+  memberProfileId String
+  memberProfile   MemberProfile @relation(fields: [memberProfileId], references: [id])
+  createdAt       DateTime      @default(now())
+  revokedAt       DateTime?
+
+  @@unique([tgUserId, chatId])
+  @@index([memberProfileId])
+}
+
+model TelegramAuthCode {
+  id              String               @id @default(uuid())
+  code            String               @unique
+  kind            TelegramAuthCodeKind
+  userId          String?
+  user            User?                @relation(fields: [userId], references: [id])
+  memberProfileId String?
+  memberProfile   MemberProfile?       @relation(fields: [memberProfileId], references: [id])
+  expiresAt       DateTime
+  consumedAt      DateTime?
+  createdAt       DateTime             @default(now())
+
+  @@index([kind, expiresAt])
+  @@index([userId])
+  @@index([memberProfileId])
+}
+
+model TelegramPendingConfirmation {
+  id              String                  @id
+  chatId          String
+  messageId       Int?
+  memberProfileId String
+  memberProfile   MemberProfile           @relation(fields: [memberProfileId], references: [id])
+  tgUserId        String
+  payload         Json
+  status          TelegramPendingStatus    @default(PENDING)
+  expiresAt       DateTime
+  createdAt       DateTime                @default(now())
+  resolvedAt      DateTime?
+  financialOperations TelegramFinancialOperation[] @relation("OperationPendingConfirmation")
+  undoFinancialOperations TelegramFinancialOperation[] @relation("UndoPendingConfirmation")
+
+  @@index([chatId, tgUserId, status])
+  @@index([expiresAt])
+}
+
+model TelegramUpdate {
+  updateId    String               @id
+  status      TelegramUpdateStatus @default(received)
+  attempts    Int                  @default(0)
+  payload     Json
+  receivedAt  DateTime             @default(now())
+  processedAt DateTime?
+  lastError   String?
+  financialOperations TelegramFinancialOperation[]
+}
+
+model TelegramFinancialOperation {
+  id                        String                           @id @default(uuid())
+  idempotencyKey            String                           @unique
+  kind                      TelegramFinancialOperationKind
+  status                    TelegramFinancialOperationStatus @default(CREATED)
+  memberProfileId           String
+  memberProfile             MemberProfile                    @relation(fields: [memberProfileId], references: [id])
+  tgUserId                  String
+  chatId                    String
+  sourceUpdateId            String?
+  sourceUpdate              TelegramUpdate?                  @relation(fields: [sourceUpdateId], references: [updateId])
+  sourceMessageId           Int?
+  pendingConfirmationId     String?
+  pendingConfirmation       TelegramPendingConfirmation?     @relation("OperationPendingConfirmation", fields: [pendingConfirmationId], references: [id])
+  transactionId             String?                          @unique
+  transaction               Transaction?                     @relation(fields: [transactionId], references: [id])
+  installmentPlanId         String?                          @unique
+  installmentPlan           InstallmentPlan?                 @relation(fields: [installmentPlanId], references: [id])
+  createdAt                 DateTime                         @default(now())
+  undoneAt                  DateTime?
+  undoPendingConfirmationId String?
+  undoPendingConfirmation   TelegramPendingConfirmation?     @relation("UndoPendingConfirmation", fields: [undoPendingConfirmationId], references: [id])
+
+  @@index([memberProfileId, tgUserId, status, createdAt])
+  @@index([sourceUpdateId])
+}
+
+model TelegramMessageLog {
+  id              String         @id @default(uuid())
+  chatId          String
+  tgUserId        String
+  messageId       Int
+  memberProfileId String?
+  memberProfile   MemberProfile? @relation(fields: [memberProfileId], references: [id])
+  textRaw         String
+  aiResponseJson  Json?
+  model           String?
+  tokensIn        Int?
+  tokensOut       Int?
+  costUsd         Decimal?       @db.Decimal(10, 6)
+  createdAt       DateTime       @default(now())
+
+  @@index([createdAt])
+  @@index([chatId, messageId])
 }

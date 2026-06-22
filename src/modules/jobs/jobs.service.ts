@@ -3,7 +3,7 @@ import { Cron } from '@nestjs/schedule';
 
 import { PrismaService } from '../../prisma/prisma.service';
 import { parseMonth, startOfMonth } from '../../shared/date-range';
-import { netCents } from '../../shared/finance-calculator';
+import { accountBalanceCents } from '../../shared/finance-calculator';
 
 @Injectable()
 export class JobsService {
@@ -24,8 +24,8 @@ export class JobsService {
       include: {
         accounts: { select: { initialBalanceCents: true } },
         transactions: {
-          where: { date: { lt: reference }, status: 'confirmed' },
-          select: { amountCents: true, type: true, date: true },
+          where: { referenceMonth: { lt: reference }, status: 'confirmed' },
+          select: { amountCents: true, type: true, date: true, applicationDate: true, account: { select: { type: true } } },
         },
       },
       orderBy: { displayName: 'asc' },
@@ -34,7 +34,7 @@ export class JobsService {
     const results = [];
     for (const profile of profiles) {
       const initialBalanceCents = profile.accounts.reduce((total, account) => total + account.initialBalanceCents, 0);
-      const balanceCents = initialBalanceCents + netCents(profile.transactions);
+      const balanceCents = initialBalanceCents + accountBalanceCents(profile.transactions);
       const opening = await this.prisma.monthlyOpening.upsert({
         where: {
           memberProfileId_referenceMonth: {

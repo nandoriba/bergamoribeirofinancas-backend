@@ -1,10 +1,14 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { ImportRowStatus, Prisma, TransactionType } from '@prisma/client';
+import { ImportRowStatus, Prisma } from '@prisma/client';
+import type { Account, ImportType, TransactionType } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
+import { clampDayForMonth, startOfMonth } from '../../shared/date-range';
 import { normalizeAmountCents } from '../../shared/finance-calculator';
 import type { AuthenticatedUser } from '../auth/auth.types';
+import { InstallmentsService } from '../installments/installments.service';
 import { ConfirmImportDto } from './dto/confirm-import.dto';
+import { DiscardImportDto } from './dto/discard-import.dto';
 import { ImportParserService, type ParsedImportRow } from './import-parser.service';
 
 export interface UploadedCsvFile {
@@ -12,11 +16,29 @@ export interface UploadedCsvFile {
   buffer: Buffer;
 }
 
+interface DuplicateClassification {
+  status: ImportRowStatus;
+  falseDuplicate: boolean;
+  candidates: DuplicateCandidate[];
+}
+
+export interface DuplicateCandidate {
+  id?: string;
+  description: string;
+  applicationDate: string;
+  amountCents: number;
+  source: string;
+  accountName?: string | null;
+}
+
+export type ImportPreviewStatus = 'new' | 'duplicate' | 'possible_duplicate' | 'review';
+
 @Injectable()
 export class ImportsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly parser: ImportParserService,
+    private readonly installmentsService: InstallmentsService,
   ) {}
 
   listBatches(user: AuthenticatedUser) {
@@ -38,7 +60,9 @@ export class ImportsService {
       user.profileId,
       parsed.rows.map((row) => row.externalId).filter((id): id is string => Boolean(id)),
     );
-    const seen = new Set<string>();
+    const existingDuplicateCandidates = await this.findExistingDuplicateCandidates(user.profileId, parsed.rows, parsed.type);
+    const seenExternalIds = new Set<string>();
+    const seenValueDateDescriptions = new Map(existingDuplicateCandidates);
 
     const batch = await this.prisma.importBatch.create({
       data: {
@@ -48,7 +72,13 @@ export class ImportsService {
         memberProfileId: user.profileId,
         rows: {
           create: parsed.rows.map((row) => {
-            const status = this.resolveRowStatus(row, existingExternalIds, seen);
+            const duplicate = this.resolveRowDuplicate(
+              row,
+              existingExternalIds,
+              seenExternalIds,
+              seenValueDateDescriptions,
+              parsed.type,
+            );
             return {
               rowIndex: row.rowIndex,
               raw: row.raw as Prisma.InputJsonValue,
@@ -56,8 +86,12 @@ export class ImportsService {
               description: row.description,
               amountCents: row.amountCents,
               externalId: row.externalId,
-              suggestedCategory: this.resolveSuggestedCategory(row, categories),
-              status,
+              suggestedCategory: this.resolveSuggestedCategory(row, categories, parsed.type),
+              status: duplicate.status,
+              falseDuplicate: duplicate.falseDuplicate,
+              duplicateCandidates: duplicate.candidates.length
+                ? (duplicate.candidates as unknown as Prisma.InputJsonValue)
+                : undefined,
             };
           }),
         },
@@ -75,7 +109,7 @@ export class ImportsService {
 
   async confirm(user: AuthenticatedUser, dto: ConfirmImportDto) {
     const batch = await this.prisma.importBatch.findFirst({
-      where: { id: dto.batchId, memberProfile: { familyId: user.familyId }, status: 'preview' },
+      where: { id: dto.batchId, memberProfileId: user.profileId, status: 'preview' },
       include: { rows: { orderBy: { rowIndex: 'asc' } } },
     });
     if (!batch) throw new NotFoundException('Prévia de importação não encontrada');
@@ -83,36 +117,188 @@ export class ImportsService {
     const selectedRows = dto.rowIds?.length
       ? batch.rows.filter((row) => dto.rowIds?.includes(row.id))
       : batch.rows;
+    const acceptedDuplicateRowIds = new Set(dto.acceptedPossibleDuplicateRowIds ?? []);
+    const confirmedDuplicateRowIds = new Set(dto.confirmedDuplicateRowIds ?? []);
+    const invoiceAdjustmentRowIds = new Set(dto.invoiceAdjustmentRowIds ?? []);
+    const conflictingDuplicateDecisions = selectedRows.filter(
+      (row) =>
+        row.status === 'duplicate' &&
+        acceptedDuplicateRowIds.has(row.id) &&
+        confirmedDuplicateRowIds.has(row.id),
+    );
+    if (conflictingDuplicateDecisions.length > 0) {
+      throw new BadRequestException({
+        code: 'POSSIBLE_DUPLICATES_CONFLICTING_DECISION',
+        message: 'Escolha apenas uma decisão por duplicidade',
+        rowIds: conflictingDuplicateDecisions.map((row) => row.id),
+      });
+    }
+
+    const missingPossibleDuplicateDecisions = selectedRows.filter(
+      (row) =>
+        row.status === 'duplicate' &&
+        row.falseDuplicate &&
+        !acceptedDuplicateRowIds.has(row.id) &&
+        !confirmedDuplicateRowIds.has(row.id),
+    );
+    if (missingPossibleDuplicateDecisions.length > 0) {
+      throw new BadRequestException({
+        code: 'POSSIBLE_DUPLICATES_REQUIRE_DECISION',
+        message: 'Escolha se cada possível duplicidade deve ser importada ou ignorada',
+        rowIds: missingPossibleDuplicateDecisions.map((row) => row.id),
+      });
+    }
+
     const importableRows = selectedRows.filter(
-      (row) => row.status === 'new' && row.date && row.description && row.amountCents !== null,
+      (row) =>
+        (row.status === 'new' ||
+          (row.status === 'duplicate' && acceptedDuplicateRowIds.has(row.id)) ||
+          isLegacyCreditCardAdjustmentReview(batch.type, row)) &&
+        row.date &&
+        row.description &&
+        row.amountCents !== null,
+    );
+    const duplicateRowsToConfirm = selectedRows.filter(
+      (row) => row.status === 'duplicate' && row.falseDuplicate && confirmedDuplicateRowIds.has(row.id),
     );
 
     const categories = await this.prisma.category.findMany({ where: { familyId: user.familyId } });
     const categoryByName = new Map(categories.map((category) => [`${category.type}:${category.name}`, category.id]));
+    const account = dto.accountId
+      ? await this.prisma.account.findFirst({ where: { id: dto.accountId, memberProfileId: user.profileId } })
+      : null;
+    if (dto.accountId && !account) throw new BadRequestException('Conta inválida');
+    if (batch.type === 'nubank_credit_card' && (!account || account.type !== 'credit_card')) {
+      throw new BadRequestException('Selecione o cartão desta fatura para confirmar a importação');
+    }
 
     const created = [];
+    const bookkeepingDate = new Date();
     for (const row of importableRows) {
+      const forcedDuplicateImport = row.status === 'duplicate' && acceptedDuplicateRowIds.has(row.id);
       const signedAmount = row.amountCents ?? 0;
-      const type: TransactionType = signedAmount >= 0 ? 'income' : 'expense';
-      const categoryId = row.suggestedCategory ? categoryByName.get(`${type}:${row.suggestedCategory}`) : undefined;
+      const importAsInvoiceAdjustment =
+        batch.type === 'nubank_credit_card' &&
+        invoiceAdjustmentRowIds.has(row.id) &&
+        isCreditCardInvoiceAdjustmentCandidate(row.description);
+
+      if (importAsInvoiceAdjustment && account?.type === 'credit_card' && row.date) {
+        const invoiceId = await this.findOrCreateInvoice(account, user.profileId, startOfMonth(row.date));
+        const externalId = forcedDuplicateImport ? row.id : row.externalId ?? row.id;
+        const transaction = await this.prisma.transaction.upsert({
+          where: {
+            memberProfileId_externalId: {
+              memberProfileId: user.profileId,
+              externalId,
+            },
+          },
+          update: {},
+          create: {
+            date: bookkeepingDate,
+            applicationDate: row.date,
+            referenceMonth: startOfMonth(row.date),
+            description: row.description ?? 'Ajuste de fatura',
+            amountCents: normalizeAmountCents(signedAmount),
+            type: 'expense',
+            status: 'confirmed',
+            recurrenceType: 'none',
+            source: batch.type,
+            externalId,
+            isInvoiceAdjustment: true,
+            invoiceAmountCents: Math.round(signedAmount),
+            accountId: account.id,
+            invoiceId,
+            memberProfileId: user.profileId,
+            importRowId: row.id,
+          },
+        });
+
+        await this.prisma.importRow.update({
+          where: { id: row.id },
+          data: { status: ImportRowStatus.imported, falseDuplicate: forcedDuplicateImport ? true : undefined },
+        });
+        created.push(transaction);
+        continue;
+      }
+
+      const type = this.resolveTransactionType(batch.type, signedAmount);
+      const categoryId = this.resolveCategoryId(categories, categoryByName, type, row.suggestedCategory);
+      const installment = readInstallment(row.raw);
+
+      if (installment && account?.type === 'credit_card' && type === 'expense' && row.date) {
+        const baseDescription = stripInstallment(row.description ?? 'Importado');
+        const referenceMonth = startOfMonth(row.date);
+        const existingProjected = forcedDuplicateImport
+          ? null
+          : await this.prisma.transaction.findFirst({
+              where: {
+                memberProfileId: user.profileId,
+                accountId: account.id,
+                referenceMonth,
+                amountCents: normalizeAmountCents(signedAmount),
+                installmentNumber: installment.current,
+                description: { contains: baseDescription, mode: 'insensitive' },
+              },
+            });
+
+        if (existingProjected) {
+          await this.prisma.importRow.update({
+            where: { id: row.id },
+            data: { status: ImportRowStatus.duplicate, falseDuplicate: false },
+          });
+          continue;
+        }
+
+        const plan = await this.installmentsService.create(user, {
+          description: baseDescription,
+          totalInstallments: installment.total,
+          firstInstallmentNumber: installment.current,
+          monthlyAmountCents: normalizeAmountCents(signedAmount),
+          totalAmountCents: normalizeAmountCents(signedAmount) * installment.total,
+          startsAt: bookkeepingDate.toISOString(),
+          firstApplicationDate: row.date.toISOString(),
+          firstReferenceMonth: referenceMonth.toISOString(),
+          accountId: account.id,
+          categoryId,
+          confirmExistingLinks: true,
+        });
+
+        await this.prisma.importRow.update({
+          where: { id: row.id },
+          data: { status: ImportRowStatus.imported, falseDuplicate: forcedDuplicateImport ? true : undefined },
+        });
+        created.push(plan);
+        continue;
+      }
+
+      const invoiceId =
+        account?.type === 'credit_card' && row.date
+          ? await this.findOrCreateInvoice(account, user.profileId, startOfMonth(row.date))
+          : undefined;
+      const externalId = forcedDuplicateImport ? row.id : row.externalId ?? row.id;
 
       const transaction = await this.prisma.transaction.upsert({
         where: {
           memberProfileId_externalId: {
             memberProfileId: user.profileId,
-            externalId: row.externalId ?? row.id,
+            externalId,
           },
         },
         update: {},
         create: {
-          date: row.date as Date,
+          date: bookkeepingDate,
+          applicationDate: row.date as Date,
+          referenceMonth: startOfMonth(row.date as Date),
           description: row.description ?? 'Importado',
           amountCents: normalizeAmountCents(signedAmount),
           type,
           status: 'confirmed',
           recurrenceType: 'none',
           source: batch.type,
-          externalId: row.externalId ?? row.id,
+          externalId,
+          isInvoicePayment: isInvoicePaymentFromImport(batch.type, row.description),
+          accountId: account?.id,
+          invoiceId,
           categoryId,
           memberProfileId: user.profileId,
           importRowId: row.id,
@@ -121,9 +307,16 @@ export class ImportsService {
 
       await this.prisma.importRow.update({
         where: { id: row.id },
-        data: { status: ImportRowStatus.imported },
+        data: { status: ImportRowStatus.imported, falseDuplicate: forcedDuplicateImport ? true : undefined },
       });
       created.push(transaction);
+    }
+
+    if (duplicateRowsToConfirm.length > 0) {
+      await this.prisma.importRow.updateMany({
+        where: { id: { in: duplicateRowsToConfirm.map((row) => row.id) } },
+        data: { status: ImportRowStatus.duplicate, falseDuplicate: false },
+      });
     }
 
     await this.prisma.importBatch.update({
@@ -138,6 +331,51 @@ export class ImportsService {
     };
   }
 
+  async discard(user: AuthenticatedUser, dto: DiscardImportDto) {
+    const batch = await this.prisma.importBatch.findFirst({
+      where: { id: dto.batchId, memberProfileId: user.profileId, status: 'preview' },
+      include: { rows: { select: { id: true } } },
+    });
+    if (!batch) throw new NotFoundException('Prévia de importação não encontrada');
+
+    await this.prisma.$transaction([
+      this.prisma.importRow.updateMany({
+        where: { importBatchId: batch.id },
+        data: { status: ImportRowStatus.ignored },
+      }),
+      this.prisma.importBatch.update({
+        where: { id: batch.id },
+        data: { status: 'discarded' },
+      }),
+    ]);
+
+    return {
+      batchId: batch.id,
+      discarded: batch.rows.length,
+    };
+  }
+
+  private async findOrCreateInvoice(account: Account, memberProfileId: string, referenceMonth: Date) {
+    const invoice = await this.prisma.invoice.upsert({
+      where: {
+        accountId_referenceMonth: {
+          accountId: account.id,
+          referenceMonth,
+        },
+      },
+      update: {},
+      create: {
+        accountId: account.id,
+        memberProfileId,
+        referenceMonth,
+        status: 'open',
+        closingDate: account.closingDay ? clampDayForMonth(referenceMonth, account.closingDay) : undefined,
+        dueDate: account.dueDay ? clampDayForMonth(referenceMonth, account.dueDay) : undefined,
+      },
+    });
+    return invoice.id;
+  }
+
   private async findExistingExternalIds(memberProfileId: string, externalIds: string[]) {
     if (externalIds.length === 0) return new Set<string>();
     const transactions = await this.prisma.transaction.findMany({
@@ -147,23 +385,130 @@ export class ImportsService {
     return new Set(transactions.map((transaction) => transaction.externalId).filter((id): id is string => Boolean(id)));
   }
 
-  private resolveRowStatus(row: ParsedImportRow, existingExternalIds: Set<string>, seen: Set<string>): ImportRowStatus {
-    if (row.status === 'review' || !row.externalId) return ImportRowStatus.review;
-    if (existingExternalIds.has(row.externalId) || seen.has(row.externalId)) return ImportRowStatus.duplicate;
-    seen.add(row.externalId);
-    return ImportRowStatus.new;
+  private async findExistingDuplicateCandidates(memberProfileId: string, rows: ParsedImportRow[], importType: ImportType) {
+    const filters = rows
+      .filter((row) => row.date && row.amountCents !== undefined)
+      .map((row) => ({
+        applicationDate: row.date as Date,
+        signedAmountCents: duplicateAmountForImportRow(importType, row),
+      }));
+
+    if (filters.length === 0) return new Map<string, DuplicateCandidate[]>();
+
+    const uniqueFilters = [...new Map(filters.map((filter) => [duplicateKey(filter.applicationDate, filter.signedAmountCents), filter])).values()];
+    const transactions = await this.prisma.transaction.findMany({
+      where: {
+        memberProfileId,
+        OR: uniqueFilters.map((filter) => ({
+          applicationDate: filter.applicationDate,
+          amountCents: normalizeAmountCents(filter.signedAmountCents),
+          type: filter.signedAmountCents >= 0 ? 'income' : 'expense',
+        })),
+      },
+      select: {
+        id: true,
+        applicationDate: true,
+        amountCents: true,
+        description: true,
+        type: true,
+        account: { select: { name: true } },
+      },
+    });
+
+    const candidates = new Map<string, DuplicateCandidate[]>();
+    for (const transaction of transactions) {
+      addDuplicateCandidate(candidates, {
+        id: transaction.id,
+        applicationDate: toDateKey(transaction.applicationDate),
+        amountCents: signedTransactionAmountCents(transaction),
+        description: cleanRepeatedSeparators(transaction.description),
+        source: 'Sistema',
+        accountName: transaction.account?.name,
+      });
+    }
+    return candidates;
+  }
+
+  private resolveRowDuplicate(
+    row: ParsedImportRow,
+    existingExternalIds: Set<string>,
+    seenExternalIds: Set<string>,
+    seenValueDateDescriptions: Map<string, DuplicateCandidate[]>,
+    importType: ImportType,
+  ): DuplicateClassification {
+    if (row.status === 'review') return { status: ImportRowStatus.review, falseDuplicate: false, candidates: [] };
+
+    if (row.externalId && (existingExternalIds.has(row.externalId) || seenExternalIds.has(row.externalId))) {
+      return { status: ImportRowStatus.duplicate, falseDuplicate: false, candidates: [] };
+    }
+
+    if (row.externalId) seenExternalIds.add(row.externalId);
+
+    if (!row.date || row.amountCents === undefined || !row.description) {
+      return { status: ImportRowStatus.review, falseDuplicate: false, candidates: [] };
+    }
+
+    const amountCents = duplicateAmountForImportRow(importType, row);
+    const key = duplicateKey(row.date, amountCents);
+    const candidates = seenValueDateDescriptions.get(key);
+    const description = normalizeText(row.description);
+    const currentCandidate = {
+      applicationDate: toDateKey(row.date),
+      amountCents,
+      description: cleanRepeatedSeparators(row.description),
+      source: 'Prévia atual',
+    };
+
+    if (candidates?.some((candidate) => normalizeText(candidate.description) === description)) {
+      return { status: ImportRowStatus.duplicate, falseDuplicate: false, candidates };
+    }
+
+    if (candidates && candidates.length > 0) {
+      const possibleDuplicateCandidates = [...candidates];
+      candidates.push(currentCandidate);
+      return {
+        status: ImportRowStatus.duplicate,
+        falseDuplicate: true,
+        candidates: possibleDuplicateCandidates,
+      };
+    }
+
+    seenValueDateDescriptions.set(key, [currentCandidate]);
+    return { status: ImportRowStatus.new, falseDuplicate: false, candidates: [] };
   }
 
   private resolveSuggestedCategory(
     row: ParsedImportRow,
     categories: Awaited<ReturnType<PrismaService['category']['findMany']>>,
+    importType: ImportType,
   ): string {
-    const type = (row.amountCents ?? 0) >= 0 ? 'income' : 'expense';
+    if (row.suggestedCategory === 'Revisar' || row.suggestedCategory === 'Ajuste de fatura') {
+      return row.suggestedCategory;
+    }
+    const type = importType === 'nubank_credit_card' ? 'expense' : (row.amountCents ?? 0) >= 0 ? 'income' : 'expense';
     const requested = row.suggestedCategory;
     if (requested && categories.some((category) => category.type === type && category.name === requested)) {
       return requested;
     }
     return categories.find((category) => category.type === type && category.name === 'Outros')?.name ?? 'Outros';
+  }
+
+  private resolveTransactionType(importType: ImportType, amountCents: number): TransactionType {
+    if (importType === 'nubank_credit_card') return 'expense';
+    return amountCents >= 0 ? 'income' : 'expense';
+  }
+
+  private resolveCategoryId(
+    categories: Awaited<ReturnType<PrismaService['category']['findMany']>>,
+    categoryByName: Map<string, string>,
+    type: TransactionType,
+    suggestedCategory?: string | null,
+  ) {
+    if (suggestedCategory) {
+      const requested = categoryByName.get(`${type}:${suggestedCategory}`);
+      if (requested) return requested;
+    }
+    return categories.find((category) => category.type === type && category.name === 'Outros')?.id;
   }
 
   private mapPreviewRow(
@@ -174,11 +519,23 @@ export class ImportsService {
       amountCents: number | null;
       suggestedCategory: string | null;
       status: ImportRowStatus;
+      falseDuplicate: boolean;
+      duplicateCandidates: Prisma.JsonValue | null;
+      raw: Prisma.JsonValue;
     },
     source: string,
   ) {
+    const invoiceAdjustmentCandidate = isInvoiceAdjustmentPreviewCandidate(source, row);
+    const invoiceAdjustmentDefault = invoiceAdjustmentCandidate && isInvoiceAdjustmentDefault(row);
+    const legacyReviewAdjustment =
+      row.status === ImportRowStatus.review &&
+      invoiceAdjustmentCandidate &&
+      Boolean(row.date) &&
+      row.amountCents !== null;
+
     return {
       id: row.id,
+      applicationDate: row.date ? toDateKey(row.date) : null,
       date: row.date
         ? `${String(row.date.getUTCDate()).padStart(2, '0')}/${String(row.date.getUTCMonth() + 1).padStart(2, '0')}`
         : '-',
@@ -186,7 +543,169 @@ export class ImportsService {
       source,
       suggestedCategory: row.suggestedCategory ?? 'Revisar',
       value: row.amountCents ?? 0,
-      status: row.status,
+      status: legacyReviewAdjustment ? 'new' : mapPreviewStatus(row.status, row.falseDuplicate),
+      reviewReason: legacyReviewAdjustment ? null : resolveReviewReason(row.status),
+      duplicateCandidates: readDuplicateCandidates(row.duplicateCandidates),
+      invoiceAdjustmentCandidate,
+      invoiceAdjustmentDefault,
     };
   }
+}
+
+function readInstallment(raw: Prisma.JsonValue): { current: number; total: number } | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !('installment' in raw)) return null;
+  const value = String((raw as { installment?: unknown }).installment ?? '');
+  const match = /^(\d{1,2})\/(\d{1,2})$/.exec(value);
+  if (!match) return null;
+  const current = Number(match[1]);
+  const total = Number(match[2]);
+  return current > 0 && total >= current ? { current, total } : null;
+}
+
+function stripInstallment(description: string) {
+  return cleanDescriptionSeparators(
+    description
+      .replace(/(?:parcela\s*)?\d{1,2}\s*\/\s*\d{1,2}/gi, ''),
+  );
+}
+
+function cleanDescriptionSeparators(description: string) {
+  return description
+    .replace(/\s+/g, ' ')
+    .replace(/\s*[-–—]+\s*$/g, '')
+    .trim();
+}
+
+function isCreditCardPaymentReceived(description?: string | null): boolean {
+  const text = normalizeText(description ?? '');
+  return text.includes('pagamento recebido');
+}
+
+function isCreditCardInvoiceAdjustmentCandidate(description?: string | null): boolean {
+  const text = normalizeText(description ?? '');
+  return (
+    isCreditCardPaymentReceived(description) ||
+    ['estorno', 'credito', 'reembolso'].some((token) => text.includes(token))
+  );
+}
+
+function isLegacyCreditCardAdjustmentReview(
+  importType: ImportType,
+  row: { status: ImportRowStatus; description: string | null },
+): boolean {
+  return (
+    importType === 'nubank_credit_card' &&
+    row.status === ImportRowStatus.review &&
+    isCreditCardInvoiceAdjustmentCandidate(row.description)
+  );
+}
+
+function isInvoicePaymentFromImport(importType: ImportType, description?: string | null): boolean {
+  if (importType !== 'nubank_account') return false;
+  const text = normalizeText(description ?? '');
+  return text.includes('pagamento') && text.includes('fatura');
+}
+
+function normalizeText(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function duplicateKey(applicationDate: Date, amountCents: number) {
+  return `${applicationDate.toISOString().slice(0, 10)}:${Math.round(amountCents)}`;
+}
+
+function addDuplicateCandidate(candidates: Map<string, DuplicateCandidate[]>, candidate: DuplicateCandidate) {
+  const key = `${candidate.applicationDate}:${Math.round(candidate.amountCents)}`;
+  const items = candidates.get(key) ?? [];
+  items.push(candidate);
+  candidates.set(key, items);
+}
+
+function duplicateAmountForImportRow(importType: ImportType, row: ParsedImportRow): number {
+  const amountCents = Math.round(row.amountCents ?? 0);
+  if (importType === 'nubank_credit_card') return -normalizeAmountCents(amountCents);
+  return amountCents;
+}
+
+function signedTransactionAmountCents(transaction: { amountCents: number; type: TransactionType }): number {
+  const amountCents = normalizeAmountCents(transaction.amountCents);
+  return transaction.type === 'income' ? amountCents : -amountCents;
+}
+
+function mapPreviewStatus(status: ImportRowStatus, falseDuplicate: boolean): ImportPreviewStatus {
+  if (status === ImportRowStatus.duplicate && falseDuplicate) return 'possible_duplicate';
+  if (status === ImportRowStatus.duplicate) return 'duplicate';
+  if (status === ImportRowStatus.review) return 'review';
+  return 'new';
+}
+
+function resolveReviewReason(status: ImportRowStatus): string | null {
+  if (status !== ImportRowStatus.review) return null;
+  return 'Linha sem dados suficientes para importação automática.';
+}
+
+function isInvoiceAdjustmentPreviewCandidate(
+  source: string,
+  row: { raw: Prisma.JsonValue; description: string | null },
+): boolean {
+  if (source !== 'nubank_credit_card') return false;
+  return readRawBoolean(row.raw, 'invoiceAdjustmentCandidate') ?? isCreditCardInvoiceAdjustmentCandidate(row.description);
+}
+
+function isInvoiceAdjustmentDefault(row: { raw: Prisma.JsonValue; description: string | null }): boolean {
+  return readRawBoolean(row.raw, 'invoiceAdjustmentDefault') ?? isCreditCardPaymentReceived(row.description);
+}
+
+function readRawBoolean(raw: Prisma.JsonValue, key: string): boolean | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !(key in raw)) return null;
+  const value = (raw as Record<string, unknown>)[key];
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (value.toLowerCase() === 'true') return true;
+    if (value.toLowerCase() === 'false') return false;
+  }
+  return null;
+}
+
+function toDateKey(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function readDuplicateCandidates(value: Prisma.JsonValue | null): DuplicateCandidate[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    const parsed = parseDuplicateCandidate(candidate);
+    return parsed ? [parsed] : [];
+  });
+}
+
+function parseDuplicateCandidate(value: Prisma.JsonValue): DuplicateCandidate | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.description !== 'string' ||
+    typeof candidate.applicationDate !== 'string' ||
+    typeof candidate.amountCents !== 'number' ||
+    typeof candidate.source !== 'string'
+  ) {
+    return null;
+  }
+
+  return {
+    id: typeof candidate.id === 'string' ? candidate.id : undefined,
+    description: cleanRepeatedSeparators(candidate.description),
+    applicationDate: candidate.applicationDate,
+    amountCents: candidate.amountCents,
+    source: candidate.source,
+    accountName: typeof candidate.accountName === 'string' ? candidate.accountName : undefined,
+  };
+}
+
+function cleanRepeatedSeparators(description: string) {
+  return description.replace(/\s*[-–—]+\s*[-–—]+\s*Parcela/gi, ' - Parcela').trim();
 }

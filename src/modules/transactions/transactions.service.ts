@@ -1,81 +1,131 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
+import { dateFromAccountDay, resolveCreditCardReferenceMonth } from '../../shared/credit-card-invoice';
+import { endOfDay, endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
+
+const transactionInclude = {
+  account: true,
+  category: true,
+  invoice: true,
+  installmentPlan: true,
+  memberProfile: { select: { id: true, displayName: true } },
+} satisfies Prisma.TransactionInclude;
+
+type TransactionWithRelations = Prisma.TransactionGetPayload<{ include: typeof transactionInclude }>;
+type PrismaExecutor = PrismaService | Prisma.TransactionClient;
 
 @Injectable()
 export class TransactionsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  list(user: AuthenticatedUser, query: { month?: string; profileId?: string }) {
-    const reference = parseMonth(query.month);
+  async list(user: AuthenticatedUser, query: { referenceMonth?: string; profileId?: string }) {
+    const reference = parseMonth(query.referenceMonth);
     const where: Prisma.TransactionWhereInput = {
       memberProfile: { familyId: user.familyId },
-      date: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
+      referenceMonth: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
     };
 
     if (query.profileId) {
       where.memberProfileId = query.profileId;
     }
 
-    return this.prisma.transaction.findMany({
+    const transactions = await this.prisma.transaction.findMany({
       where,
-      include: {
-        account: true,
-        category: true,
-        memberProfile: { select: { id: true, displayName: true } },
-      },
-      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+      include: transactionInclude,
+      orderBy: [{ applicationDate: 'desc' }, { createdAt: 'desc' }],
     });
+    return transactions.map(mapTransactionResponse);
   }
 
   async create(user: AuthenticatedUser, dto: CreateTransactionDto) {
-    await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
-    return this.prisma.transaction.create({
+    return this.createInTransaction(this.prisma, user, dto);
+  }
+
+  async createInTransaction(client: PrismaExecutor, user: AuthenticatedUser, dto: CreateTransactionDto) {
+    const account = await this.validateRelations(client, user, dto.accountId, dto.categoryId, dto.invoiceId);
+    const applicationDate = new Date(dto.applicationDate);
+    await this.validateDuplicate(client, user, dto, applicationDate);
+    const fallbackReferenceMonth = startOfMonth(new Date(dto.referenceMonth ?? dto.applicationDate));
+    const referenceMonth =
+      account?.type === 'credit_card' && !dto.referenceMonth
+        ? (resolveCreditCardReferenceMonth(account, applicationDate) ?? fallbackReferenceMonth)
+        : fallbackReferenceMonth;
+    const invoiceId =
+      account?.type === 'credit_card'
+        ? await this.findOrCreateInvoice(client, user, account, referenceMonth, dto.invoiceId)
+        : dto.invoiceId;
+
+    const transaction = await client.transaction.create({
       data: {
-        date: new Date(dto.date),
-        description: dto.description,
-        amountCents: dto.amountCents,
+        date: new Date(),
+        applicationDate,
+        referenceMonth,
+        description: dto.description.trim(),
+        amountCents: Math.abs(dto.amountCents),
         type: dto.type,
-        status: dto.status ?? 'confirmed',
+        status: this.resolveManualStatus(applicationDate, dto.status),
         recurrenceType: dto.recurrenceType ?? 'none',
         source: dto.source,
         externalId: dto.externalId,
         notes: dto.notes,
         accountId: dto.accountId,
         categoryId: dto.categoryId,
-        invoiceId: dto.invoiceId,
+        invoiceId,
+        installmentNumber: dto.installmentNumber,
         memberProfileId: user.profileId,
       },
-      include: { account: true, category: true },
+      include: transactionInclude,
     });
+    return mapTransactionResponse(transaction);
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateTransactionDto) {
-    await this.ensureTransaction(user, id);
-    await this.validateRelations(user, dto.accountId, dto.categoryId, dto.invoiceId);
-    return this.prisma.transaction.update({
+    const current = await this.ensureTransaction(user, id);
+    const updateData = { ...dto };
+    delete updateData.allowDuplicate;
+    await this.validateRelations(
+      this.prisma,
+      user,
+      dto.accountId ?? current.accountId ?? undefined,
+      dto.categoryId,
+      dto.invoiceId ?? current.invoiceId ?? undefined,
+    );
+    const applicationDate = dto.applicationDate ? new Date(dto.applicationDate) : current.applicationDate;
+    const transaction = await this.prisma.transaction.update({
       where: { id },
       data: {
-        ...dto,
-        date: dto.date ? new Date(dto.date) : undefined,
+        ...updateData,
+        date: undefined,
+        description: dto.description?.trim(),
+        amountCents: dto.amountCents !== undefined ? Math.abs(dto.amountCents) : undefined,
+        applicationDate: dto.applicationDate ? applicationDate : undefined,
+        referenceMonth: dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined,
+        status: dto.status || dto.applicationDate ? this.resolveManualStatus(applicationDate, dto.status) : undefined,
       },
-      include: { account: true, category: true },
+      include: transactionInclude,
     });
+    return mapTransactionResponse(transaction);
   }
 
   async remove(user: AuthenticatedUser, id: string) {
-    await this.ensureTransaction(user, id);
-    return this.prisma.transaction.delete({ where: { id } });
+    const transaction = await this.ensureTransaction(user, id);
+    return this.prisma.$transaction(async (tx) => {
+      await tx.telegramFinancialOperation.updateMany({
+        where: { transactionId: transaction.id, status: 'CREATED' },
+        data: { status: 'UNDONE', undoneAt: new Date() },
+      });
+      return tx.transaction.delete({ where: { id } });
+    });
   }
 
   private async ensureTransaction(user: AuthenticatedUser, id: string) {
     const transaction = await this.prisma.transaction.findFirst({
-      where: { id, memberProfile: { familyId: user.familyId } },
+      where: { id, memberProfileId: user.profileId },
     });
     if (!transaction) {
       throw new NotFoundException('Lançamento não encontrado');
@@ -84,31 +134,200 @@ export class TransactionsService {
   }
 
   private async validateRelations(
+    client: PrismaExecutor,
     user: AuthenticatedUser,
     accountId?: string,
     categoryId?: string,
     invoiceId?: string,
   ) {
-    if (accountId) {
-      const account = await this.prisma.account.findFirst({
-        where: { id: accountId, memberProfile: { familyId: user.familyId } },
-      });
-      if (!account) throw new BadRequestException('Conta inválida');
+    const account = accountId
+      ? await client.account.findFirst({
+          where: { id: accountId, memberProfileId: user.profileId },
+        })
+      : null;
+
+    if (accountId && !account) {
+      throw new BadRequestException('Conta inválida');
     }
 
     if (categoryId) {
-      const category = await this.prisma.category.findFirst({
+      const category = await client.category.findFirst({
         where: { id: categoryId, familyId: user.familyId },
       });
       if (!category) throw new BadRequestException('Categoria inválida');
     }
 
     if (invoiceId) {
-      const invoice = await this.prisma.invoice.findFirst({
-        where: { id: invoiceId, memberProfile: { familyId: user.familyId } },
+      const invoice = await client.invoice.findFirst({
+        where: { id: invoiceId, memberProfileId: user.profileId },
       });
       if (!invoice) throw new BadRequestException('Fatura inválida');
+      if (!accountId) {
+        throw new BadRequestException('Informe a conta da fatura');
+      }
+      if (invoice.accountId !== accountId) {
+        throw new BadRequestException('Fatura não pertence à conta selecionada');
+      }
+      if (account?.type !== 'credit_card') {
+        throw new BadRequestException('Fatura só pode ser vinculada a cartão de crédito');
+      }
     }
+
+    return account;
+  }
+
+  private resolveManualStatus(applicationDate: Date, requested?: 'confirmed' | 'pending') {
+    if (applicationDate <= endOfDay(new Date())) return 'confirmed';
+    return requested ?? 'pending';
+  }
+
+  private async validateDuplicate(
+    client: PrismaExecutor,
+    user: AuthenticatedUser,
+    dto: CreateTransactionDto,
+    applicationDate: Date,
+  ) {
+    const sameValueAndDate = await client.transaction.findMany({
+      where: {
+        memberProfileId: user.profileId,
+        applicationDate,
+        amountCents: Math.abs(dto.amountCents),
+        type: dto.type,
+      },
+      select: {
+        id: true,
+        description: true,
+        amountCents: true,
+        applicationDate: true,
+      },
+      take: 5,
+    });
+
+    if (sameValueAndDate.length === 0) return;
+
+    const description = normalizeDescription(dto.description);
+    const strongDuplicate = sameValueAndDate.find(
+      (transaction) => normalizeDescription(transaction.description) === description,
+    );
+
+    if (strongDuplicate) {
+      throw new BadRequestException({
+        code: 'STRONG_DUPLICATE',
+        message: 'Já existe um lançamento com o mesmo valor, data de aplicação e descrição.',
+        duplicate: this.mapDuplicate(strongDuplicate),
+      });
+    }
+
+    if (!dto.allowDuplicate) {
+      throw new ConflictException({
+        code: 'FALSE_DUPLICATE',
+        message: 'Já existe um lançamento com o mesmo valor e data de aplicação.',
+        duplicate: this.mapDuplicate(sameValueAndDate[0]),
+      });
+    }
+  }
+
+  private mapDuplicate(transaction: { id: string; description: string; amountCents: number; applicationDate: Date }) {
+    return {
+      id: transaction.id,
+      description: transaction.description,
+      amountCents: transaction.amountCents,
+      applicationDate: transaction.applicationDate.toISOString(),
+    };
+  }
+
+  private async findOrCreateInvoice(
+    client: PrismaExecutor,
+    user: AuthenticatedUser,
+    account: { id: string; closingDay: number | null; dueDay: number | null },
+    referenceMonth: Date,
+    preferredInvoiceId?: string,
+  ) {
+    if (preferredInvoiceId) return preferredInvoiceId;
+
+    const invoice = await client.invoice.upsert({
+      where: {
+        accountId_referenceMonth: {
+          accountId: account.id,
+          referenceMonth,
+        },
+      },
+      update: {},
+      create: {
+        accountId: account.id,
+        memberProfileId: user.profileId,
+        referenceMonth,
+        status: 'open',
+        closingDate: dateFromAccountDay(referenceMonth, account.closingDay),
+        dueDate: dateFromAccountDay(referenceMonth, account.dueDay),
+      },
+    });
+
+    return invoice.id;
   }
 }
 
+function normalizeDescription(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function mapTransactionResponse(transaction: TransactionWithRelations) {
+  return {
+    ...transaction,
+    operationalCategory: resolveOperationalCategory(transaction),
+  };
+}
+
+function resolveOperationalCategory(transaction: TransactionWithRelations) {
+  if (transaction.isInvoiceAdjustment) {
+    return {
+      key: 'system:invoice_adjustment',
+      name: 'Ajuste de fatura',
+      color: '#e0c278',
+    };
+  }
+
+  if (isInvoicePaymentTransaction(transaction)) {
+    return {
+      key: 'system:invoice_payment',
+      name: 'Pagamento de fatura',
+      color: '#d99090',
+    };
+  }
+
+  if (transaction.type === 'expense' && transaction.account?.type === 'credit_card') {
+    return {
+      key: 'system:credit_card',
+      name: 'Cartão',
+      color: '#d99090',
+    };
+  }
+
+  if (transaction.category) {
+    return {
+      key: `category:${transaction.category.id}`,
+      name: transaction.category.name,
+      color: transaction.category.color,
+    };
+  }
+
+  return {
+    key: 'system:uncategorized',
+    name: 'Sem categoria',
+    color: '#3a4a66',
+  };
+}
+
+function isInvoicePaymentTransaction(transaction: TransactionWithRelations) {
+  if (transaction.isInvoicePayment) return true;
+  if (transaction.type !== 'expense' || transaction.account?.type === 'credit_card') return false;
+
+  const description = normalizeDescription(transaction.description);
+  const category = normalizeDescription(transaction.category?.name ?? '');
+  return category === 'cartao' && description.includes('pagamento') && description.includes('fatura');
+}

@@ -1,8 +1,10 @@
 import { CategoryType } from '@prisma/client';
-import { IsArray, IsEnum, IsOptional, IsString, Matches } from 'class-validator';
+import { IsArray, IsEnum, IsNotEmpty, IsOptional, IsString, Matches, MaxLength } from 'class-validator';
 
 export class CreateCategoryDto {
   @IsString()
+  @IsNotEmpty()
+  @MaxLength(80)
   name!: string;
 
   @IsEnum(CategoryType)
@@ -17,4 +19,3 @@ export class CreateCategoryDto {
   @IsString({ each: true })
   aliases?: string[];
 }
-

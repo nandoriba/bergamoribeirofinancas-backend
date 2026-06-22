@@ -9,6 +9,8 @@ export interface ParsedImportRow {
   amountCents?: number;
   externalId?: string;
   suggestedCategory?: string;
+  invoiceAdjustmentCandidate?: boolean;
+  invoiceAdjustmentDefault?: boolean;
   status: 'new' | 'review';
 }
 
@@ -72,15 +74,26 @@ export class ImportParserService {
     const description = row.title || row.descricao || row.description;
     const installment = extractInstallment(description);
     const externalId = buildSyntheticExternalId('nubank-card', date, description, amountCents);
+    const invoiceAdjustmentCandidate = isCreditCardInvoiceAdjustmentCandidate(description);
+    const invoiceAdjustmentDefault = isCreditCardPaymentReceived(description);
+    const categoryAmount = amountCents === undefined ? undefined : -Math.abs(amountCents);
+    const rawWithMetadata: Record<string, string> = { ...raw };
+    if (installment) rawWithMetadata.installment = installment;
+    if (invoiceAdjustmentCandidate) {
+      rawWithMetadata.invoiceAdjustmentCandidate = 'true';
+      rawWithMetadata.invoiceAdjustmentDefault = invoiceAdjustmentDefault ? 'true' : 'false';
+    }
 
     return this.withReviewStatus({
       rowIndex,
-      raw: installment ? { ...raw, installment } : raw,
+      raw: rawWithMetadata,
       date,
       description,
       amountCents,
       externalId,
-      suggestedCategory: suggestCategory(description, amountCents),
+      suggestedCategory: invoiceAdjustmentDefault ? 'Ajuste de fatura' : suggestCategory(description, categoryAmount),
+      invoiceAdjustmentCandidate,
+      invoiceAdjustmentDefault,
       status: 'new',
     });
   }
@@ -248,4 +261,17 @@ function extractInstallment(description?: string): string | undefined {
   if (!description) return undefined;
   const match = /(?:parcela\s*)?(\d{1,2})\s*\/\s*(\d{1,2})/i.exec(description);
   return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
+function isCreditCardPaymentReceived(description?: string): boolean {
+  const text = normalizeKey(description ?? '');
+  return text.includes('pagamento_recebido');
+}
+
+function isCreditCardInvoiceAdjustmentCandidate(description?: string): boolean {
+  const text = normalizeKey(description ?? '');
+  return (
+    isCreditCardPaymentReceived(description) ||
+    ['estorno', 'credito', 'reembolso'].some((token) => text.includes(token))
+  );
 }

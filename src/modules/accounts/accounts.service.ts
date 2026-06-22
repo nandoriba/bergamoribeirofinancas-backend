@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import type { AccountType } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
 import type { AuthenticatedUser } from '../auth/auth.types';
@@ -12,6 +13,7 @@ export class AccountsService {
   list(user: AuthenticatedUser) {
     return this.prisma.account.findMany({
       where: { memberProfile: { familyId: user.familyId } },
+      include: { memberProfile: { select: { id: true, displayName: true } } },
       orderBy: [{ type: 'asc' }, { name: 'asc' }],
     });
   }
@@ -19,7 +21,10 @@ export class AccountsService {
   create(user: AuthenticatedUser, dto: CreateAccountDto) {
     return this.prisma.account.create({
       data: {
-        ...dto,
+        name: dto.name.trim(),
+        type: dto.type,
+        institution: normalizeOptionalString(dto.institution),
+        ...this.normalizeCardFields(dto, dto.type),
         initialBalanceCents: dto.initialBalanceCents ?? 0,
         memberProfileId: user.profileId,
       },
@@ -27,23 +32,46 @@ export class AccountsService {
   }
 
   async update(user: AuthenticatedUser, id: string, dto: UpdateAccountDto) {
-    await this.ensureAccount(user, id);
-    return this.prisma.account.update({ where: { id }, data: dto });
+    const account = await this.ensureOwnAccount(user, id);
+    const nextType = dto.type ?? account.type;
+    return this.prisma.account.update({
+      where: { id },
+      data: {
+        name: dto.name?.trim(),
+        type: dto.type,
+        institution: normalizeOptionalString(dto.institution),
+        ...this.normalizeCardFields(dto, nextType),
+        initialBalanceCents: dto.initialBalanceCents,
+      },
+    });
   }
 
   async remove(user: AuthenticatedUser, id: string) {
-    await this.ensureAccount(user, id);
+    await this.ensureOwnAccount(user, id);
     return this.prisma.account.delete({ where: { id } });
   }
 
-  private async ensureAccount(user: AuthenticatedUser, id: string) {
+  private async ensureOwnAccount(user: AuthenticatedUser, id: string) {
     const account = await this.prisma.account.findFirst({
-      where: { id, memberProfile: { familyId: user.familyId } },
+      where: { id, memberProfileId: user.profileId },
     });
     if (!account) {
       throw new NotFoundException('Conta não encontrada');
     }
     return account;
   }
+
+  private normalizeCardFields(dto: CreateAccountDto | UpdateAccountDto, type: AccountType) {
+    const isCreditCard = type === 'credit_card';
+    return {
+      lastFourDigits: isCreditCard ? normalizeOptionalString(dto.lastFourDigits) : null,
+      closingDay: isCreditCard ? dto.closingDay : null,
+      dueDay: isCreditCard ? dto.dueDay : null,
+    };
+  }
 }
 
+function normalizeOptionalString(value?: string) {
+  const normalized = value?.trim();
+  return normalized || undefined;
+}

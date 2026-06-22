@@ -1,0 +1,1 @@
+ALTER TABLE "ImportRow" ADD COLUMN "falseDuplicate" BOOLEAN NOT NULL DEFAULT false;

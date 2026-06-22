@@ -17,6 +17,7 @@ import { MemberInvitesModule } from './modules/member-invites/member-invites.mod
 import { ProfilesModule } from './modules/profiles/profiles.module';
 import { RecurringModule } from './modules/recurring/recurring.module';
 import { ReportsModule } from './modules/reports/reports.module';
+import { TelegramModule } from './modules/telegram/telegram.module';
 import { TransactionsModule } from './modules/transactions/transactions.module';
 import { UsersModule } from './modules/users/users.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -52,8 +53,8 @@ import { configuration, validateConfig } from './shared/configuration';
     InstallmentsModule,
     DashboardModule,
     ReportsModule,
+    TelegramModule,
     JobsModule,
   ],
 })
 export class AppModule {}
-

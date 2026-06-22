@@ -15,10 +15,11 @@ export class TransactionsController {
   @Get()
   list(
     @CurrentUser() user: AuthenticatedUser,
+    @Query('referenceMonth') referenceMonth?: string,
     @Query('month') month?: string,
     @Query('profileId') profileId?: string,
   ) {
-    return this.transactionsService.list(user, { month, profileId });
+    return this.transactionsService.list(user, { referenceMonth: referenceMonth || month, profileId });
   }
 
   @Post()
@@ -36,4 +37,3 @@ export class TransactionsController {
     return this.transactionsService.remove(user, id);
   }
 }
-

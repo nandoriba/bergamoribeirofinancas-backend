@@ -6,6 +6,6 @@ prisma/dev-demo-data.json
 .env
 .env.*
 !.env.example
+!.env.production.example
 *.log
 *.tsbuildinfo
-
