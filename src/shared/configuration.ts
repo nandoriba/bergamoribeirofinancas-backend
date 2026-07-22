@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
-const schema = z.object({
+const optionalNonBlankString = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  z.string().trim().min(1).optional(),
+);
+
+const baseSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8180),
   DATABASE_URL: z.string().min(1),
@@ -30,6 +35,22 @@ const schema = z.object({
   TELEGRAM_UNDO_WINDOW_MINUTES: z.coerce.number().int().positive().default(10),
   TELEGRAM_MESSAGE_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   TELEGRAM_UPDATE_RECOVERY_MINUTES: z.coerce.number().int().positive().default(5),
+  ABACATEPAY_DEV_API_KEY: optionalNonBlankString,
+  ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: optionalNonBlankString,
+});
+
+const schema = baseSchema.superRefine((config, context) => {
+  if (config.NODE_ENV !== 'production') return;
+
+  for (const key of ['ABACATEPAY_DEV_API_KEY', 'ABACATEPAY_DEV_MONTHLY_PRODUCT_ID'] as const) {
+    if (config[key]) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [key],
+        message: 'Credenciais de sandbox não podem ser carregadas em produção.',
+      });
+    }
+  }
 });
 
 export type AppConfig = z.infer<typeof schema>;

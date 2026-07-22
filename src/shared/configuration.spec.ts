@@ -27,4 +27,40 @@ describe('validateConfig', () => {
       }).JWT_SECRET,
     ).toBe(jwtSecret);
   });
+
+  it('trata configuração vazia do sandbox como ausente', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+      ABACATEPAY_DEV_API_KEY: '',
+      ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: '   ',
+    });
+
+    expect(config.ABACATEPAY_DEV_API_KEY).toBeUndefined();
+    expect(config.ABACATEPAY_DEV_MONTHLY_PRODUCT_ID).toBeUndefined();
+  });
+
+  it('aceita credenciais do sandbox fora de produção', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+      ABACATEPAY_DEV_API_KEY: 'dev-key',
+      ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod-monthly',
+    });
+
+    expect(config.ABACATEPAY_DEV_API_KEY).toBe('dev-key');
+    expect(config.ABACATEPAY_DEV_MONTHLY_PRODUCT_ID).toBe('prod-monthly');
+  });
+
+  it('rejeita credenciais de sandbox em produção', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        NODE_ENV: 'production',
+        JWT_SECRET: 'x'.repeat(32),
+        ABACATEPAY_DEV_API_KEY: 'dev-key',
+        ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod-monthly',
+      }),
+    ).toThrow();
+  });
 });

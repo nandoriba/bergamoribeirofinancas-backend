@@ -19,6 +19,7 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "tsx prisma/seed.ts",
     "telegram:set-webhook": "tsx scripts/set-telegram-webhook.ts",
+    "abacatepay:sandbox:probe": "tsx test/contracts/abacatepay-sandbox.contract.ts",
     "backfill:credit-card-invoices": "tsx prisma/backfill-credit-card-invoices.ts"
   },
   "dependencies": {
