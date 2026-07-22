@@ -1,14 +1,12 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 
 import { CurrentUser } from '../../shared/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/auth.types';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
 import { TransactionsService } from './transactions.service';
 
 @Controller('transactions')
-@UseGuards(JwtAuthGuard)
 export class TransactionsController {
   constructor(private readonly transactionsService: TransactionsService) {}
 

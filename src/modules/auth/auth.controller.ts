@@ -1,10 +1,11 @@
-import { Body, Controller, Get, Post, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Res } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import type { Response } from 'express';
 
 import { CurrentUser } from '../../shared/current-user.decorator';
+import { Public } from '../../shared/public.decorator';
 import { LoginDto } from './dto/login.dto';
 import { AuthService } from './auth.service';
-import { JwtAuthGuard } from './jwt-auth.guard';
 import type { AuthenticatedUser } from './auth.types';
 
 @Controller('auth')
@@ -12,6 +13,8 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Post('login')
+  @Public()
+  @Throttle({ default: { ttl: 60_000, limit: 5 } })
   async login(@Body() dto: LoginDto, @Res({ passthrough: true }) response: Response) {
     const result = await this.authService.login(dto.email, dto.password);
     this.authService.setSessionCookie(response, result.token);
@@ -19,7 +22,6 @@ export class AuthController {
   }
 
   @Get('me')
-  @UseGuards(JwtAuthGuard)
   async me(@CurrentUser() user: AuthenticatedUser) {
     return this.authService.me(user);
   }
@@ -30,4 +32,3 @@ export class AuthController {
     return { ok: true };
   }
 }
-

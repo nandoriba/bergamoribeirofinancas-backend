@@ -5,11 +5,10 @@ import { CurrentUser } from '../../shared/current-user.decorator';
 import { Roles } from '../../shared/role.decorator';
 import { RolesGuard } from '../../shared/roles.guard';
 import type { AuthenticatedUser } from '../auth/auth.types';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { MemberApprovalsService } from './member-approvals.service';
 
 @Controller('member-approvals')
-@UseGuards(JwtAuthGuard, RolesGuard)
+@UseGuards(RolesGuard)
 @Roles(UserRole.admin)
 export class MemberApprovalsController {
   constructor(private readonly memberApprovalsService: MemberApprovalsService) {}
@@ -29,4 +28,3 @@ export class MemberApprovalsController {
     return this.memberApprovalsService.reject(user, id);
   }
 }
-

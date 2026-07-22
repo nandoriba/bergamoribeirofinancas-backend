@@ -1,14 +1,12 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 
 import { CurrentUser } from '../../shared/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/auth.types';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CreateRecurringDto } from './dto/create-recurring.dto';
 import { UpdateRecurringDto } from './dto/update-recurring.dto';
 import { RecurringService } from './recurring.service';
 
 @Controller('recurring')
-@UseGuards(JwtAuthGuard)
 export class RecurringController {
   constructor(private readonly recurringService: RecurringService) {}
 
@@ -37,4 +35,3 @@ export class RecurringController {
     return this.recurringService.remove(user, id);
   }
 }
-

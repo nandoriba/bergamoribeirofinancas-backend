@@ -1,14 +1,12 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
 
 import { CurrentUser } from '../../shared/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/auth.types';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CategoriesService } from './categories.service';
 import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
 
 @Controller('categories')
-@UseGuards(JwtAuthGuard)
 export class CategoriesController {
   constructor(private readonly categoriesService: CategoriesService) {}
 
@@ -32,4 +30,3 @@ export class CategoriesController {
     return this.categoriesService.remove(user, id);
   }
 }
-

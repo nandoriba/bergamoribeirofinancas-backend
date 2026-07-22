@@ -4,19 +4,16 @@ import {
   Get,
   Post,
   UploadedFile,
-  UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 
 import { CurrentUser } from '../../shared/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/auth.types';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ConfirmImportDto } from './dto/confirm-import.dto';
 import { DiscardImportDto } from './dto/discard-import.dto';
 import { ImportsService, type UploadedCsvFile } from './imports.service';
 
-@UseGuards(JwtAuthGuard)
 @Controller('imports')
 export class ImportsController {
   constructor(private readonly importsService: ImportsService) {}

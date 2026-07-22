@@ -8,6 +8,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import type { AppConfig } from '../../shared/configuration';
 import { endOfDay, endOfMonth, startOfMonth } from '../../shared/date-range';
 import { accountBalanceCents, expenseCents } from '../../shared/finance-calculator';
+import { timingSafeStringEqual } from '../../shared/timing-safe-string-equal';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { InstallmentsService } from '../installments/installments.service';
 import { TransactionsService } from '../transactions/transactions.service';
@@ -136,7 +137,7 @@ export class TelegramService {
 
   private assertWebhookSecret(secretToken?: string) {
     const expected = this.config.get<string>('TELEGRAM_WEBHOOK_SECRET');
-    if (!expected || secretToken !== expected) {
+    if (!timingSafeStringEqual(expected, secretToken)) {
       throw new UnauthorizedException('Telegram webhook secret inválido');
     }
   }
