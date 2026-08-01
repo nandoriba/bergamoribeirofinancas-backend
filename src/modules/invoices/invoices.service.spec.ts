@@ -14,23 +14,38 @@ describe('InvoicesService', () => {
     profileId: 'profile-1',
   } satisfies AuthenticatedUser);
 
+  function listTenantScope(profileIds: string[] = ['profile-1', 'inactive-profile']) {
+    return {
+      resolveProfileIds: vi.fn().mockResolvedValue(profileIds),
+      byFamilyProfiles: vi.fn().mockReturnValue({ memberProfile: { familyId: 'family-1' } }),
+      consistentInvoiceRelations: vi.fn().mockReturnValue({ account: { memberProfile: { familyId: 'family-1' } } }),
+      consistentTransactionRelations: vi.fn().mockReturnValue({
+        AND: Array.from({ length: 5 }, (_, index) => ({ relation: index })),
+      }),
+    };
+  }
+
   it('pagina faturas e mantém todos os ramos de transações no escopo familiar autenticado', async () => {
     const invoices = Array.from({ length: 13 }, (_, index) => ({ id: `invoice-${index + 1}` }));
     const findMany = vi.fn().mockResolvedValue(invoices);
-    const service = new InvoicesService({ invoice: { findMany } } as never);
+    const tenantScope = listTenantScope();
+    const service = new InvoicesService({ invoice: { findMany } } as never, tenantScope as never);
 
     const result = await service.list(context);
 
     const query = findMany.mock.calls[0][0];
     expect(query.where).toEqual({
+      memberProfileId: { in: ['profile-1', 'inactive-profile'] },
       memberProfile: { familyId: 'family-1' },
       account: { memberProfile: { familyId: 'family-1' } },
     });
     expect(query.include.transactions.where).toMatchObject({
+      memberProfileId: { in: ['profile-1', 'inactive-profile'] },
       memberProfile: { familyId: 'family-1' },
     });
     expect(query.include.transactions.where.AND).toHaveLength(5);
     expect(query.include.transactions.include.installmentPlan.include.transactions.where).toMatchObject({
+      memberProfileId: { in: ['profile-1', 'inactive-profile'] },
       memberProfile: { familyId: 'family-1' },
     });
     expect(query.include.transactions.include.installmentPlan.include.transactions.where.AND).toHaveLength(5);
@@ -46,17 +61,54 @@ describe('InvoicesService', () => {
     });
   });
 
+  it('uses the exact selected profile in invoices and every nested transaction branch', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const tenantScope = listTenantScope(['inactive-profile']);
+    const service = new InvoicesService({ invoice: { findMany } } as never, tenantScope as never);
+
+    await service.list(context, { limit: 12, profileId: 'inactive-profile' });
+
+    expect(tenantScope.resolveProfileIds).toHaveBeenCalledWith(context, {
+      family: true,
+      profileId: 'inactive-profile',
+    });
+    const query = findMany.mock.calls[0][0];
+    expect(query.where.memberProfileId).toEqual({ in: ['inactive-profile'] });
+    expect(query.include.transactions.where.memberProfileId).toEqual({ in: ['inactive-profile'] });
+    expect(
+      query.include.transactions.include.installmentPlan.include.transactions.where.memberProfileId,
+    ).toEqual({ in: ['inactive-profile'] });
+  });
+
+  it('rejects a pending or foreign profile before querying invoices', async () => {
+    const findFirst = vi.fn();
+    const findMany = vi.fn();
+    const tenantScope = listTenantScope();
+    tenantScope.resolveProfileIds.mockRejectedValue(new Error('Perfil inválido'));
+    const service = new InvoicesService({ invoice: { findFirst, findMany } } as never, tenantScope as never);
+
+    await expect(service.list(context, { limit: 12, profileId: 'pending-profile' })).rejects.toThrow(
+      'Perfil inválido',
+    );
+    expect(findFirst).not.toHaveBeenCalled();
+    expect(findMany).not.toHaveBeenCalled();
+  });
+
   it('continua a paginação a partir de um cursor válido do mesmo escopo familiar', async () => {
     const cursor = '8e6db1e4-d9eb-4e2c-a284-5c28993f3b85';
     const findFirst = vi.fn().mockResolvedValue({ id: cursor });
     const findMany = vi.fn().mockResolvedValue([{ id: 'invoice-next' }]);
-    const service = new InvoicesService({ invoice: { findFirst, findMany } } as never);
+    const service = new InvoicesService(
+      { invoice: { findFirst, findMany } } as never,
+      listTenantScope() as never,
+    );
 
     const result = await service.list(context, { cursor, limit: 5 });
 
     expect(findFirst).toHaveBeenCalledWith({
       where: {
         id: cursor,
+        memberProfileId: { in: ['profile-1', 'inactive-profile'] },
         memberProfile: { familyId: 'family-1' },
         account: { memberProfile: { familyId: 'family-1' } },
       },
@@ -81,13 +133,17 @@ describe('InvoicesService', () => {
     const cursor = '8e6db1e4-d9eb-4e2c-a284-5c28993f3b85';
     const findFirst = vi.fn().mockResolvedValue({ id: cursor });
     const findMany = vi.fn().mockResolvedValue([]);
-    const service = new InvoicesService({ invoice: { findFirst, findMany } } as never);
+    const service = new InvoicesService(
+      { invoice: { findFirst, findMany } } as never,
+      listTenantScope() as never,
+    );
 
     await service.list(context, { cursor, limit: 12, referenceMonth: '2026-07' });
 
     expect(findFirst).toHaveBeenCalledWith({
       where: {
         id: cursor,
+        memberProfileId: { in: ['profile-1', 'inactive-profile'] },
         memberProfile: { familyId: 'family-1' },
         account: { memberProfile: { familyId: 'family-1' } },
         referenceMonth: {
@@ -103,7 +159,10 @@ describe('InvoicesService', () => {
     const cursor = '8e6db1e4-d9eb-4e2c-a284-5c28993f3b85';
     const findFirst = vi.fn().mockResolvedValue(null);
     const findMany = vi.fn();
-    const service = new InvoicesService({ invoice: { findFirst, findMany } } as never);
+    const service = new InvoicesService(
+      { invoice: { findFirst, findMany } } as never,
+      listTenantScope() as never,
+    );
 
     await expect(service.list(context, { cursor, limit: 12 })).rejects.toMatchObject({
       response: expect.objectContaining({ message: 'Cursor inválido' }),

@@ -16,4 +16,8 @@ export class ListInvoicesQueryDto {
   @IsOptional()
   @Matches(/^\d{4}-(0[1-9]|1[0-2])$/)
   referenceMonth?: string;
+
+  @IsOptional()
+  @IsUUID('4')
+  profileId?: string;
 }

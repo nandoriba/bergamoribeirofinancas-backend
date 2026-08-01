@@ -12,4 +12,8 @@ export class ListInstallmentsQueryDto {
   @IsOptional()
   @IsUUID('4')
   cursor?: string;
+
+  @IsOptional()
+  @IsUUID('4')
+  profileId?: string;
 }

@@ -4,6 +4,7 @@ import { CurrentTenant } from '../../shared/current-tenant.decorator';
 import type { TenantContext } from '../../shared/tenant-context';
 import { CreateRecurringDto } from './dto/create-recurring.dto';
 import { GenerateRecurringQueryDto } from './dto/generate-recurring-query.dto';
+import { ListRecurringQueryDto } from './dto/list-recurring-query.dto';
 import { UpdateRecurringDto } from './dto/update-recurring.dto';
 import { RecurringService } from './recurring.service';
 
@@ -12,8 +13,8 @@ export class RecurringController {
   constructor(private readonly recurringService: RecurringService) {}
 
   @Get()
-  list(@CurrentTenant() context: TenantContext) {
-    return this.recurringService.list(context);
+  list(@CurrentTenant() context: TenantContext, @Query() query: ListRecurringQueryDto) {
+    return this.recurringService.list(context, query);
   }
 
   @Post()

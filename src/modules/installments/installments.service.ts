@@ -20,7 +20,14 @@ export class InstallmentsService {
   ) {}
 
   async list(context: TenantContext, query: ListInstallmentsQueryDto = new ListInstallmentsQueryDto()) {
-    const where = this.tenantScope.byFamilyProfiles(context);
+    const profileIds = await this.tenantScope.resolveProfileIds(context, {
+      family: true,
+      profileId: query.profileId,
+    });
+    const where = {
+      memberProfileId: { in: profileIds },
+      ...this.tenantScope.byFamilyProfiles(context),
+    };
     if (query.cursor) {
       const cursor = await this.prisma.installmentPlan.findFirst({
         where: { id: query.cursor, ...where },
@@ -34,7 +41,7 @@ export class InstallmentsService {
         where,
         include: {
           transactions: {
-            where: this.consistentTransactionsWhere(context),
+            where: this.consistentTransactionsWhere(context, profileIds),
             include: {
               account: true,
               category: true,
@@ -49,7 +56,7 @@ export class InstallmentsService {
         take: query.limit + 1,
         ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
       }),
-      this.summarizeFamily(context),
+      this.summarizeProfiles(context, profileIds),
     ]);
 
     const hasNextPage = rows.length > query.limit;
@@ -410,14 +417,17 @@ export class InstallmentsService {
     return invoice.id;
   }
 
-  private consistentTransactionsWhere(context: TenantContext): Prisma.TransactionWhereInput {
+  private consistentTransactionsWhere(
+    context: TenantContext,
+    profileIds: string[] = [context.authorProfileId],
+  ): Prisma.TransactionWhereInput {
     return {
-      ...this.tenantScope.byFamilyProfiles(context),
+      memberProfileId: { in: profileIds },
       ...this.tenantScope.consistentTransactionRelations(context),
     };
   }
 
-  private async summarizeFamily(context: TenantContext) {
+  private async summarizeProfiles(context: TenantContext, profileIds: string[]) {
     const [summary] = await this.prisma.$queryRaw<
       Array<{ totalPurchaseCents: bigint; totalInstallments: bigint; totalAmountToPayCents: bigint }>
     >(Prisma.sql`
@@ -431,6 +441,7 @@ export class InstallmentsService {
       FROM "InstallmentPlan" plan
       INNER JOIN "MemberProfile" profile ON profile.id = plan."memberProfileId"
       WHERE profile."familyId" = ${context.familyId}
+        AND profile.id IN (${Prisma.join(profileIds)})
     `);
 
     return {

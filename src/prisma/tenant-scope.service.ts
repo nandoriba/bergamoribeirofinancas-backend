@@ -70,6 +70,7 @@ export class TenantScopeService {
         where: {
           id: selection.profileId,
           familyId: context.familyId,
+          status: { in: ['active', 'inactive'] },
         },
         select: { id: true },
       });
@@ -83,6 +84,7 @@ export class TenantScopeService {
     const profiles = await this.prisma.memberProfile.findMany({
       where: {
         familyId: context.familyId,
+        status: { in: ['active', 'inactive'] },
       },
       select: { id: true },
       orderBy: { displayName: 'asc' },

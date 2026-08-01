@@ -19,17 +19,27 @@ interface TenantFixture {
 interface FixtureIds {
   tenantA: TenantFixture;
   tenantB: TenantFixture;
+  activeProfileA: string;
   inactiveProfileA: string;
+  pendingProfileA: string;
   accountA: string;
   cardA: string;
+  activeAccountA: string;
+  activeCardA: string;
   accountB: string;
   cardB: string;
   categoryB: string;
   transactionB: string;
+  activeTransactionA: string;
+  activeNestedTransactionA: string;
   invoiceB: string;
+  activeInvoiceA: string;
   recurringB: string;
+  activeRecurringA: string;
   installmentB: string;
+  activeInstallmentA: string;
   importBatchB: string;
+  activeImportBatchA: string;
   importRowB: string;
   inconsistentTransactionA: string;
 }
@@ -64,6 +74,7 @@ describe("isolamento PostgreSQL com dois tenants", () => {
   it("mantém leituras familiares dentro do tenant e preserva histórico inativo", async () => {
     const accounts = itemsOf(await getJson(baseUrl, cookieA, "/accounts"));
     expect(accounts.map(readId)).toContain(fixture.accountA);
+    expect(accounts.map(readId)).toContain(fixture.activeAccountA);
     expect(accounts.map(readMemberProfileId)).toContain(
       fixture.inactiveProfileA,
     );
@@ -90,9 +101,11 @@ describe("isolamento PostgreSQL com dois tenants", () => {
     const invoices = itemsOf(
       await getJson(baseUrl, cookieA, "/invoices?limit=50"),
     );
+    expect(invoices.map(readId)).toContain(fixture.activeInvoiceA);
     expect(invoices.map(readId)).not.toContain(fixture.invoiceB);
 
     const recurring = itemsOf(await getJson(baseUrl, cookieA, "/recurring"));
+    expect(recurring.map(readId)).toContain(fixture.activeRecurringA);
     expect(recurring.map(readId)).not.toContain(fixture.recurringB);
 
     const installments = await getJson(
@@ -103,35 +116,179 @@ describe("isolamento PostgreSQL com dois tenants", () => {
     expect(itemsOf(installments).map(readId)).not.toContain(
       fixture.installmentB,
     );
+    expect(itemsOf(installments).map(readId)).toContain(
+      fixture.activeInstallmentA,
+    );
 
     const batches = itemsOf(
       await getJson(baseUrl, cookieA, "/imports/batches?limit=50"),
     );
+    expect(batches.map(readId)).not.toContain(fixture.activeImportBatchA);
     expect(batches.map(readId)).not.toContain(fixture.importBatchB);
 
     const profiles = itemsOf(await getJson(baseUrl, cookieA, "/profiles"));
-    expect(profiles.map(readId)).not.toContain(fixture.inactiveProfileA);
+    expect(profiles.map(readId)).toContain(fixture.activeProfileA);
+    expect(profiles.map(readId)).toContain(fixture.inactiveProfileA);
+    expect(profiles.map(readId)).not.toContain(fixture.pendingProfileA);
   });
 
-  it("rejeita filtros de perfil de outra família no dashboard, relatório e lançamentos", async () => {
+  it("filtra todas as visões financeiras por um perfil ativo da própria família", async () => {
+    const profileId = fixture.activeProfileA;
+    const accounts = itemsOf(
+      await getJson(baseUrl, cookieA, `/accounts?profileId=${profileId}`),
+    );
+    expect(accounts.map(readId)).toContain(fixture.activeAccountA);
+    expect(accounts.every((item) => readMemberProfileId(item) === profileId)).toBe(true);
+
+    const transactions = itemsOf(
+      await getJson(
+        baseUrl,
+        cookieA,
+        `/transactions?referenceMonth=2026-07&limit=100&profileId=${profileId}`,
+      ),
+    );
+    expect(transactions.map(readId)).toEqual(
+      expect.arrayContaining([fixture.activeTransactionA, fixture.activeNestedTransactionA]),
+    );
+    expect(transactions.every((item) => readMemberProfileId(item) === profileId)).toBe(true);
+
+    const invoices = itemsOf(
+      await getJson(baseUrl, cookieA, `/invoices?limit=50&profileId=${profileId}`),
+    );
+    expect(invoices.map(readId)).toEqual([fixture.activeInvoiceA]);
+    const invoiceTransactions = itemsOf(invoices[0].transactions);
+    expect(invoiceTransactions.map(readId)).toContain(fixture.activeNestedTransactionA);
+    expect(invoiceTransactions.every((item) => readMemberProfileId(item) === profileId)).toBe(true);
+    const invoiceInstallment = asRecord(
+      invoiceTransactions.find((item) => readId(item) === fixture.activeNestedTransactionA)?.installmentPlan,
+    );
+    expect(itemsOf(invoiceInstallment.transactions).every((item) => readMemberProfileId(item) === profileId)).toBe(true);
+
+    const recurring = itemsOf(
+      await getJson(baseUrl, cookieA, `/recurring?profileId=${profileId}`),
+    );
+    expect(recurring.map(readId)).toEqual([fixture.activeRecurringA]);
+
+    const installments = asRecord(
+      await getJson(baseUrl, cookieA, `/installments?limit=50&profileId=${profileId}`),
+    );
+    const installmentItems = itemsOf(installments);
+    expect(installmentItems.map(readId)).toEqual([fixture.activeInstallmentA]);
+    expect(itemsOf(installmentItems[0].transactions).map(readId)).toContain(fixture.activeNestedTransactionA);
+    expect(
+      itemsOf(installmentItems[0].transactions).every((item) => readMemberProfileId(item) === profileId),
+    ).toBe(true);
+    expect(asRecord(installments.summary)).toMatchObject({
+      totalPurchaseCents: 14_000,
+      totalInstallments: 2,
+      totalAmountToPayCents: 7_000,
+    });
+
+    const dashboard = asRecord(
+      await getJson(baseUrl, cookieA, `/dashboard?referenceMonth=2026-07&profileId=${profileId}`),
+    );
+    expect(itemsOf(dashboard.transactions).map(readId)).toEqual(
+      expect.arrayContaining([fixture.activeTransactionA, fixture.activeNestedTransactionA]),
+    );
+
+    const report = asRecord(
+      await getJson(baseUrl, cookieA, `/reports/monthly?month=2026-07&profileId=${profileId}`),
+    );
+    expect(itemsOf(report.profiles).map(readId)).toEqual([profileId]);
+    expect(asRecord(report.totals)).toMatchObject({ incomeCents: 40_000, expenseCents: 7_000, netCents: 33_000 });
+  });
+
+  it("permite consultar o histórico de um perfil inativo da própria família", async () => {
+    const profileId = fixture.inactiveProfileA;
+    const accounts = itemsOf(await getJson(baseUrl, cookieA, `/accounts?profileId=${profileId}`));
+    expect(accounts.map(readMemberProfileId)).toEqual([profileId]);
+
+    const transactions = itemsOf(
+      await getJson(
+        baseUrl,
+        cookieA,
+        `/transactions?referenceMonth=2026-07&limit=100&profileId=${profileId}`,
+      ),
+    );
+    expect(transactions.map((item) => readString(item, "description"))).toEqual(["Histórico inativo A"]);
+
+    const report = asRecord(
+      await getJson(baseUrl, cookieA, `/reports/monthly?month=2026-07&profileId=${profileId}`),
+    );
+    expect(itemsOf(report.profiles).map(readId)).toEqual([profileId]);
+  });
+
+  it("rejeita perfis pendentes, desconhecidos ou de outra família antes das leituras", async () => {
+    const endpoints = [
+      "/accounts",
+      "/transactions?referenceMonth=2026-07&limit=100",
+      "/invoices?limit=50",
+      "/recurring",
+      "/installments?limit=50",
+      "/dashboard?referenceMonth=2026-07",
+      "/reports/monthly?month=2026-07",
+    ];
+    const rejectedProfileIds = [fixture.pendingProfileA, fixture.tenantB.profileId, randomUUID()];
+
+    for (const endpoint of endpoints) {
+      const separator = endpoint.includes("?") ? "&" : "?";
+      for (const profileId of rejectedProfileIds) {
+        await expectStatus(baseUrl, cookieA, `${endpoint}${separator}profileId=${profileId}`, 400);
+      }
+    }
+
     await expectStatus(
       baseUrl,
-      cookieA,
-      `/transactions?referenceMonth=2026-07&profileId=${fixture.tenantB.profileId}`,
+      cookieB,
+      `/accounts?profileId=${fixture.activeProfileA}`,
       400,
     );
-    await expectStatus(
-      baseUrl,
-      cookieA,
-      `/dashboard?profileId=${fixture.tenantB.profileId}`,
-      400,
-    );
-    await expectStatus(
-      baseUrl,
-      cookieA,
-      `/reports/monthly?month=2026-07&profileId=${fixture.tenantB.profileId}`,
-      400,
-    );
+  });
+
+  it("rejeita profileId forjado em mutações e sempre grava no perfil autor", async () => {
+    const forgedProfileIds = [fixture.activeProfileA, fixture.tenantB.profileId];
+    for (const profileId of forgedProfileIds) {
+      await expectStatus(baseUrl, cookieA, "/accounts", 400, {
+        method: "POST",
+        body: { name: "Conta forjada", type: "checking", profileId },
+      });
+      await expectStatus(baseUrl, cookieA, "/transactions", 400, {
+        method: "POST",
+        body: {
+          applicationDate: "2026-07-22",
+          referenceMonth: "2026-07-01",
+          description: "Lançamento forjado",
+          amountCents: 1234,
+          type: "expense",
+          profileId,
+        },
+      });
+    }
+
+    const createdAccount = await postJson(baseUrl, cookieA, "/accounts", {
+      name: `Conta válida ${randomUUID()}`,
+      type: "checking",
+    });
+    expect(readMemberProfileId(createdAccount)).toBe(fixture.tenantA.profileId);
+
+    const createdTransaction = await postJson(baseUrl, cookieA, "/transactions", {
+      applicationDate: "2026-09-22",
+      referenceMonth: "2026-09-01",
+      description: `Lançamento válido ${randomUUID()}`,
+      amountCents: 1234,
+      type: "expense",
+    });
+    expect(readMemberProfileId(createdTransaction)).toBe(fixture.tenantA.profileId);
+
+    await expect(
+      prisma.account.findUnique({ where: { id: readId(createdAccount) }, select: { memberProfileId: true } }),
+    ).resolves.toEqual({ memberProfileId: fixture.tenantA.profileId });
+    await expect(
+      prisma.transaction.findUnique({
+        where: { id: readId(createdTransaction) },
+        select: { memberProfileId: true },
+      }),
+    ).resolves.toEqual({ memberProfileId: fixture.tenantA.profileId });
   });
 
   it("mantém dashboard e relatório fail-closed diante de relações financeiras inconsistentes", async () => {
@@ -157,8 +314,8 @@ describe("isolamento PostgreSQL com dois tenants", () => {
     const reportProfiles = itemsOf(report.profiles);
     expect(reportProfiles.map(readId)).not.toContain(fixture.tenantB.profileId);
     const totals = asRecord(report.totals);
-    expect(readNumber(totals, "incomeCents")).toBe(30_000);
-    expect(readNumber(totals, "expenseCents")).toBe(1_000);
+    expect(readNumber(totals, "incomeCents")).toBe(70_000);
+    expect(readNumber(totals, "expenseCents")).toBe(7_000);
     expect(
       itemsOf(report.accounts).map((item) => readString(item, "name")),
     ).not.toContain("Cartão B");
@@ -448,7 +605,53 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
     return { user, profile };
   });
 
-  const [accountA, cardA, inactiveAccountA, accountB, cardB] =
+  const activeMember = await prisma.$transaction(async (tx) => {
+    const user = await tx.user.create({
+      data: {
+        id: randomUUID(),
+        email: "active-a2@example.test",
+        passwordHash,
+        name: "Membro ativo A2",
+        familyId: tenantA.familyId,
+        emailVerifiedAt: new Date(),
+      },
+    });
+    const profile = await tx.memberProfile.create({
+      data: {
+        id: randomUUID(),
+        displayName: "Membro ativo A2",
+        familyId: tenantA.familyId,
+        userId: user.id,
+        status: "active",
+      },
+    });
+    return { user, profile };
+  });
+
+  const pendingMember = await prisma.$transaction(async (tx) => {
+    const user = await tx.user.create({
+      data: {
+        id: randomUUID(),
+        email: `pending-${randomUUID()}@invite.invalid`,
+        passwordHash,
+        name: "Membro pendente A",
+        familyId: tenantA.familyId,
+        isActive: false,
+      },
+    });
+    const profile = await tx.memberProfile.create({
+      data: {
+        id: randomUUID(),
+        displayName: "Membro pendente A",
+        familyId: tenantA.familyId,
+        userId: user.id,
+        status: "pending",
+      },
+    });
+    return { user, profile };
+  });
+
+  const [accountA, cardA, activeAccountA, activeCardA, inactiveAccountA, accountB, cardB] =
     await Promise.all([
       prisma.account.create({
         data: {
@@ -466,6 +669,24 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
           closingDay: 20,
           dueDay: 28,
           memberProfileId: tenantA.profileId,
+        },
+      }),
+      prisma.account.create({
+        data: {
+          id: randomUUID(),
+          name: "Conta A2",
+          type: "checking",
+          memberProfileId: activeMember.profile.id,
+        },
+      }),
+      prisma.account.create({
+        data: {
+          id: randomUUID(),
+          name: "Cartão A2",
+          type: "credit_card",
+          closingDay: 20,
+          dueDay: 28,
+          memberProfileId: activeMember.profile.id,
         },
       }),
       prisma.account.create({
@@ -516,12 +737,20 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
     }),
   ]);
   const referenceMonth = new Date("2026-07-01T00:00:00.000Z");
-  const [, invoiceB] = await Promise.all([
+  const [, activeInvoiceA, invoiceB] = await Promise.all([
     prisma.invoice.create({
       data: {
         id: randomUUID(),
         accountId: cardA.id,
         memberProfileId: tenantA.profileId,
+        referenceMonth,
+      },
+    }),
+    prisma.invoice.create({
+      data: {
+        id: randomUUID(),
+        accountId: activeCardA.id,
+        memberProfileId: activeMember.profile.id,
         referenceMonth,
       },
     }),
@@ -534,7 +763,7 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
       },
     }),
   ]);
-  const [, recurringB] = await Promise.all([
+  const [, activeRecurringA, recurringB] = await Promise.all([
     prisma.recurringTemplate.create({
       data: {
         id: randomUUID(),
@@ -550,6 +779,18 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
     prisma.recurringTemplate.create({
       data: {
         id: randomUUID(),
+        description: "Recorrência A2",
+        amountCents: 1500,
+        type: "expense",
+        dayOfMonth: 6,
+        startsAt: referenceMonth,
+        accountId: activeAccountA.id,
+        memberProfileId: activeMember.profile.id,
+      },
+    }),
+    prisma.recurringTemplate.create({
+      data: {
+        id: randomUUID(),
         description: "Recorrência B",
         amountCents: 2000,
         type: "expense",
@@ -560,7 +801,7 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
       },
     }),
   ]);
-  const [, installmentB] = await Promise.all([
+  const [, activeInstallmentA, installmentB] = await Promise.all([
     prisma.installmentPlan.create({
       data: {
         id: randomUUID(),
@@ -576,6 +817,19 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
     prisma.installmentPlan.create({
       data: {
         id: randomUUID(),
+        description: "Parcelamento A2",
+        totalInstallments: 2,
+        paidInstallments: 1,
+        firstReferenceMonth: referenceMonth,
+        monthlyAmountCents: 7000,
+        totalAmountCents: 14000,
+        startsAt: referenceMonth,
+        memberProfileId: activeMember.profile.id,
+      },
+    }),
+    prisma.installmentPlan.create({
+      data: {
+        id: randomUUID(),
         description: "Parcelamento B",
         totalInstallments: 2,
         firstReferenceMonth: referenceMonth,
@@ -586,7 +840,7 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
       },
     }),
   ]);
-  const [, importB] = await Promise.all([
+  const [, activeImportA, importB] = await Promise.all([
     prisma.importBatch.create({
       data: {
         id: randomUUID(),
@@ -601,6 +855,26 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
             status: "new",
             description: "Import A",
             amountCents: 1000,
+            date: referenceMonth,
+          },
+        },
+      },
+      include: { rows: true },
+    }),
+    prisma.importBatch.create({
+      data: {
+        id: randomUUID(),
+        fileName: "a2.csv",
+        type: "nubank_account",
+        memberProfileId: activeMember.profile.id,
+        rows: {
+          create: {
+            id: randomUUID(),
+            rowIndex: 1,
+            raw: {},
+            status: "new",
+            description: "Import A2",
+            amountCents: 1500,
             date: referenceMonth,
           },
         },
@@ -628,7 +902,7 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
       include: { rows: true },
     }),
   ]);
-  const [, , transactionB] = await Promise.all([
+  const [, , activeTransactionA, activeNestedTransactionA, transactionB] = await Promise.all([
     createTransaction(
       prisma,
       tenantA.profileId,
@@ -645,6 +919,31 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
       "Histórico inativo A",
       20000,
     ),
+    createTransaction(
+      prisma,
+      activeMember.profile.id,
+      activeAccountA.id,
+      categoryA.id,
+      "Receita membro A2",
+      40000,
+    ),
+    prisma.transaction.create({
+      data: {
+        id: randomUUID(),
+        date: referenceMonth,
+        applicationDate: new Date("2026-07-12T00:00:00.000Z"),
+        referenceMonth,
+        description: "Parcela A2 na fatura",
+        amountCents: 7000,
+        type: "expense",
+        status: "confirmed",
+        memberProfileId: activeMember.profile.id,
+        accountId: activeCardA.id,
+        invoiceId: activeInvoiceA.id,
+        installmentPlanId: activeInstallmentA.id,
+        installmentNumber: 1,
+      },
+    }),
     createTransaction(
       prisma,
       tenantB.profileId,
@@ -677,17 +976,27 @@ async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
   return {
     tenantA,
     tenantB,
+    activeProfileA: activeMember.profile.id,
     inactiveProfileA: inactive.profile.id,
+    pendingProfileA: pendingMember.profile.id,
     accountA: accountA.id,
     cardA: cardA.id,
+    activeAccountA: activeAccountA.id,
+    activeCardA: activeCardA.id,
     accountB: accountB.id,
     cardB: cardB.id,
     categoryB: categoryB.id,
     transactionB: transactionB.id,
+    activeTransactionA: activeTransactionA.id,
+    activeNestedTransactionA: activeNestedTransactionA.id,
     invoiceB: invoiceB.id,
+    activeInvoiceA: activeInvoiceA.id,
     recurringB: recurringB.id,
+    activeRecurringA: activeRecurringA.id,
     installmentB: installmentB.id,
+    activeInstallmentA: activeInstallmentA.id,
     importBatchB: importB.id,
+    activeImportBatchA: activeImportA.id,
     importRowB: importB.rows[0].id,
     inconsistentTransactionA: inconsistentTransaction.id,
   };

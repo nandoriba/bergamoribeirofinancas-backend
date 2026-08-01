@@ -240,7 +240,7 @@ describe('DashboardService', () => {
       }),
     );
     expect(tenantScope.resolveProfileIds).toHaveBeenCalledWith(context, { family: true, profileId: undefined });
-    expect(recurringService.materializeOwnProfile).toHaveBeenCalledWith(context, referenceMonth);
+    expect(recurringService.materializeOwnProfile).not.toHaveBeenCalled();
     expect(prisma.importRow.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({ importBatchId: 'batch-1' }),
@@ -248,7 +248,7 @@ describe('DashboardService', () => {
     );
   });
 
-  it('rejects a cross-tenant profile before materializing or reading dashboard data', async () => {
+  it('rejects a cross-tenant profile before reading dashboard data', async () => {
     const tenantScope = {
       resolveProfileIds: vi.fn().mockRejectedValue(new Error('Perfil inválido')),
     };

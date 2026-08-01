@@ -400,7 +400,11 @@ describe('TransactionsService', () => {
       service.list(context, { referenceMonth: '2026-06', profileId: 'foreign-profile' }),
     ).rejects.toThrow('Perfil inválido');
     expect(profileFindFirst).toHaveBeenCalledWith({
-      where: { id: 'foreign-profile', familyId: 'family-1' },
+      where: {
+        id: 'foreign-profile',
+        familyId: 'family-1',
+        status: { in: ['active', 'inactive'] },
+      },
       select: { id: true },
     });
     expect(transactionFindMany).not.toHaveBeenCalled();

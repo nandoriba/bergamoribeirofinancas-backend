@@ -6,6 +6,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { TenantScopeService } from '../../prisma/tenant-scope.service';
 import {
   addMonths,
+  clampDayForMonth,
   daysInMonth,
   endOfDay,
   endOfMonth,
@@ -41,11 +42,38 @@ const transactionInclude = {
   memberProfile: { select: { id: true, displayName: true } },
 } satisfies Prisma.TransactionInclude;
 
+const recurringAccountSelect = {
+  id: true,
+  name: true,
+  type: true,
+} satisfies Prisma.AccountSelect;
+
+const recurringTemplateInclude = {
+  category: true,
+} satisfies Prisma.RecurringTemplateInclude;
+
 type DashboardTransaction = Prisma.TransactionGetPayload<{ include: typeof transactionInclude }>;
 type DashboardInvoice = Prisma.InvoiceGetPayload<{ include: { account: true } }>;
-type DashboardRecurring = Prisma.RecurringTemplateGetPayload<Record<string, never>>;
+type DashboardRecurring = Prisma.RecurringTemplateGetPayload<{ include: typeof recurringTemplateInclude }> & {
+  account: Prisma.AccountGetPayload<{ select: typeof recurringAccountSelect }> | null;
+};
 type DashboardInstallmentPlan = Prisma.InstallmentPlanGetPayload<Record<string, never>>;
 type DashboardImportRow = Prisma.ImportRowGetPayload<{ include: { importBatch: true } }>;
+type DashboardMetricTransaction = Pick<
+  DashboardTransaction,
+  | 'amountCents'
+  | 'applicationDate'
+  | 'category'
+  | 'date'
+  | 'description'
+  | 'installmentNumber'
+  | 'isInvoiceAdjustment'
+  | 'isInvoicePayment'
+  | 'status'
+  | 'type'
+> & {
+  account: Pick<NonNullable<DashboardTransaction['account']>, 'name' | 'type'> | null;
+};
 export type ImportPreviewStatus = 'new' | 'duplicate' | 'possible_duplicate' | 'review';
 
 export interface ImportDuplicateCandidate {
@@ -80,8 +108,6 @@ export class DashboardService {
       profileId: query.profileId,
     });
 
-    await this.recurringService.materializeOwnProfile(context, reference);
-
     const [monthTransactions, previousMonthTransactions, importRows, installments, invoices, recurring] =
       await Promise.all([
         this.getTransactions(context, profileIds, monthStart, monthEnd),
@@ -110,13 +136,25 @@ export class DashboardService {
         this.getRecurringTemplates(context, profileIds, monthStart, monthEnd),
       ]);
 
+    const projectedRecurringTransactions = this.buildProjectedRecurringTransactions(
+      recurring,
+      monthTransactions,
+      monthStart,
+    );
+    const projectedMonthTransactions: DashboardMetricTransaction[] = [
+      ...monthTransactions,
+      ...projectedRecurringTransactions,
+    ];
+
     const today = new Date();
     const todayEnd = endOfDay(today);
     const currentTransactions = monthTransactions.filter(
       (transaction) => transaction.status === 'confirmed' && transaction.applicationDate <= todayEnd,
     );
     const currentFinancialTransactions = currentTransactions.filter((transaction) => !transaction.isInvoiceAdjustment);
-    const monthFinancialTransactions = monthTransactions.filter((transaction) => !transaction.isInvoiceAdjustment);
+    const monthFinancialTransactions = projectedMonthTransactions.filter(
+      (transaction) => !transaction.isInvoiceAdjustment,
+    );
     const previousMonthFinancialTransactions = previousMonthTransactions.filter(
       (transaction) => !transaction.isInvoiceAdjustment,
     );
@@ -195,7 +233,12 @@ export class DashboardService {
         mensal: plan.monthlyAmountCents,
         restante: Math.max(plan.totalInstallments - plan.paidInstallments, 0) * plan.monthlyAmountCents,
       })),
-      saldoMensal: await this.buildMonthlyBalances(profileIds, reference, context),
+      saldoMensal: await this.buildMonthlyBalances(
+        profileIds,
+        reference,
+        context,
+        projectedRecurringTransactions,
+      ),
       saldoDiario: saldoDiarioProjetado,
       saldoDiarioAtual,
       saldoDiarioProjetado,
@@ -234,12 +277,13 @@ export class DashboardService {
   ) {
     const accounts = await this.prisma.account.findMany({
       where: { memberProfileId: { in: profileIds } },
-      select: { id: true },
+      select: recurringAccountSelect,
     });
 
-    return this.prisma.recurringTemplate.findMany({
+    const templates = await this.prisma.recurringTemplate.findMany({
       where: {
         memberProfileId: { in: profileIds },
+        deletedAt: null,
         status: 'active',
         startsAt: { lte: monthEnd },
         OR: [{ endsAt: null }, { endsAt: { gte: monthStart } }],
@@ -248,8 +292,59 @@ export class DashboardService {
           accounts.map((account) => account.id),
         ),
       },
+      include: recurringTemplateInclude,
       orderBy: [{ dayOfMonth: 'asc' }],
-      take: 4,
+    });
+
+    const accountsById = new Map(accounts.map((account) => [account.id, account]));
+    return templates.flatMap((template) => {
+      const applicationDate = clampDayForMonth(monthStart, template.dayOfMonth);
+      if (!isRecurringOccurrenceWithinPeriod(applicationDate, template.startsAt, template.endsAt)) return [];
+      return [
+        {
+          ...template,
+          account: template.accountId ? (accountsById.get(template.accountId) ?? null) : null,
+        },
+      ];
+    });
+  }
+
+  private buildProjectedRecurringTransactions(
+    templates: DashboardRecurring[],
+    persistedTransactions: DashboardTransaction[],
+    monthStart: Date,
+  ): DashboardMetricTransaction[] {
+    const materializedTemplateIds = new Set(
+      persistedTransactions.flatMap((transaction) =>
+        transaction.recurringTemplateId ? [transaction.recurringTemplateId] : [],
+      ),
+    );
+    const materializedExternalIds = new Set(
+      persistedTransactions.flatMap((transaction) => (transaction.externalId ? [transaction.externalId] : [])),
+    );
+    const monthKey = monthStart.toISOString().slice(0, 7);
+
+    return templates.flatMap((template) => {
+      const externalId = `recurring:${template.id}:${monthKey}`;
+      if (materializedTemplateIds.has(template.id) || materializedExternalIds.has(externalId)) return [];
+
+      const applicationDate = clampDayForMonth(monthStart, template.dayOfMonth);
+      if (!isRecurringOccurrenceWithinPeriod(applicationDate, template.startsAt, template.endsAt)) return [];
+      return [
+        {
+          account: template.account,
+          amountCents: template.amountCents,
+          applicationDate,
+          category: template.category,
+          date: applicationDate,
+          description: template.description,
+          installmentNumber: null,
+          isInvoiceAdjustment: false,
+          isInvoicePayment: false,
+          status: 'pending' as const,
+          type: template.type,
+        },
+      ];
     });
   }
 
@@ -301,7 +396,7 @@ export class DashboardService {
     }, 0);
   }
 
-  private groupExpenseCategories(transactions: DashboardTransaction[]) {
+  private groupExpenseCategories(transactions: DashboardMetricTransaction[]) {
     const totals = new Map<string, { name: string; value: number; color: string }>();
 
     for (const transaction of transactions) {
@@ -329,7 +424,12 @@ export class DashboardService {
     return { top5, others, donutSlices };
   }
 
-  private async buildMonthlyBalances(profileIds: string[], reference: Date, context?: TenantContext) {
+  private async buildMonthlyBalances(
+    profileIds: string[],
+    reference: Date,
+    context?: TenantContext,
+    projectedReferenceTransactions: DashboardMetricTransaction[] = [],
+  ) {
     const firstMonth = addMonths(reference, -11);
     const start = startOfMonth(firstMonth);
     const end = endOfMonth(reference);
@@ -339,6 +439,7 @@ export class DashboardService {
         referenceMonth: { gte: start, lte: end },
         ...(context ? this.tenantScope.consistentTransactionRelations(context) : {}),
       },
+      include: { account: true },
       orderBy: { referenceMonth: 'asc' },
     });
 
@@ -348,7 +449,8 @@ export class DashboardService {
       const month = addMonths(firstMonth, index);
       const key = monthKey(month);
       const monthTransactions = transactions.filter((transaction) => monthKey(transaction.referenceMonth) === key);
-      runningBalance += accountBalanceCents(monthTransactions);
+      const projectedTransactions = key === monthKey(reference) ? projectedReferenceTransactions : [];
+      runningBalance += accountBalanceCents([...monthTransactions, ...projectedTransactions]);
       points.push({ m: SHORT_MONTHS[month.getUTCMonth()], v: runningBalance });
     }
     return points;
@@ -390,7 +492,7 @@ export class DashboardService {
     };
   }
 
-  private summarizeCreditCardInstallments(transactions: DashboardTransaction[]) {
+  private summarizeCreditCardInstallments(transactions: DashboardMetricTransaction[]) {
     const installments = transactions.filter(
       (transaction) =>
         transaction.type === 'expense' &&
@@ -597,6 +699,12 @@ function toDateKey(date: Date) {
   return date.toISOString().slice(0, 10);
 }
 
+function isRecurringOccurrenceWithinPeriod(applicationDate: Date, startsAt: Date, endsAt?: Date | null) {
+  const occurrence = toDateKey(applicationDate);
+  if (occurrence < toDateKey(startsAt)) return false;
+  return !endsAt || occurrence <= toDateKey(endsAt);
+}
+
 function normalizeText(value: string) {
   return value
     .normalize('NFD')
@@ -648,7 +756,7 @@ function readRawBoolean(raw: Prisma.JsonValue | undefined, key: string): boolean
 }
 
 function isInvoicePaymentTransaction(
-  transaction: Pick<DashboardTransaction, 'type' | 'description' | 'isInvoicePayment' | 'account' | 'category'>,
+  transaction: Pick<DashboardMetricTransaction, 'type' | 'description' | 'isInvoicePayment' | 'account' | 'category'>,
 ): boolean {
   if (transaction.isInvoicePayment) return true;
   if (transaction.type !== 'expense' || transaction.account?.type === 'credit_card') return false;
@@ -659,7 +767,7 @@ function isInvoicePaymentTransaction(
 }
 
 function expenseCategoryForDashboard(
-  transaction: Pick<DashboardTransaction, 'account' | 'category'>,
+  transaction: Pick<DashboardMetricTransaction, 'account' | 'category'>,
 ): { name: string; color?: string | null } {
   if (transaction.account?.type === 'credit_card') return CREDIT_CARD_CATEGORY;
   return {

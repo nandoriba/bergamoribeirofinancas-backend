@@ -5,6 +5,7 @@ import { TenantScopeService } from '../../prisma/tenant-scope.service';
 import { clampDayForMonth, endOfDay, endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
 import type { TenantContext } from '../../shared/tenant-context';
 import { CreateRecurringDto } from './dto/create-recurring.dto';
+import { ListRecurringQueryDto } from './dto/list-recurring-query.dto';
 import { UpdateRecurringDto } from './dto/update-recurring.dto';
 
 @Injectable()
@@ -14,14 +15,22 @@ export class RecurringService {
     private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
   ) {}
 
-  async list(context: TenantContext) {
+  async list(context: TenantContext, query: ListRecurringQueryDto = new ListRecurringQueryDto()) {
+    const profileIds = await this.tenantScope.resolveProfileIds(context, {
+      family: true,
+      profileId: query.profileId,
+    });
     const accounts = await this.prisma.account.findMany({
-      where: this.tenantScope.byFamilyProfiles(context),
-      select: { id: true },
+      where: {
+        memberProfileId: { in: profileIds },
+        ...this.tenantScope.byFamilyProfiles(context),
+      },
+      select: { id: true, name: true, type: true, memberProfileId: true },
     });
     const templates = await this.prisma.recurringTemplate.findMany({
       where: {
         deletedAt: null,
+        memberProfileId: { in: profileIds },
         ...this.tenantScope.byFamilyProfiles(context),
         ...this.tenantScope.consistentRecurringRelations(
           context,
@@ -35,7 +44,11 @@ export class RecurringService {
       orderBy: { createdAt: 'desc' },
     });
 
-    return templates;
+    const accountsById = new Map(accounts.map((account) => [account.id, account]));
+    return templates.map((template) => ({
+      ...template,
+      account: template.accountId ? (accountsById.get(template.accountId) ?? null) : null,
+    }));
   }
 
   async create(context: TenantContext, dto: CreateRecurringDto) {
@@ -131,6 +144,7 @@ export class RecurringService {
     for (const template of templates) {
       await this.validateRelations(context, template.accountId ?? undefined, template.categoryId ?? undefined);
       const applicationDate = clampDayForMonth(monthStart, template.dayOfMonth);
+      if (!isWithinTemplatePeriod(applicationDate, template.startsAt, template.endsAt)) continue;
       const externalId = `recurring:${template.id}:${monthStart.toISOString().slice(0, 7)}`;
       const transaction = await this.prisma.transaction.upsert({
         where: {
@@ -199,4 +213,10 @@ export class RecurringService {
 function normalizeOptionalText(value?: string | null) {
   const trimmed = value?.trim();
   return trimmed || undefined;
+}
+
+function isWithinTemplatePeriod(applicationDate: Date, startsAt: Date, endsAt?: Date | null) {
+  const occurrence = applicationDate.toISOString().slice(0, 10);
+  if (occurrence < startsAt.toISOString().slice(0, 10)) return false;
+  return !endsAt || occurrence <= endsAt.toISOString().slice(0, 10);
 }

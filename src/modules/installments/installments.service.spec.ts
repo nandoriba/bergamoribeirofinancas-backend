@@ -13,6 +13,14 @@ describe('InstallmentsService', () => {
     profileId: 'profile-1',
   });
 
+  function listTenantScope(profileIds: string[] = ['profile-1', 'inactive-profile']) {
+    return {
+      resolveProfileIds: vi.fn().mockResolvedValue(profileIds),
+      byFamilyProfiles: vi.fn().mockReturnValue({ memberProfile: { familyId: 'family-1' } }),
+      consistentTransactionRelations: vi.fn().mockReturnValue({ AND: [{ relations: 'consistent' }] }),
+    };
+  }
+
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -115,12 +123,15 @@ describe('InstallmentsService', () => {
 
   it('keeps the historical list scoped to every profile in the authenticated family', async () => {
     const findMany = vi.fn().mockResolvedValue([]);
-    const service = new InstallmentsService({
-      $queryRaw: vi.fn().mockResolvedValue([
-        { totalPurchaseCents: 0n, totalInstallments: 0n, totalAmountToPayCents: 0n },
-      ]),
-      installmentPlan: { findMany },
-    } as never);
+    const service = new InstallmentsService(
+      {
+        $queryRaw: vi.fn().mockResolvedValue([
+          { totalPurchaseCents: 0n, totalInstallments: 0n, totalAmountToPayCents: 0n },
+        ]),
+        installmentPlan: { findMany },
+      } as never,
+      listTenantScope() as never,
+    );
 
     await expect(service.list(context)).resolves.toEqual({
       items: [],
@@ -130,10 +141,15 @@ describe('InstallmentsService', () => {
 
     expect(findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { memberProfile: { familyId: 'family-1' } },
+        where: {
+          memberProfileId: { in: ['profile-1', 'inactive-profile'] },
+          memberProfile: { familyId: 'family-1' },
+        },
         include: expect.objectContaining({
           transactions: expect.objectContaining({
-            where: expect.objectContaining({ memberProfile: { familyId: 'family-1' } }),
+            where: expect.objectContaining({
+              memberProfileId: { in: ['profile-1', 'inactive-profile'] },
+            }),
           }),
         }),
       }),
@@ -153,7 +169,10 @@ describe('InstallmentsService', () => {
     const queryRaw = vi.fn().mockResolvedValue([
       { totalPurchaseCents: 13_000n, totalInstallments: 26n, totalAmountToPayCents: 6_500n },
     ]);
-    const service = new InstallmentsService({ $queryRaw: queryRaw, installmentPlan: { findMany } } as never);
+    const service = new InstallmentsService(
+      { $queryRaw: queryRaw, installmentPlan: { findMany } } as never,
+      listTenantScope() as never,
+    );
 
     const result = await service.list(context, { limit: 12 });
 
@@ -166,7 +185,10 @@ describe('InstallmentsService', () => {
     expect(result.pageInfo).toEqual({ hasNextPage: true, nextCursor: 'plan-12' });
     expect(findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { memberProfile: { familyId: 'family-1' } },
+        where: {
+          memberProfileId: { in: ['profile-1', 'inactive-profile'] },
+          memberProfile: { familyId: 'family-1' },
+        },
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         take: 13,
       }),
@@ -174,10 +196,66 @@ describe('InstallmentsService', () => {
     expect(queryRaw).toHaveBeenCalledOnce();
   });
 
+  it('uses one exact profile for plans, nested transactions and the aggregate summary', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const queryRaw = vi.fn().mockResolvedValue([
+      { totalPurchaseCents: 0n, totalInstallments: 0n, totalAmountToPayCents: 0n },
+    ]);
+    const tenantScope = listTenantScope(['inactive-profile']);
+    const service = new InstallmentsService(
+      { $queryRaw: queryRaw, installmentPlan: { findMany } } as never,
+      tenantScope as never,
+    );
+
+    await service.list(context, { limit: 12, profileId: 'inactive-profile' });
+
+    expect(tenantScope.resolveProfileIds).toHaveBeenCalledWith(context, {
+      family: true,
+      profileId: 'inactive-profile',
+    });
+    expect(findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          memberProfileId: { in: ['inactive-profile'] },
+          memberProfile: { familyId: 'family-1' },
+        },
+        include: expect.objectContaining({
+          transactions: expect.objectContaining({
+            where: expect.objectContaining({ memberProfileId: { in: ['inactive-profile'] } }),
+          }),
+        }),
+      }),
+    );
+    expect(queryRaw).toHaveBeenCalledOnce();
+    expect(queryRaw.mock.calls[0][0].values).toEqual(['family-1', 'inactive-profile']);
+  });
+
+  it('rejects a pending or foreign profile before querying plans or summaries', async () => {
+    const findFirst = vi.fn();
+    const findMany = vi.fn();
+    const queryRaw = vi.fn();
+    const tenantScope = listTenantScope();
+    tenantScope.resolveProfileIds.mockRejectedValue(new Error('Perfil inválido'));
+    const service = new InstallmentsService(
+      { $queryRaw: queryRaw, installmentPlan: { findFirst, findMany } } as never,
+      tenantScope as never,
+    );
+
+    await expect(
+      service.list(context, { limit: 12, profileId: 'pending-profile' }),
+    ).rejects.toThrow('Perfil inválido');
+    expect(findFirst).not.toHaveBeenCalled();
+    expect(findMany).not.toHaveBeenCalled();
+    expect(queryRaw).not.toHaveBeenCalled();
+  });
+
   it('rejects a cursor outside the authenticated family scope', async () => {
     const findFirst = vi.fn().mockResolvedValue(null);
     const findMany = vi.fn();
-    const service = new InstallmentsService({ installmentPlan: { findFirst, findMany } } as never);
+    const service = new InstallmentsService(
+      { installmentPlan: { findFirst, findMany } } as never,
+      listTenantScope() as never,
+    );
 
     await expect(
       service.list(context, { limit: 12, cursor: '00000000-0000-4000-8000-000000000002' }),
@@ -186,6 +264,7 @@ describe('InstallmentsService', () => {
     expect(findFirst).toHaveBeenCalledWith({
       where: {
         id: '00000000-0000-4000-8000-000000000002',
+        memberProfileId: { in: ['profile-1', 'inactive-profile'] },
         memberProfile: { familyId: 'family-1' },
       },
       select: { id: true },

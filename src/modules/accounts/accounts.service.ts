@@ -5,6 +5,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { TenantScopeService } from '../../prisma/tenant-scope.service';
 import type { TenantContext } from '../../shared/tenant-context';
 import { CreateAccountDto } from './dto/create-account.dto';
+import { ListAccountsQueryDto } from './dto/list-accounts-query.dto';
 import { UpdateAccountDto } from './dto/update-account.dto';
 
 @Injectable()
@@ -14,9 +15,16 @@ export class AccountsService {
     private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
   ) {}
 
-  list(context: TenantContext) {
+  async list(context: TenantContext, query: ListAccountsQueryDto = new ListAccountsQueryDto()) {
+    const profileIds = await this.tenantScope.resolveProfileIds(context, {
+      family: true,
+      profileId: query.profileId,
+    });
     return this.prisma.account.findMany({
-      where: this.tenantScope.byFamilyProfiles(context),
+      where: {
+        memberProfileId: { in: profileIds },
+        ...this.tenantScope.byFamilyProfiles(context),
+      },
       include: { memberProfile: { select: { id: true, displayName: true } } },
       orderBy: [{ type: 'asc' }, { name: 'asc' }],
     });

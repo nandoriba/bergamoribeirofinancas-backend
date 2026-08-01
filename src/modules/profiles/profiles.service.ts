@@ -15,19 +15,13 @@ export class ProfilesService {
     return this.prisma.memberProfile.findMany({
       where: {
         ...this.tenantScope.byFamily(context),
-        // Este endpoint alimenta o seletor de perfis disponíveis, não o histórico financeiro.
-        status: 'active',
+        // Perfis inativos preservam histórico financeiro; solicitações pendentes não entram no seletor.
+        status: { in: ['active', 'inactive'] },
       },
       select: {
         id: true,
         displayName: true,
         status: true,
-        user: {
-          select: {
-            email: true,
-            platformRole: true,
-          },
-        },
       },
       orderBy: { displayName: 'asc' },
     });

@@ -17,8 +17,9 @@ export class InvoicesService {
     private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
   ) {}
 
-  private invoiceInclude(context: TenantContext) {
+  private invoiceInclude(context: TenantContext, profileIds: string[] = [context.authorProfileId]) {
     const familyTransactions = {
+      memberProfileId: { in: profileIds },
       ...this.tenantScope.byFamilyProfiles(context),
       ...this.tenantScope.consistentTransactionRelations(context),
     };
@@ -51,8 +52,13 @@ export class InvoicesService {
   }
 
   async list(context: TenantContext, query: ListInvoicesQueryDto = new ListInvoicesQueryDto()) {
+    const profileIds = await this.tenantScope.resolveProfileIds(context, {
+      family: true,
+      profileId: query.profileId,
+    });
     const referenceMonth = query.referenceMonth ? parseMonth(query.referenceMonth) : undefined;
     const where = {
+      memberProfileId: { in: profileIds },
       ...this.tenantScope.byFamilyProfiles(context),
       ...this.tenantScope.consistentInvoiceRelations(context),
       ...(referenceMonth
@@ -70,7 +76,7 @@ export class InvoicesService {
 
     const rows = await this.prisma.invoice.findMany({
       where,
-      include: this.invoiceInclude(context),
+      include: this.invoiceInclude(context, profileIds),
       orderBy: [{ referenceMonth: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
       take: query.limit + 1,
       ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),

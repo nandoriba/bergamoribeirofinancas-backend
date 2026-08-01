@@ -1,9 +1,10 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 
 import { CurrentTenant } from '../../shared/current-tenant.decorator';
 import type { TenantContext } from '../../shared/tenant-context';
 import { AccountsService } from './accounts.service';
 import { CreateAccountDto } from './dto/create-account.dto';
+import { ListAccountsQueryDto } from './dto/list-accounts-query.dto';
 import { UpdateAccountDto } from './dto/update-account.dto';
 
 @Controller('accounts')
@@ -11,8 +12,8 @@ export class AccountsController {
   constructor(private readonly accountsService: AccountsService) {}
 
   @Get()
-  list(@CurrentTenant() context: TenantContext) {
-    return this.accountsService.list(context);
+  list(@CurrentTenant() context: TenantContext, @Query() query: ListAccountsQueryDto) {
+    return this.accountsService.list(context, query);
   }
 
   @Post()

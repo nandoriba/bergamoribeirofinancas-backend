@@ -17,15 +17,48 @@ describe('AccountsService', () => {
 
   it('lists the consolidated family view', async () => {
     const findMany = vi.fn().mockResolvedValue([]);
-    const service = new AccountsService({ account: { findMany } } as never);
+    const tenantScope = {
+      resolveProfileIds: vi.fn().mockResolvedValue(['profile-1', 'inactive-profile']),
+      byFamilyProfiles: vi.fn().mockReturnValue({ memberProfile: { familyId: 'family-1' } }),
+    };
+    const service = new AccountsService({ account: { findMany } } as never, tenantScope as never);
 
     await service.list(context);
 
+    expect(tenantScope.resolveProfileIds).toHaveBeenCalledWith(context, { family: true, profileId: undefined });
     expect(findMany).toHaveBeenCalledWith({
-      where: { memberProfile: { familyId: 'family-1' } },
+      where: {
+        memberProfileId: { in: ['profile-1', 'inactive-profile'] },
+        memberProfile: { familyId: 'family-1' },
+      },
       include: { memberProfile: { select: { id: true, displayName: true } } },
       orderBy: [{ type: 'asc' }, { name: 'asc' }],
     });
+  });
+
+  it('applies an exact same-family profile filter and rejects invalid profiles before querying accounts', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const resolveProfileIds = vi.fn().mockResolvedValueOnce(['inactive-profile']).mockRejectedValueOnce(
+      new Error('Perfil inválido'),
+    );
+    const tenantScope = {
+      resolveProfileIds,
+      byFamilyProfiles: vi.fn().mockReturnValue({ memberProfile: { familyId: 'family-1' } }),
+    };
+    const service = new AccountsService({ account: { findMany } } as never, tenantScope as never);
+
+    await service.list(context, { profileId: 'inactive-profile' });
+    expect(findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        where: {
+          memberProfileId: { in: ['inactive-profile'] },
+          memberProfile: { familyId: 'family-1' },
+        },
+      }),
+    );
+
+    await expect(service.list(context, { profileId: 'foreign-profile' })).rejects.toThrow('Perfil inválido');
+    expect(findMany).toHaveBeenCalledOnce();
   });
 
   it('blocks updates outside the author profile', async () => {
