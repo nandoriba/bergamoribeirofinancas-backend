@@ -8,7 +8,11 @@ import { randomUUID } from 'node:crypto';
 
 import { PrismaService } from '../../prisma/prisma.service';
 import {
-  requiredActionFromPendingPayment,
+  evaluateSubscriptionProjection,
+  SUBSCRIPTION_ACCESS_SELECT,
+} from '../payments/subscription-access.projection';
+import {
+  requiredActionFromSubscriptionAccess,
   type AuthenticatedUser,
   type JwtPayload,
 } from './auth.types';
@@ -16,7 +20,14 @@ import {
 const DUMMY_PASSWORD_HASH = '$2a$12$if2i1aU0zMN0sCeQf1OH2uyr2PwSJfsiaiVxNoRMV.v8KuvXLmjbC';
 const SESSION_USER_INCLUDE = {
   profile: true,
-  family: { select: { name: true, ownerUserId: true, pendingPaymentExpiresAt: true } },
+  family: {
+    select: {
+      name: true,
+      ownerUserId: true,
+      pendingPaymentExpiresAt: true,
+      currentSubscription: { select: SUBSCRIPTION_ACCESS_SELECT },
+    },
+  },
 } as const;
 
 type SessionUserRecord = Prisma.UserGetPayload<{ include: typeof SESSION_USER_INCLUDE }>;
@@ -107,10 +118,15 @@ export class AuthService {
       include: SESSION_USER_INCLUDE,
     });
 
+    const subscriptionAccess = evaluateSubscriptionProjection(
+      dbUser.family.currentSubscription,
+    );
+
     return this.serializeUser(
       {
         ...user,
-        requiredAction: requiredActionFromPendingPayment(dbUser.family.pendingPaymentExpiresAt),
+        requiredAction: requiredActionFromSubscriptionAccess(subscriptionAccess),
+        subscriptionAccess,
       },
       dbUser.name,
       dbUser.themePreference,
@@ -124,6 +140,9 @@ export class AuthService {
       throw new UnauthorizedException('Usuário pendente ou inativo');
     }
 
+    const subscriptionAccess = evaluateSubscriptionProjection(
+      user.family.currentSubscription,
+    );
     const authUser: AuthenticatedUser = {
       id: user.id,
       email: user.email,
@@ -131,7 +150,8 @@ export class AuthService {
       tenantRole: user.family.ownerUserId === user.id ? 'owner' : 'member',
       familyId: user.familyId,
       profileId: user.profile.id,
-      requiredAction: requiredActionFromPendingPayment(user.family.pendingPaymentExpiresAt),
+      requiredAction: requiredActionFromSubscriptionAccess(subscriptionAccess),
+      subscriptionAccess,
     };
 
     return {
@@ -180,6 +200,8 @@ export class AuthService {
       profileId: user.profileId,
       themePreference,
       requiredAction: user.requiredAction,
+      effectiveStatus: user.subscriptionAccess?.effectiveStatus ?? 'suspended',
+      accessAllowed: user.subscriptionAccess?.accessAllowed ?? false,
       ...(supportEmail ? { supportEmail } : {}),
       ...(pendingPaymentExpiresAt
         ? { pendingPaymentExpiresAt: pendingPaymentExpiresAt.toISOString() }

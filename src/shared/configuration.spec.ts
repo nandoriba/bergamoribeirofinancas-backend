@@ -306,27 +306,137 @@ describe('validateConfig', () => {
     ).toThrow();
   });
 
-  it('aceita onboarding explicitamente habilitado somente com configuração completa', () => {
+  it('rejeita onboarding enquanto esta build não suporta contrato positivo comprovado', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        OWNER_SIGNUP_ENABLED: 'true',
+        EMAIL_PROVIDER: 'resend',
+        ACTION_TOKEN_SECRET: 'a'.repeat(32),
+        EMAIL_OUTBOX_SECRET: 'e'.repeat(32),
+        RESEND_API_KEY: 're_secret',
+        EMAIL_FROM: 'Finanças <hello@example.com>',
+        SUPPORT_EMAIL: 'support@example.com',
+        PUBLIC_API_ORIGIN: 'http://127.0.0.1:8180',
+        ...abacatePayDevConfig,
+        ABACATEPAY_WEBHOOK_ENABLED: 'true',
+        ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED: 'true',
+        ABACATEPAY_DEV_WEBHOOK_SECRET: 'w'.repeat(32),
+        ABACATEPAY_ENTITLEMENT_ENABLED: 'true',
+        ABACATEPAY_ENTITLEMENT_CONTRACT_VERSION: 'sandbox-contract-v1',
+      }),
+    ).toThrow();
+  });
+
+  it('mantém webhook e entitlement desabilitados por padrão', () => {
     const config = validateConfig({
       ...requiredConfig,
       JWT_SECRET: 'x'.repeat(32),
-      OWNER_SIGNUP_ENABLED: 'true',
-      EMAIL_PROVIDER: 'resend',
-      ACTION_TOKEN_SECRET: 'a'.repeat(32),
-      EMAIL_OUTBOX_SECRET: 'e'.repeat(32),
-      RESEND_API_KEY: 're_secret',
-      EMAIL_FROM: 'Finanças <hello@example.com>',
-      SUPPORT_EMAIL: 'support@example.com',
-      PUBLIC_API_ORIGIN: 'http://127.0.0.1:8180',
-      ...abacatePayDevConfig,
     });
 
     expect(config).toMatchObject({
-      OWNER_SIGNUP_ENABLED: true,
-      EMAIL_PROVIDER: 'resend',
-      LEGAL_BUNDLE_VERSION: '2026-08-01',
-      ABACATEPAY_ENABLED: true,
+      ABACATEPAY_WEBHOOK_ENABLED: false,
+      ABACATEPAY_WEBHOOK_HMAC_MODE: 'registered_secret',
+      ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED: false,
+      ABACATEPAY_PENDING_EXPIRY_CONTRACT_CONFIRMED: false,
+      ABACATEPAY_ENTITLEMENT_ENABLED: false,
+      RETENTION_CANCELLED_MONTHS: 12,
+      RETENTION_PURGE_MAX_AGE_HOURS: 48,
     });
+  });
+
+  it('mantém o cadastro bloqueado sem prova de expiração do checkout pendente', () => {
+    try {
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        OWNER_SIGNUP_ENABLED: 'true',
+        EMAIL_PROVIDER: 'resend',
+        ACTION_TOKEN_SECRET: 'a'.repeat(32),
+        EMAIL_OUTBOX_SECRET: 'e'.repeat(32),
+        RESEND_API_KEY: 're_secret',
+        EMAIL_FROM: 'Finanças <hello@example.com>',
+        SUPPORT_EMAIL: 'support@example.com',
+        PUBLIC_API_ORIGIN: 'http://127.0.0.1:8180',
+        ...abacatePayDevConfig,
+        ABACATEPAY_WEBHOOK_ENABLED: 'true',
+        ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED: 'true',
+        ABACATEPAY_DEV_WEBHOOK_SECRET: 'w'.repeat(32),
+        ABACATEPAY_ENTITLEMENT_ENABLED: 'true',
+        ABACATEPAY_ENTITLEMENT_CONTRACT_VERSION: 'sandbox-contract-v1',
+      });
+      throw new Error('A configuração deveria ter sido rejeitada.');
+    } catch (error) {
+      const issues = (error as { issues?: Array<{ path?: unknown[] }> }).issues;
+      expect(issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: ['ABACATEPAY_PENDING_EXPIRY_CONTRACT_CONFIRMED'],
+          }),
+        ]),
+      );
+    }
+  });
+
+  it('rejeita webhook sem confirmação e secret registrado do ambiente', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ...abacatePayDevConfig,
+        ABACATEPAY_WEBHOOK_ENABLED: 'true',
+      }),
+    ).toThrow();
+  });
+
+  it('aceita shadow webhook sem habilitar entitlement positivo', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+      ...abacatePayDevConfig,
+      ABACATEPAY_WEBHOOK_ENABLED: 'true',
+      ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED: 'true',
+      ABACATEPAY_DEV_WEBHOOK_SECRET: 'h'.repeat(32),
+    });
+
+    expect(config).toMatchObject({
+      ABACATEPAY_WEBHOOK_ENABLED: true,
+      ABACATEPAY_ENTITLEMENT_ENABLED: false,
+    });
+  });
+
+  it('rejeita entitlement sem versão do contrato mensal e modos HMAC alternativos', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ...abacatePayDevConfig,
+        ABACATEPAY_WEBHOOK_ENABLED: 'true',
+        ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED: 'true',
+        ABACATEPAY_DEV_WEBHOOK_SECRET: 'h'.repeat(32),
+        ABACATEPAY_ENTITLEMENT_ENABLED: 'true',
+      }),
+    ).toThrow();
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ...abacatePayDevConfig,
+        ABACATEPAY_WEBHOOK_ENABLED: 'true',
+        ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED: 'true',
+        ABACATEPAY_DEV_WEBHOOK_SECRET: 'h'.repeat(32),
+        ABACATEPAY_ENTITLEMENT_ENABLED: 'true',
+        ABACATEPAY_ENTITLEMENT_CONTRACT_VERSION: 'unproven-v1',
+      }),
+    ).toThrow();
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ABACATEPAY_WEBHOOK_HMAC_MODE: 'public_key',
+      }),
+    ).toThrow();
   });
 
   it('rejeita cooldown que possa sobreviver ao código ou link emitido', () => {

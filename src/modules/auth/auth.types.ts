@@ -1,12 +1,14 @@
 import { PlatformRole } from '@prisma/client';
 
+import type { SubscriptionAccessDecision } from '../payments/subscription-access.policy';
+
 export type TenantRole = 'owner' | 'member';
 export type RequiredAction = 'payment' | null;
 
-export function requiredActionFromPendingPayment(
-  pendingPaymentExpiresAt: Date | null,
+export function requiredActionFromSubscriptionAccess(
+  access: SubscriptionAccessDecision,
 ): RequiredAction {
-  return pendingPaymentExpiresAt === null ? null : 'payment';
+  return access.accessAllowed ? null : 'payment';
 }
 
 export interface AuthenticatedUser {
@@ -21,6 +23,8 @@ export interface AuthenticatedUser {
    * non-HTTP tenant contexts that predate the onboarding access gate.
    */
   requiredAction?: RequiredAction;
+  /** Freshly derived from the current subscription by JwtStrategy on every request. */
+  subscriptionAccess?: SubscriptionAccessDecision;
 }
 
 export interface JwtPayload {

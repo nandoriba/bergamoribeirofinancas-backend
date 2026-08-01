@@ -1,6 +1,10 @@
-import { SetMetadata } from '@nestjs/common';
+import {
+  ALLOW_BLOCKED_TENANT_ACCESS_KEY,
+  AllowBlockedTenantAccess,
+} from './allow-blocked-tenant-access.decorator';
 
-export const ALLOW_PENDING_PAYMENT_ACCESS_KEY = 'allowPendingPaymentAccess';
+/** @deprecated Use AllowBlockedTenantAccess for every fail-closed subscription state. */
+export const ALLOW_PENDING_PAYMENT_ACCESS_KEY = ALLOW_BLOCKED_TENANT_ACCESS_KEY;
 
-export const AllowPendingPaymentAccess = () =>
-  SetMetadata(ALLOW_PENDING_PAYMENT_ACCESS_KEY, true);
+/** @deprecated Use AllowBlockedTenantAccess. Kept as a compatibility alias. */
+export const AllowPendingPaymentAccess = AllowBlockedTenantAccess;

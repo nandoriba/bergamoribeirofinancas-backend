@@ -22,6 +22,8 @@
     "prisma:seed": "tsx prisma/seed.ts",
     "telegram:set-webhook": "tsx scripts/set-telegram-webhook.ts",
     "abacatepay:sandbox:probe": "tsx test/contracts/abacatepay-sandbox.contract.ts",
+    "retention:purge": "tsx scripts/run-tenant-retention.ts",
+    "retention:check": "tsx scripts/check-tenant-retention.ts",
     "backfill:credit-card-invoices": "tsx prisma/backfill-credit-card-invoices.ts"
   },
   "dependencies": {
@@ -39,6 +41,7 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
     "cookie-parser": "^1.4.7",
+    "express": "^4.22.1",
     "helmet": "^8.0.0",
     "jose": "^5.10.0",
     "passport": "^0.7.0",

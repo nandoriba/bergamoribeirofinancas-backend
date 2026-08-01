@@ -128,7 +128,7 @@ describe('AuthService', () => {
     );
   });
 
-  it('keeps legacy families with no pending-payment timestamp in normal app access', async () => {
+  it('falha fechado para família legada sem assinatura autoritativa', async () => {
     const { prisma, service } = setup();
     vi.mocked(prisma.user.findUnique).mockResolvedValue({
       id: 'legacy-user',
@@ -147,7 +147,11 @@ describe('AuthService', () => {
     (bcrypt.compare as unknown as { mockResolvedValue(value: boolean): void }).mockResolvedValue(true);
 
     await expect(service.login('legacy@example.com', 'correct-password')).resolves.toMatchObject({
-      user: { requiredAction: null },
+      user: {
+        requiredAction: 'payment',
+        effectiveStatus: 'pending_payment',
+        accessAllowed: false,
+      },
     });
   });
 

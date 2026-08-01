@@ -2,7 +2,7 @@
 
 ## Estado de rollout
 
-`OWNER_SIGNUP_ENABLED` deve permanecer `false` até o webhook autoritativo, o paywall derivado e o contrato mensal do sandbox estarem publicados e validados. A implementação atual já é fail-closed: famílias criadas pelo onboarding recebem `pendingPaymentExpiresAt`, a sessão deriva `requiredAction=payment` e o guard global nega módulos financeiros. Além de `/auth/me` e `/auth/logout`, somente a consulta de assinatura e a criação de checkout possuem allowlist explícita para essa sessão.
+`OWNER_SIGNUP_ENABLED` deve permanecer `false` até o webhook autoritativo e o contrato mensal do sandbox estarem validados. A implementação atual já é fail-closed: famílias criadas pelo onboarding recebem `pendingPaymentExpiresAt`, a sessão deriva `requiredAction=payment` e o guard global nega módulos financeiros. Além de `/auth/me` e `/auth/logout`, somente consulta da assinatura, criação de checkout e reconciliação possuem allowlist explícita para essa sessão. Eventos positivos permanecem em quarentena até a evidência contratual descrita em [ABACATEPAY_WEBHOOK_PAYWALL_RETENTION.md](ABACATEPAY_WEBHOOK_PAYWALL_RETENTION.md).
 
 O fluxo por e-mail também exige `EMAIL_PROVIDER=resend`, canal de suporte e segredos independentes. A aplicação falha na inicialização se a combinação estiver incompleta.
 
@@ -69,7 +69,7 @@ Os segredos de token, outbox, OAuth e JWT devem ser diferentes. Em produção, `
 - Preencher controlador, endereço, encarregado/canal de privacidade e operadores reais.
 - Confirmar domínio remetente no Resend e testar entrega, bounce e rate limits.
 - Gerar segredos independentes no cofre do ambiente.
-- Validar backup/restauração e o job futuro de purge de cadastros expirados.
+- Validar backup/restauração, agendar `retention:purge` diariamente e alertar via `retention:check`.
 - Executar unitários, integração PostgreSQL, E2E e smoke test no ambiente integrado.
 
 ## Referências técnicas e legais

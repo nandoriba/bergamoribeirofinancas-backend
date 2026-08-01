@@ -17,6 +17,7 @@ import { JobsModule } from './modules/jobs/jobs.module';
 import { MemberApprovalsModule } from './modules/member-approvals/member-approvals.module';
 import { MemberInvitesModule } from './modules/member-invites/member-invites.module';
 import { PaymentsModule } from './modules/payments/payments.module';
+import { SubscriptionAccessGuard } from './modules/payments/subscription-access.guard';
 import { ProfilesModule } from './modules/profiles/profiles.module';
 import { RecurringModule } from './modules/recurring/recurring.module';
 import { ReportsModule } from './modules/reports/reports.module';
@@ -68,6 +69,10 @@ import { configuration, validateConfig } from './shared/configuration';
     {
       provide: APP_GUARD,
       useClass: JwtAuthGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: SubscriptionAccessGuard,
     },
   ],
 })

@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   ServiceUnavailableException,
@@ -13,6 +14,10 @@ import type { CookieOptions } from 'express';
 
 import { PrismaService } from '../../prisma/prisma.service';
 import { timingSafeStringEqual } from '../../shared/timing-safe-string-equal';
+import {
+  evaluateSubscriptionProjection,
+  SUBSCRIPTION_ACCESS_SELECT,
+} from '../payments/subscription-access.projection';
 import type { AuthenticatedUser } from './auth.types';
 import { AuthService } from './auth.service';
 import type { StartGoogleOAuthDto } from './dto/start-google-oauth.dto';
@@ -163,6 +168,12 @@ export class GoogleOAuthService {
       ) {
         throw new GoogleOAuthFlowError('failed');
       }
+      if (
+        attempt.intent === OAuthIntent.link_account &&
+        input.currentUser?.subscriptionAccess?.accessAllowed !== true
+      ) {
+        throw new GoogleOAuthFlowError('failed');
+      }
       if (attempt.intent === OAuthIntent.signup_owner && input.currentUser) {
         throw new GoogleOAuthFlowError('failed');
       }
@@ -221,6 +232,10 @@ export class GoogleOAuthService {
             familyName: attempt.signupFamilyName,
             legalAcceptanceVersion: attempt.legalAcceptanceVersion,
             legalAcceptedAt: attempt.legalAcceptedAt,
+          });
+          await this.prisma.oAuthAttempt.update({
+            where: { id: attempt.id },
+            data: { authenticatedUserId: session.user.id },
           });
           return {
             token: session.token,
@@ -352,8 +367,14 @@ export class GoogleOAuthService {
       });
     }
 
-    if (dto.intent === OAuthIntent.link_account) {
+      if (dto.intent === OAuthIntent.link_account) {
       if (!currentUser) throw new UnauthorizedException();
+      if (currentUser.subscriptionAccess?.accessAllowed !== true) {
+        throw new ForbiddenException({
+          code: 'SUBSCRIPTION_ACCESS_REQUIRED',
+          message: 'A assinatura atual não permite vincular um novo método de acesso.',
+        });
+      }
       if (!dto.currentPassword) throw new BadRequestException('Confirme sua senha atual.');
       if (this.hasOwnerSignupFields(dto)) {
         throw new BadRequestException('Dados incompatíveis com o vínculo de conta.');
@@ -472,10 +493,24 @@ export class GoogleOAuthService {
             select: {
               id: true,
               isActive: true,
+              familyId: true,
               profile: { select: { status: true } },
             },
           });
           if (!user || !user.isActive || user.profile?.status !== 'active') {
+            throw new GoogleOAuthFlowError('failed');
+          }
+          await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT "id" FROM "Family" WHERE "id" = ${user.familyId} FOR UPDATE
+          `;
+          const family = await tx.family.findUnique({
+            where: { id: user.familyId },
+            select: { currentSubscription: { select: SUBSCRIPTION_ACCESS_SELECT } },
+          });
+          if (
+            !family ||
+            !evaluateSubscriptionProjection(family.currentSubscription).accessAllowed
+          ) {
             throw new GoogleOAuthFlowError('failed');
           }
 

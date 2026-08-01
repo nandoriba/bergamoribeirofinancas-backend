@@ -103,7 +103,40 @@ const baseSchema = z.object({
   ABACATEPAY_RETRY_MAX: z.coerce.number().int().min(1).max(10).default(3),
   ABACATEPAY_RETRY_EVERY_DAYS: z.coerce.number().int().min(1).max(30).default(2),
   ABACATEPAY_CHECKOUT_LOCK_SECONDS: z.coerce.number().int().min(30).max(600).default(90),
+  ABACATEPAY_WEBHOOK_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  ABACATEPAY_WEBHOOK_HMAC_MODE: z.literal('registered_secret').default('registered_secret'),
+  ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  ABACATEPAY_PENDING_EXPIRY_CONTRACT_CONFIRMED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  ABACATEPAY_DEV_WEBHOOK_SECRET: optionalSecret,
+  ABACATEPAY_PROD_WEBHOOK_SECRET: optionalSecret,
+  ABACATEPAY_ENTITLEMENT_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  ABACATEPAY_ENTITLEMENT_CONTRACT_VERSION: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z.string().trim().regex(/^[A-Za-z0-9._-]{1,64}$/).optional(),
+  ),
+  ABACATEPAY_GRACE_DAYS: z.coerce.number().int().min(0).max(30).default(3),
+  RETENTION_CANCELLED_MONTHS: z.coerce.number().int().min(1).max(120).default(12),
+  RETENTION_PURGE_BATCH_SIZE: z.coerce.number().int().min(1).max(250).default(50),
+  RETENTION_PURGE_LEASE_SECONDS: z.coerce.number().int().min(60).max(3_600).default(900),
+  RETENTION_PURGE_MAX_AGE_HOURS: z.coerce.number().int().min(1).max(48).default(48),
 });
+
+// Positive entitlement requires a versioned implementation backed by a real
+// sandbox trace for HMAC, monthly boundaries, end-of-month and late retry.
+// The empty allowlist makes an accidental flag flip fail during startup.
+const supportedEntitlementContractVersions = new Set<string>();
 
 const schema = baseSchema.superRefine((config, context) => {
   const webOrigins = config.WEB_ORIGIN.split(',').map((origin) => origin.trim());
@@ -247,6 +280,21 @@ const schema = baseSchema.superRefine((config, context) => {
         message: 'O cadastro público exige checkout AbacatePay configurado.',
       });
     }
+    if (!config.ABACATEPAY_ENTITLEMENT_ENABLED) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ABACATEPAY_ENTITLEMENT_ENABLED'],
+        message: 'O cadastro público exige o contrato autoritativo de entitlement habilitado.',
+      });
+    }
+    if (!config.ABACATEPAY_PENDING_EXPIRY_CONTRACT_CONFIRMED) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ABACATEPAY_PENDING_EXPIRY_CONTRACT_CONFIRMED'],
+        message:
+          'O cadastro público exige prova no sandbox de expiração ou invalidação segura do checkout pendente.',
+      });
+    }
   }
 
   for (const key of ['ABACATEPAY_DEV_API_URL', 'ABACATEPAY_PROD_API_URL'] as const) {
@@ -296,6 +344,59 @@ const schema = baseSchema.superRefine((config, context) => {
     }
   }
 
+  if (config.ABACATEPAY_WEBHOOK_ENABLED) {
+    if (!config.ABACATEPAY_ENABLED) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ABACATEPAY_WEBHOOK_ENABLED'],
+        message: 'O webhook exige a integração AbacatePay habilitada.',
+      });
+    }
+    if (!config.ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ABACATEPAY_WEBHOOK_CONTRACT_CONFIRMED'],
+        message: 'Confirme explicitamente o contrato de secret cadastrado e HMAC antes de habilitar.',
+      });
+    }
+    const webhookSecret =
+      config.NODE_ENV === 'production'
+        ? config.ABACATEPAY_PROD_WEBHOOK_SECRET
+        : config.ABACATEPAY_DEV_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [
+          config.NODE_ENV === 'production'
+            ? 'ABACATEPAY_PROD_WEBHOOK_SECRET'
+            : 'ABACATEPAY_DEV_WEBHOOK_SECRET',
+        ],
+        message: 'Informe um secret de webhook exclusivo para o ambiente atual.',
+      });
+    }
+  }
+
+  if (config.ABACATEPAY_ENTITLEMENT_ENABLED) {
+    if (!config.ABACATEPAY_WEBHOOK_ENABLED || !config.ABACATEPAY_ENTITLEMENT_CONTRACT_VERSION) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ABACATEPAY_ENTITLEMENT_ENABLED'],
+        message: 'Entitlement exige webhook habilitado e versão do contrato mensal comprovado.',
+      });
+    }
+    if (
+      config.ABACATEPAY_ENTITLEMENT_CONTRACT_VERSION &&
+      !supportedEntitlementContractVersions.has(config.ABACATEPAY_ENTITLEMENT_CONTRACT_VERSION)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ABACATEPAY_ENTITLEMENT_CONTRACT_VERSION'],
+        message:
+          'Esta build não possui uma versão de contrato mensal comprovada e habilitável.',
+      });
+    }
+  }
+
   if (
     config.ABACATEPAY_CHECKOUT_LOCK_SECONDS * 1_000 <
     config.ABACATEPAY_TIMEOUT_MS * 2 + 15_000
@@ -307,9 +408,19 @@ const schema = baseSchema.superRefine((config, context) => {
     });
   }
 
+  if (config.RETENTION_PURGE_LEASE_SECONDS < config.ABACATEPAY_CHECKOUT_LOCK_SECONDS) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['RETENTION_PURGE_LEASE_SECONDS'],
+      message: 'A janela de segurança da retenção deve cobrir o lease do checkout.',
+    });
+  }
+
   if (
     config.NODE_ENV !== 'production' &&
-    (config.ABACATEPAY_PROD_API_KEY || config.ABACATEPAY_PROD_MONTHLY_PRODUCT_ID)
+    (config.ABACATEPAY_PROD_API_KEY ||
+      config.ABACATEPAY_PROD_MONTHLY_PRODUCT_ID ||
+      config.ABACATEPAY_PROD_WEBHOOK_SECRET)
   ) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
@@ -375,7 +486,11 @@ const schema = baseSchema.superRefine((config, context) => {
     });
   }
 
-  for (const key of ['ABACATEPAY_DEV_API_KEY', 'ABACATEPAY_DEV_MONTHLY_PRODUCT_ID'] as const) {
+  for (const key of [
+    'ABACATEPAY_DEV_API_KEY',
+    'ABACATEPAY_DEV_MONTHLY_PRODUCT_ID',
+    'ABACATEPAY_DEV_WEBHOOK_SECRET',
+  ] as const) {
     if (config[key]) {
       context.addIssue({
         code: z.ZodIssueCode.custom,

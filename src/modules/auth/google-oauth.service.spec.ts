@@ -17,6 +17,29 @@ const currentUser: AuthenticatedUser = {
   tenantRole: 'member',
   familyId: 'family-1',
   profileId: 'profile-1',
+  requiredAction: null,
+  subscriptionAccess: {
+    effectiveStatus: 'active',
+    accessAllowed: true,
+    reason: 'PAID_ACCESS',
+  },
+};
+
+const activeSubscription = {
+  providerStatus: 'ACTIVE',
+  lastProviderEvent: 'subscription.renewed',
+  providerUpdatedAt: new Date('2026-07-01T12:00:01.000Z'),
+  lastSuccessfulPaymentAt: new Date('2026-07-01T12:00:00.000Z'),
+  accessPaidThrough: new Date(Date.now() + 86_400_000),
+  paymentFailedAt: null,
+  graceUntil: null,
+  cancelledAt: null,
+  cancelRequestedAt: null,
+  cancelledDueTo: null,
+  lastInstallmentNumber: 2,
+  entitlementContractVersion: 'sandbox-contract-v1',
+  billingCycle: 'MONTHLY',
+  paymentMethod: 'CARD',
 };
 
 function setup(configOverrides: Record<string, unknown> = {}) {
@@ -44,7 +67,11 @@ function setup(configOverrides: Record<string, unknown> = {}) {
   let storedAttempt: Record<string, unknown> | undefined;
 
   const tx = {
+    $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-1' }]),
     user: { findUnique: vi.fn() },
+    family: {
+      findUnique: vi.fn().mockResolvedValue({ currentSubscription: activeSubscription }),
+    },
     userIdentity: {
       findUnique: vi.fn(),
       create: vi.fn(),
@@ -72,6 +99,7 @@ function setup(configOverrides: Record<string, unknown> = {}) {
       findMany: vi.fn().mockResolvedValue([]),
       deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      update: vi.fn().mockResolvedValue({ id: 'attempt-1' }),
     },
     user: { findUnique: vi.fn() },
     userIdentity: {
@@ -91,7 +119,7 @@ function setup(configOverrides: Record<string, unknown> = {}) {
   const ownerOnboarding = {
     completeGoogleOwnerSignup: vi.fn().mockResolvedValue({
       token: 'owner-session-token',
-      user: { requiredAction: 'payment' },
+      user: { id: 'owner-user', requiredAction: 'payment' },
     }),
   } as unknown as OwnerOnboardingService;
   const oidcClient = {
@@ -431,7 +459,14 @@ describe('GoogleOAuthService', () => {
   });
 
   it('completes Google owner signup exclusively from persisted attempt facts and verified identity', async () => {
-    const { getAuthorizationInput, getStoredAttempt, oidcClient, ownerOnboarding, service } = setup();
+    const {
+      getAuthorizationInput,
+      getStoredAttempt,
+      oidcClient,
+      ownerOnboarding,
+      prisma,
+      service,
+    } = setup();
     const start = await service.start({
       intent: OAuthIntent.signup_owner,
       ownerName: 'Ana Silva',
@@ -460,6 +495,10 @@ describe('GoogleOAuthService', () => {
       legalAcceptedAt: attempt?.legalAcceptedAt,
     });
     expect(result.token).toBe('owner-session-token');
+    expect(prisma.oAuthAttempt.update).toHaveBeenCalledWith({
+      where: { id: 'attempt-1' },
+      data: { authenticatedUserId: 'owner-user' },
+    });
     const redirect = new URL(result.redirectUrl);
     expect(redirect.pathname).toBe('/pagamento/pendente');
     expect(redirect.search).toBe('');
@@ -718,6 +757,7 @@ describe('GoogleOAuthService', () => {
     tx.user.findUnique.mockResolvedValue({
       id: 'local-user',
       isActive: true,
+      familyId: 'family-1',
       profile: { status: 'active' },
     });
     tx.userIdentity.findUnique.mockResolvedValue(null);

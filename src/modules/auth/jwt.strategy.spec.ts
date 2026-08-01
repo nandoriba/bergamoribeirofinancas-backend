@@ -55,6 +55,11 @@ describe('JwtStrategy', () => {
       familyId: 'real-family',
       profileId: 'real-profile',
       requiredAction: 'payment',
+      subscriptionAccess: {
+        effectiveStatus: 'pending_payment',
+        accessAllowed: false,
+        reason: 'SUBSCRIPTION_ABSENT',
+      },
     });
   });
 

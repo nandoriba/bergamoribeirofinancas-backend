@@ -1,10 +1,9 @@
-import { ForbiddenException, type ExecutionContext } from '@nestjs/common';
+import { type ExecutionContext } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { AuthGuard } from '@nestjs/passport';
 import { PlatformRole } from '@prisma/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ALLOW_PENDING_PAYMENT_ACCESS_KEY } from '../../shared/allow-pending-payment-access.decorator';
 import { IS_PUBLIC_KEY } from '../../shared/public.decorator';
 import type { AuthenticatedUser } from './auth.types';
 import { JwtAuthGuard } from './jwt-auth.guard';
@@ -68,40 +67,8 @@ describe('JwtAuthGuard', () => {
     expect(passportCanActivate).toHaveBeenCalledWith(context);
   });
 
-  it('denies pending-payment sessions by default after JWT authentication', async () => {
-    const { context, handler, TestController } = createContext(pendingPaymentUser);
-    const reflector = {
-      getAllAndOverride: vi.fn((key: string) =>
-        key === IS_PUBLIC_KEY ? undefined : undefined,
-      ),
-    };
-    vi.spyOn(AuthGuard('jwt').prototype, 'canActivate').mockResolvedValue(true);
-    const guard = new JwtAuthGuard(reflector as unknown as Reflector);
-
-    await expect(guard.canActivate(context)).rejects.toEqual(
-      new ForbiddenException({ code: 'PAYMENT_REQUIRED', message: 'Pagamento pendente' }),
-    );
-    expect(reflector.getAllAndOverride).toHaveBeenCalledWith(
-      ALLOW_PENDING_PAYMENT_ACCESS_KEY,
-      [handler, TestController],
-    );
-  });
-
-  it('allows only explicitly annotated protected routes for pending-payment sessions', async () => {
+  it('autentica sessão bloqueada sem aplicar política de assinatura neste guard', async () => {
     const { context } = createContext(pendingPaymentUser);
-    const reflector = {
-      getAllAndOverride: vi.fn((key: string) =>
-        key === ALLOW_PENDING_PAYMENT_ACCESS_KEY ? true : undefined,
-      ),
-    };
-    vi.spyOn(AuthGuard('jwt').prototype, 'canActivate').mockResolvedValue(true);
-    const guard = new JwtAuthGuard(reflector as unknown as Reflector);
-
-    await expect(guard.canActivate(context)).resolves.toBe(true);
-  });
-
-  it('allows normal app sessions without requiring opt-in metadata', async () => {
-    const { context } = createContext({ ...pendingPaymentUser, requiredAction: null });
     const reflector = {
       getAllAndOverride: vi.fn().mockReturnValue(undefined),
     };

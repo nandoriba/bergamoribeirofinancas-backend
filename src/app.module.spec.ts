@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import { AppModule } from './app.module';
 import { JwtAuthGuard } from './modules/auth/jwt-auth.guard';
+import { SubscriptionAccessGuard } from './modules/payments/subscription-access.guard';
 
 describe('guards globais do AppModule', () => {
   it('registra rate limiting antes da autenticação JWT', () => {
@@ -16,6 +17,10 @@ describe('guards globais do AppModule', () => {
       .filter((provider) => provider?.provide === APP_GUARD)
       .map((provider) => provider.useClass);
 
-    expect(globalGuardClasses).toEqual([ThrottlerGuard, JwtAuthGuard]);
+    expect(globalGuardClasses).toEqual([
+      ThrottlerGuard,
+      JwtAuthGuard,
+      SubscriptionAccessGuard,
+    ]);
   });
 });

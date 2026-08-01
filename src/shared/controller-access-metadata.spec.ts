@@ -9,6 +9,8 @@ import { HealthController } from '../modules/health/health.controller';
 import { MemberApprovalsController } from '../modules/member-approvals/member-approvals.controller';
 import { MemberInvitesController } from '../modules/member-invites/member-invites.controller';
 import { ProfilesController } from '../modules/profiles/profiles.controller';
+import { PaymentsController } from '../modules/payments/payments.controller';
+import { AbacatePayWebhookController } from '../modules/payments/webhooks/abacatepay-webhook.controller';
 import { TelegramAuthCodesController } from '../modules/telegram/telegram-auth-codes.controller';
 import { TelegramWebhookController } from '../modules/telegram/telegram-webhook.controller';
 import { UsersController } from '../modules/users/users.controller';
@@ -67,9 +69,33 @@ describe('metadados de acesso dos controllers', () => {
     ).toBe(true);
   });
 
-  it('libera somente sessão atual e logout durante pagamento pendente', () => {
+  it('libera para tenant bloqueado somente sessão, logout e cobrança revisada', () => {
     expect(allowsPendingPayment(AuthController, AuthController.prototype.me)).toBe(true);
     expect(allowsPendingPayment(AuthController, AuthController.prototype.logout)).toBe(true);
+    expect(
+      allowsPendingPayment(
+        PaymentsController,
+        PaymentsController.prototype.getSubscription,
+      ),
+    ).toBe(true);
+    expect(
+      allowsPendingPayment(
+        PaymentsController,
+        PaymentsController.prototype.createCheckout,
+      ),
+    ).toBe(true);
+    expect(
+      allowsPendingPayment(
+        PaymentsController,
+        PaymentsController.prototype.reconcileSubscription,
+      ),
+    ).toBe(true);
+    expect(
+      allowsPendingPayment(
+        PaymentsController,
+        PaymentsController.prototype.cancelSubscription,
+      ),
+    ).toBe(true);
     expect(allowsPendingPayment(AuthController, AuthController.prototype.methods)).toBeUndefined();
     expect(allowsPendingPayment(UsersController, UsersController.prototype.updateTheme)).toBeUndefined();
   });
@@ -81,6 +107,11 @@ describe('metadados de acesso dos controllers', () => {
     ['consulta de convite', MemberInvitesController, MemberInvitesController.prototype.getPublic],
     ['cadastro de membro', MemberInvitesController, MemberInvitesController.prototype.register],
     ['webhook do Telegram', TelegramWebhookController, TelegramWebhookController.prototype.receiveWebhook],
+    [
+      'webhook autenticado da AbacatePay',
+      AbacatePayWebhookController,
+      AbacatePayWebhookController.prototype.receive,
+    ],
     ['healthcheck', HealthController, HealthController.prototype.check],
   ] as const)('marca %s como público', (_label, controller, handler) => {
     expect(isPublic(controller, handler)).toBe(true);

@@ -2,9 +2,9 @@
 
 ## Estado de rollout
 
-O runtime está preparado para criar e reconciliar checkout de assinatura `MONTHLY` exclusivamente com `CARD`. A mesma base oficial `https://api.abacatepay.com/v2` é usada nos dois ambientes; a chave seleciona Dev ou produção. `ABACATEPAY_ENABLED` e `OWNER_SIGNUP_ENABLED` permanecem `false` por padrão.
+O runtime está preparado para criar, reconciliar e cancelar assinatura `MONTHLY` exclusivamente com `CARD`. A mesma base oficial `https://api.abacatepay.com/v2` é usada nos dois ambientes; a chave seleciona Dev ou produção. `ABACATEPAY_ENABLED` e `OWNER_SIGNUP_ENABLED` permanecem `false` por padrão.
 
-Esta fatia não concede acesso. A URL de conclusão apenas leva o navegador à tela de confirmação; o tenant continua `pending_payment` até a próxima fatia processar um webhook autenticado. Não habilite cadastro público em produção antes de validar webhook, paywall e fronteira do ciclo mensal no sandbox.
+A URL de conclusão apenas leva o navegador à tela de confirmação; o tenant continua `pending_payment` até um webhook autenticado fornecer fatos contratuais suficientes. A infraestrutura de webhook e paywall existe, mas eventos positivos permanecem em quarentena enquanto o contrato mensal real não for comprovado no sandbox. Consulte [ABACATEPAY_WEBHOOK_PAYWALL_RETENTION.md](ABACATEPAY_WEBHOOK_PAYWALL_RETENTION.md).
 
 ## Fluxo seguro e idempotência
 
@@ -23,12 +23,15 @@ A AbacatePay não documenta uma chave de idempotência para essa criação. Por 
 
 - `GET /payments/subscription`: membro autenticado do próprio tenant; retorna apenas estado público, plano, prazo e ações possíveis, sem IDs do provider ou do tenant. A ação de checkout só aparece para o owner elegível.
 - `POST /payments/checkout`: owner verificado com pagamento pendente; exige origem de navegador permitida, aplica throttle e aceita DTO vazio. Produto, preço, método, metadados e URLs são montados pelo servidor.
+- `POST /payments/subscription/reconcile`: owner; consulta uma criação pendente/ambígua, mas nunca concede entitlement por encontrar `PAID`.
+- `POST /payments/subscription/cancel`: owner de tenant operacional; confirma a operação irreversível com o provider e revoga o acesso local imediatamente.
+- `POST /payments/webhooks/abacatepay`: endpoint público autenticado por secret e HMAC sobre corpo bruto.
 
 O frontend aceita navegação somente para `https://app.abacatepay.com/pay/bill_...`, sem porta, credenciais, query, fragmento ou path adicional.
 
-## Fronteira com a próxima fatia
+## Cancelamento e retorno
 
-O adapter já possui a operação de cancelamento para `subs_...`, mas esta fatia não publica um endpoint de cancelamento. A criação devolve primeiro `bill_...`; o identificador final da assinatura e os fatos que bloqueiam acesso chegam pelo webhook. Expor cancelamento antes de persistir esses efeitos atomicamente permitiria confirmar uma operação irreversível no provider sem bloquear o tenant local. Cancelamento, novo checkout pós-cancelamento, reconciliação da assinatura ativa e qualquer atualização de método entram junto com webhook e `SubscriptionAccessPolicy` na Fatia 8.
+O cancelamento usa claim durável, chamada externa fora da transação e persistência serializável da confirmação. Resposta ambígua não é repetida às cegas. Cancelamento confirmado é imediato e irreversível; o retorno cria novo checkout e nova assinatura mensal. Refund ou dispute revoga acesso, mas não libera novo checkout até `subscription.cancelled` comprovar que a recorrência externa terminou.
 
 A API v2 consultada não documenta nesta integração um fluxo seguro de atualização de cartão que possamos prometer no MVP. Ele permanece indisponível até existir suporte contratual e teste no sandbox.
 
@@ -50,7 +53,7 @@ Credenciais de produção são rejeitadas fora de produção e credenciais Dev s
 - cadastrar o webhook de produção com secret exclusivo;
 - determinar no sandbox o timestamp autoritativo e a fronteira exata do ciclo mensal, inclusive fim de mês e retry atrasado.
 
-Sem essa última evidência, a próxima fatia deve continuar falhando fechada e o rollout permanece bloqueado.
+Sem essa última evidência, eventos positivos continuam em quarentena e o rollout permanece bloqueado.
 
 ## Referências oficiais
 

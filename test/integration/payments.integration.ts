@@ -4,6 +4,7 @@ import {
   PlatformRole,
   PrismaClient,
   SubscriptionCycle,
+  SubscriptionPaymentMethod,
 } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -21,6 +22,7 @@ import {
   type PaymentProvider,
 } from '../../src/modules/payments/payment-provider';
 import { PaymentsService } from '../../src/modules/payments/payments.service';
+import { SubscriptionCancellationService } from '../../src/modules/payments/subscription-cancellation.service';
 
 const PRODUCT_ID = 'prod_integration_monthly';
 const AMOUNT_CENTS = 2_990;
@@ -167,6 +169,93 @@ describe('checkout AbacatePay com PostgreSQL real', () => {
       checkoutLastErrorCode: null,
     });
     expect(reconciled.providerCheckoutId).toBe(provider.checkoutFor(ambiguous.externalId)?.id);
+  });
+
+  it('cancela somente a assinatura corrente do owner e preserva integralmente outro tenant', async () => {
+    const [tenantA, tenantB] = await Promise.all([
+      createTenant(prisma, 'Cancelamento isolado A'),
+      createTenant(prisma, 'Cancelamento isolado B'),
+    ]);
+    const [subscriptionA, subscriptionB] = await Promise.all([
+      attachActiveSubscription(prisma, tenantA, 'A'),
+      attachActiveSubscription(prisma, tenantB, 'B'),
+    ]);
+    const provider = new FakePaymentProvider();
+    const cancellation = makeCancellationService(prisma, provider);
+
+    const userBCrossTenant = {
+      ...tenantB.user,
+      familyId: tenantA.familyId,
+      profileId: tenantA.profileId,
+    };
+    await expect(cancellation.cancel(userBCrossTenant)).rejects.toMatchObject({
+      status: 403,
+    });
+    expect(provider.cancelledSubscriptionIds).toEqual([]);
+    await expect(
+      prisma.subscription.findUniqueOrThrow({ where: { id: subscriptionA.id } }),
+    ).resolves.toMatchObject({
+      providerStatus: 'ACTIVE',
+      cancelRequestedAt: null,
+      cancelClaimToken: null,
+      cancelAttempts: 0,
+    });
+
+    const result = await cancellation.cancel(tenantA.user);
+    expect(provider.cancelledSubscriptionIds).toEqual([
+      subscriptionA.providerSubscriptionId,
+    ]);
+
+    const [persistedA, persistedB, familyA, familyB] = await Promise.all([
+      prisma.subscription.findUniqueOrThrow({ where: { id: subscriptionA.id } }),
+      prisma.subscription.findUniqueOrThrow({ where: { id: subscriptionB.id } }),
+      prisma.family.findUniqueOrThrow({ where: { id: tenantA.familyId } }),
+      prisma.family.findUniqueOrThrow({ where: { id: tenantB.familyId } }),
+    ]);
+    expect(persistedA).toMatchObject({
+      familyId: tenantA.familyId,
+      providerSubscriptionId: subscriptionA.providerSubscriptionId,
+      providerStatus: 'CANCELLED',
+      lastProviderEvent: 'subscription.cancelled',
+      cancelledAt: expect.any(Date),
+      cancelledDueTo: 'owner_requested',
+      cancelRequestedAt: expect.any(Date),
+      cancelClaimToken: null,
+      cancelLockedAt: null,
+      cancelAttempts: 1,
+      cancelLastErrorCode: null,
+    });
+    expect(familyA).toMatchObject({
+      ownerUserId: tenantA.userId,
+      currentSubscriptionId: subscriptionA.id,
+      pendingPaymentExpiresAt: null,
+      cancelledAt: persistedA.cancelledAt,
+      purgeAfter: expect.any(Date),
+    });
+    expect(result).toEqual({
+      effectiveStatus: 'cancelled',
+      cancelledAt: persistedA.cancelledAt!.toISOString(),
+      purgeAfter: familyA.purgeAfter!.toISOString(),
+    });
+
+    expect(persistedB).toMatchObject({
+      familyId: tenantB.familyId,
+      providerSubscriptionId: subscriptionB.providerSubscriptionId,
+      providerStatus: 'ACTIVE',
+      lastProviderEvent: 'subscription.renewed',
+      cancelledAt: null,
+      cancelRequestedAt: null,
+      cancelClaimToken: null,
+      cancelAttempts: 0,
+    });
+    expect(familyB).toMatchObject({
+      ownerUserId: tenantB.userId,
+      currentSubscriptionId: subscriptionB.id,
+      pendingPaymentExpiresAt: null,
+      cancelledAt: null,
+      purgeAfter: null,
+    });
+    expect(familyA.currentSubscriptionId).not.toBe(familyB.currentSubscriptionId);
   });
 
   it('mantém um resultado ambíguo sem correspondência bloqueado e sem novo POST', async () => {
@@ -343,6 +432,7 @@ class FakePaymentProvider implements PaymentProvider {
   });
   postCount = 0;
   readonly postExternalIds: string[] = [];
+  readonly cancelledSubscriptionIds: string[] = [];
 
   constructor(options: { holdFirstPost?: boolean; ambiguousFirstPost?: boolean } = {}) {
     this.holdFirstPost = options.holdFirstPost ?? false;
@@ -407,9 +497,12 @@ class FakePaymentProvider implements PaymentProvider {
     return checkout;
   }
 
-  async cancelSubscription(): Promise<CancelledPaymentSubscription> {
+  async cancelSubscription(
+    id: string,
+  ): Promise<CancelledPaymentSubscription> {
+    this.cancelledSubscriptionIds.push(id);
     return {
-      id: 'subs_integration',
+      id,
       customerId: null,
       amountCents: AMOUNT_CENTS,
       currency: 'BRL',
@@ -453,6 +546,24 @@ function makeService(prisma: PrismaClient, provider: PaymentProvider) {
     get: <T>(key: string) => values[key] as T | undefined,
   } as ConfigService;
   return new PaymentsService(prisma as unknown as PrismaService, config, provider);
+}
+
+function makeCancellationService(
+  prisma: PrismaClient,
+  provider: PaymentProvider,
+) {
+  const values: Record<string, unknown> = {
+    NODE_ENV: 'test',
+    RETENTION_CANCELLED_MONTHS: 12,
+  };
+  const config = {
+    get: <T>(key: string) => values[key] as T | undefined,
+  } as ConfigService;
+  return new SubscriptionCancellationService(
+    prisma as unknown as PrismaService,
+    config,
+    provider,
+  );
 }
 
 async function createTenant(prisma: PrismaClient, label: string): Promise<TenantFixture> {
@@ -527,6 +638,52 @@ async function createTenant(prisma: PrismaClient, label: string): Promise<Tenant
       },
     };
   });
+}
+
+async function attachActiveSubscription(
+  prisma: PrismaClient,
+  tenant: TenantFixture,
+  label: string,
+) {
+  const now = new Date();
+  const billId = `bill_${randomUUID()}`;
+  const subscription = await prisma.subscription.create({
+    data: {
+      familyId: tenant.familyId,
+      externalId: `cancel-${label}-${randomUUID()}`,
+      providerSubscriptionId: `subs_${randomUUID()}`,
+      providerCustomerId: null,
+      providerCheckoutId: billId,
+      providerCheckoutUrl: `https://app.abacatepay.com/pay/${billId}`,
+      providerCheckoutStatus: 'PAID',
+      providerProductId: PRODUCT_ID,
+      providerStatus: 'ACTIVE',
+      lastProviderEvent: 'subscription.renewed',
+      providerUpdatedAt: new Date(now.getTime() - 3_600_000),
+      lastSuccessfulPaymentAt: new Date(now.getTime() - 3_600_001),
+      accessPaidThrough: new Date(now.getTime() + 30 * 86_400_000),
+      lastInstallmentNumber: 1,
+      entitlementContractVersion: 'integration-cancellation-v1',
+      amountCents: AMOUNT_CENTS,
+      currency: 'BRL',
+      paymentMethod: SubscriptionPaymentMethod.CARD,
+      providerPaymentMethod: 'CARD',
+      billingCycle: SubscriptionCycle.MONTHLY,
+      devMode: true,
+      checkoutProvisioningStatus: CheckoutProvisioningStatus.ready,
+      checkoutCreationAllowed: false,
+      checkoutAttempts: 1,
+      checkoutReadyAt: new Date(now.getTime() - 7_200_000),
+    },
+  });
+  await prisma.family.update({
+    where: { id: tenant.familyId },
+    data: {
+      currentSubscriptionId: subscription.id,
+      pendingPaymentExpiresAt: null,
+    },
+  });
+  return subscription;
 }
 
 function baseSubscriptionData(familyId: string, externalId: string, createdAt: Date) {

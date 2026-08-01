@@ -9,6 +9,7 @@ import {
   Req,
 } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
+import { JwtService } from '@nestjs/jwt';
 import { PassportModule, PassportStrategy } from '@nestjs/passport';
 import { Test } from '@nestjs/testing';
 import { Throttle, ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
@@ -18,6 +19,8 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { JwtAuthGuard } from '../modules/auth/jwt-auth.guard';
+import { SubscriptionAccessGuard } from '../modules/payments/subscription-access.guard';
+import { AllowBlockedTenantAccess } from './allow-blocked-tenant-access.decorator';
 import { nestApplicationOptions } from './nest-application-options';
 import { Public } from './public.decorator';
 
@@ -48,6 +51,12 @@ class SecurityFixtureController {
     return { ok: true };
   }
 
+  @Get('billing-allowlist')
+  @AllowBlockedTenantAccess()
+  billingAllowlist() {
+    return { ok: true };
+  }
+
   @Get('limited')
   @Public()
   @Throttle({ default: { ttl: 60_000, limit: 2 } })
@@ -69,6 +78,7 @@ class SecurityFixtureController {
     FixtureJwtStrategy,
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    { provide: APP_GUARD, useClass: SubscriptionAccessGuard },
   ],
 })
 class SecurityFixtureModule {}
@@ -98,6 +108,52 @@ describe('guards globais de segurança', () => {
     expect(protectedResponse.status).toBe(401);
   });
 
+  it('aplica paywall default-deny depois da autenticação e respeita somente a allowlist', async () => {
+    const activeToken = token({
+      effectiveStatus: 'active',
+      accessAllowed: true,
+      reason: 'PAID_ACCESS',
+    });
+    const pendingToken = token({
+      effectiveStatus: 'pending_payment',
+      accessAllowed: false,
+      reason: 'FIRST_PAYMENT_UNCONFIRMED',
+    });
+
+    const active = await fetch(`${baseUrl}/protected-by-default`, {
+      headers: { authorization: `Bearer ${activeToken}` },
+    });
+    const blocked = await fetch(`${baseUrl}/protected-by-default`, {
+      headers: { authorization: `Bearer ${pendingToken}` },
+    });
+    const billing = await fetch(`${baseUrl}/billing-allowlist`, {
+      headers: { authorization: `Bearer ${pendingToken}` },
+    });
+
+    expect(active.status).toBe(200);
+    expect(blocked.status).toBe(403);
+    expect(await blocked.json()).toMatchObject({ code: 'PAYMENT_REQUIRED' });
+    expect(billing.status).toBe(200);
+  });
+
+  it('não dá bypass a admin e bloqueia principal sem snapshot de assinatura', async () => {
+    const adminBlocked = await fetch(`${baseUrl}/protected-by-default`, {
+      headers: {
+        authorization: `Bearer ${token({
+          effectiveStatus: 'cancelled',
+          accessAllowed: false,
+          reason: 'CANCELLATION_CONFIRMED',
+        }, 'admin')}`,
+      },
+    });
+    const missingSnapshot = await fetch(`${baseUrl}/protected-by-default`, {
+      headers: { authorization: `Bearer ${token(undefined)}` },
+    });
+
+    expect(adminBlocked.status).toBe(403);
+    expect(missingSnapshot.status).toBe(403);
+  });
+
   it('retorna 429 após o limite configurado da rota', async () => {
     const responses = await Promise.all([
       fetch(`${baseUrl}/limited`),
@@ -120,3 +176,14 @@ describe('guards globais de segurança', () => {
     await expect(response.json()).resolves.toEqual({ rawBody: body });
   });
 });
+
+function token(
+  subscriptionAccess?: Record<string, unknown>,
+  platformRole = 'user',
+): string {
+  return new JwtService({ secret: 'x'.repeat(32) }).sign({
+    sub: 'user-1',
+    platformRole,
+    subscriptionAccess,
+  });
+}

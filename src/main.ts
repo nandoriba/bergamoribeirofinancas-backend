@@ -7,10 +7,14 @@ import helmet from 'helmet';
 
 import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './shared/all-exceptions.filter';
-import { nestApplicationOptions } from './shared/nest-application-options';
+import { configureHttpBodyParsers } from './shared/http-body-parsers';
+import { webhookSafeNestApplicationOptions } from './shared/nest-application-options';
 
 async function bootstrap() {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, nestApplicationOptions);
+  const app = await NestFactory.create<NestExpressApplication>(
+    AppModule,
+    webhookSafeNestApplicationOptions,
+  );
   const config = app.get(ConfigService);
   const logger = new Logger('Bootstrap');
   const webOrigin = config.getOrThrow<string>('WEB_ORIGIN');
@@ -21,6 +25,7 @@ async function bootstrap() {
     app.set('trust proxy', 1);
   }
 
+  configureHttpBodyParsers(app);
   app.use(helmet());
   app.use(cookieParser());
   app.enableCors({

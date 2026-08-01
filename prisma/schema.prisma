@@ -27,6 +27,13 @@ enum WebhookProcessingStatus {
   received
   processed
   ignored
+  quarantined
+  failed
+}
+
+enum RetentionRunStatus {
+  running
+  succeeded
   failed
 }
 
@@ -223,7 +230,9 @@ model Family {
   invites                  MemberInvite[]
   approvals                MemberApproval[]
   categories               Category[]
-  subscriptions            Subscription[]
+  subscriptions            Subscription[]            @relation("FamilySubscriptions")
+  currentSubscriptionId    String?                   @unique
+  currentSubscription      Subscription?             @relation("FamilyCurrentSubscription", fields: [currentSubscriptionId, id], references: [id, familyId], onDelete: Restrict, onUpdate: Restrict)
   subscriptionPayments     SubscriptionPayment[]
   paymentWebhookEvents     PaymentWebhookEvent[]
   legalAcceptances         LegalAcceptance[]
@@ -235,6 +244,7 @@ model Family {
   updatedAt                DateTime                  @updatedAt
 
   @@unique([ownerUserId, id])
+  @@unique([currentSubscriptionId, id])
   @@index([pendingPaymentExpiresAt])
   @@index([purgeAfter])
 }
@@ -423,46 +433,53 @@ model MemberApproval {
 
 /// SQL enforces at most one non-cancelled subscription with an open checkout per family.
 model Subscription {
-  id                      String                     @id @default(uuid())
-  familyId                String
-  family                  Family                     @relation(fields: [familyId], references: [id], onDelete: Cascade)
-  provider                String                     @default("abacatepay")
-  externalId              String                     @unique
-  providerSubscriptionId  String?
-  providerCustomerId      String?
-  providerCheckoutId      String?
-  providerCheckoutUrl     String?
-  providerCheckoutStatus  String?
-  providerProductId       String
-  providerStatus          String?
-  lastProviderEvent       String?
-  providerUpdatedAt       DateTime?
-  lastSuccessfulPaymentAt DateTime?
-  accessPaidThrough       DateTime?
-  paymentFailedAt         DateTime?
-  graceUntil              DateTime?
-  cancelledAt             DateTime?
-  cancelledDueTo          String?
-  lastInstallmentNumber   Int?
-  amountCents             Int
-  currency                String                     @default("BRL")
-  paymentMethod           SubscriptionPaymentMethod?
-  providerPaymentMethod   String?
-  billingCycle            SubscriptionCycle          @default(MONTHLY)
-  devMode                 Boolean
+  id                         String                     @id @default(uuid())
+  familyId                   String
+  family                     Family                     @relation("FamilySubscriptions", fields: [familyId], references: [id], onDelete: Cascade)
+  currentForFamily           Family?                    @relation("FamilyCurrentSubscription")
+  provider                   String                     @default("abacatepay")
+  externalId                 String                     @unique
+  providerSubscriptionId     String?
+  providerCustomerId         String?
+  providerCheckoutId         String?
+  providerCheckoutUrl        String?
+  providerCheckoutStatus     String?
+  providerProductId          String
+  providerStatus             String?
+  lastProviderEvent          String?
+  providerUpdatedAt          DateTime?
+  lastSuccessfulPaymentAt    DateTime?
+  accessPaidThrough          DateTime?
+  paymentFailedAt            DateTime?
+  graceUntil                 DateTime?
+  cancelledAt                DateTime?
+  cancelledDueTo             String?
+  lastInstallmentNumber      Int?
+  entitlementContractVersion String?
+  amountCents                Int
+  currency                   String                     @default("BRL")
+  paymentMethod              SubscriptionPaymentMethod?
+  providerPaymentMethod      String?
+  billingCycle               SubscriptionCycle          @default(MONTHLY)
+  devMode                    Boolean
   checkoutProvisioningStatus CheckoutProvisioningStatus @default(pending)
-  checkoutCreationAllowed Boolean                    @default(true)
-  checkoutAttempts        Int                        @default(0)
-  checkoutClaimToken      String?
-  checkoutLockedAt        DateTime?
-  checkoutReadyAt         DateTime?
-  checkoutClosedAt        DateTime?
-  checkoutCloseReason     String?
-  checkoutLastErrorCode   String?
-  payments                SubscriptionPayment[]
-  webhookEvents           PaymentWebhookEvent[]
-  createdAt               DateTime                   @default(now())
-  updatedAt               DateTime                   @updatedAt
+  checkoutCreationAllowed    Boolean                    @default(true)
+  checkoutAttempts           Int                        @default(0)
+  checkoutClaimToken         String?
+  checkoutLockedAt           DateTime?
+  checkoutReadyAt            DateTime?
+  checkoutClosedAt           DateTime?
+  checkoutCloseReason        String?
+  checkoutLastErrorCode      String?
+  cancelRequestedAt          DateTime?
+  cancelClaimToken           String?
+  cancelLockedAt             DateTime?
+  cancelAttempts             Int                        @default(0)
+  cancelLastErrorCode        String?
+  payments                   SubscriptionPayment[]
+  webhookEvents              PaymentWebhookEvent[]
+  createdAt                  DateTime                   @default(now())
+  updatedAt                  DateTime                   @updatedAt
 
   @@unique([provider, providerSubscriptionId])
   @@unique([provider, providerCheckoutId])
@@ -482,6 +499,7 @@ model SubscriptionPayment {
   subscription             Subscription               @relation(fields: [subscriptionId, familyId], references: [id, familyId], onDelete: Cascade, onUpdate: Restrict)
   providerPaymentId        String?                    @unique
   providerInstallmentId    String?
+  providerCheckoutId       String?                    @unique
   providerStatus           String
   installmentNumber        Int?
   retryNumber              Int?
@@ -517,7 +535,7 @@ model PaymentWebhookEvent {
   provider               String                  @default("abacatepay")
   providerEventId        String
   eventType              String
-  apiVersion             String?
+  apiVersion             Int?
   devMode                Boolean?
   payloadHash            String
   sanitizedPayload       Json?
@@ -532,6 +550,8 @@ model PaymentWebhookEvent {
   subscriptionPayment    SubscriptionPayment?    @relation(fields: [subscriptionPaymentId, subscriptionId, familyId], references: [id, subscriptionId, familyId], onDelete: Restrict, onUpdate: Restrict, map: "PaymentWebhookEvent_subscriptionPaymentId_familyId_fkey")
   providerSubscriptionId String?
   providerPaymentId      String?
+  providerCheckoutId     String?
+  providerFailureReason  String?
   occurredAt             DateTime?
   receivedAt             DateTime                @default(now())
   processedAt            DateTime?
@@ -544,7 +564,22 @@ model PaymentWebhookEvent {
   @@index([subscriptionPaymentId])
   @@index([provider, providerSubscriptionId])
   @@index([provider, providerPaymentId])
+  @@index([provider, providerCheckoutId])
   @@index([processingStatus, receivedAt])
+}
+
+model TenantPurgeRun {
+  id                   String             @id @default(uuid())
+  status               RetentionRunStatus @default(running)
+  startedAt            DateTime           @default(now())
+  finishedAt           DateTime?
+  pendingPaymentPurged Int                @default(0)
+  cancelledPurged      Int                @default(0)
+  errorCode            String?
+  createdAt            DateTime           @default(now())
+
+  @@index([status, finishedAt])
+  @@index([startedAt])
 }
 
 model Account {

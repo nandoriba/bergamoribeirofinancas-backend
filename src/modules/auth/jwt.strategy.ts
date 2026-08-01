@@ -6,7 +6,11 @@ import type { Request } from 'express';
 
 import { PrismaService } from '../../prisma/prisma.service';
 import {
-  requiredActionFromPendingPayment,
+  evaluateSubscriptionProjection,
+  SUBSCRIPTION_ACCESS_SELECT,
+} from '../payments/subscription-access.projection';
+import {
+  requiredActionFromSubscriptionAccess,
   type AuthenticatedUser,
   type JwtPayload,
 } from './auth.types';
@@ -32,7 +36,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       where: { id: payload.sub },
       include: {
         profile: true,
-        family: { select: { ownerUserId: true, pendingPaymentExpiresAt: true } },
+        family: {
+          select: {
+            ownerUserId: true,
+            currentSubscription: { select: SUBSCRIPTION_ACCESS_SELECT },
+          },
+        },
       },
     });
 
@@ -48,6 +57,10 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Sessão inválida');
     }
 
+    const subscriptionAccess = evaluateSubscriptionProjection(
+      user.family.currentSubscription,
+    );
+
     return {
       id: user.id,
       email: user.email,
@@ -55,7 +68,8 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       tenantRole: user.family.ownerUserId === user.id ? 'owner' : 'member',
       familyId: user.familyId,
       profileId: user.profile.id,
-      requiredAction: requiredActionFromPendingPayment(user.family.pendingPaymentExpiresAt),
+      requiredAction: requiredActionFromSubscriptionAccess(subscriptionAccess),
+      subscriptionAccess,
     };
   }
 }
