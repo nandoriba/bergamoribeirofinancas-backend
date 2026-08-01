@@ -23,7 +23,7 @@ function setup() {
     signAsync: vi.fn().mockResolvedValue('signed-token'),
   } as unknown as JwtService;
   const config = {
-    get: vi.fn().mockReturnValue(false),
+    get: vi.fn((key: string) => key === 'SUPPORT_EMAIL' ? 'support@example.com' : false),
   } as unknown as ConfigService;
 
   return { prisma, jwtService, service: new AuthService(prisma, jwtService, config) };
@@ -44,9 +44,11 @@ describe('AuthService', () => {
       platformRole: PlatformRole.user,
       themePreference: 'dark',
       isActive: true,
+      emailVerifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+      authVersion: 0,
       familyId: 'family-1',
       profile: { id: 'profile-1', status: 'active' },
-      family: { ownerUserId: 'google-user' },
+      family: { ownerUserId: 'google-user', pendingPaymentExpiresAt: null },
     } as never);
 
     await expect(service.login('google@example.com', 'irrelevant')).rejects.toEqual(
@@ -66,9 +68,14 @@ describe('AuthService', () => {
       platformRole: PlatformRole.user,
       themePreference: 'dark',
       isActive: true,
+      emailVerifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+      authVersion: 3,
       familyId: 'family-1',
       profile: { id: 'profile-1', status: 'active' },
-      family: { ownerUserId: 'owner-user' },
+      family: {
+        ownerUserId: 'owner-user',
+        pendingPaymentExpiresAt: new Date('2026-08-08T00:00:00.000Z'),
+      },
     } as never);
     (bcrypt.compare as unknown as { mockResolvedValue(value: boolean): void }).mockResolvedValue(true);
 
@@ -80,6 +87,8 @@ describe('AuthService', () => {
       tenantRole: 'owner',
       familyId: 'family-1',
       profileId: 'profile-1',
+      requiredAction: 'payment',
+      supportEmail: 'support@example.com',
     });
     expect(jwtService.signAsync).toHaveBeenCalledWith({
       jti: expect.any(String),
@@ -89,6 +98,56 @@ describe('AuthService', () => {
       tenantRole: 'owner',
       familyId: 'family-1',
       profileId: 'profile-1',
+      authVersion: 3,
+    });
+  });
+
+  it('rejects an unverified password account with the same generic login error', async () => {
+    const { prisma, service } = setup();
+    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+      id: 'unverified-user',
+      email: 'unverified@example.com',
+      passwordHash: 'password-hash',
+      name: 'Unverified User',
+      platformRole: PlatformRole.user,
+      themePreference: 'dark',
+      isActive: true,
+      emailVerifiedAt: null,
+      authVersion: 0,
+      familyId: 'family-1',
+      profile: { id: 'profile-1', status: 'active' },
+      family: { ownerUserId: 'unverified-user', pendingPaymentExpiresAt: null },
+    } as never);
+    (bcrypt.compare as unknown as { mockResolvedValue(value: boolean): void }).mockResolvedValue(true);
+
+    await expect(service.login(' unverified@example.com ', 'correct-password')).rejects.toEqual(
+      new UnauthorizedException('Email ou senha inválidos'),
+    );
+    expect(prisma.user.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { email: 'unverified@example.com' } }),
+    );
+  });
+
+  it('keeps legacy families with no pending-payment timestamp in normal app access', async () => {
+    const { prisma, service } = setup();
+    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+      id: 'legacy-user',
+      email: 'legacy@example.com',
+      passwordHash: 'password-hash',
+      name: 'Legacy User',
+      platformRole: PlatformRole.user,
+      themePreference: 'dark',
+      isActive: true,
+      emailVerifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+      authVersion: 0,
+      familyId: 'legacy-family',
+      profile: { id: 'legacy-profile', status: 'active' },
+      family: { ownerUserId: 'legacy-user', pendingPaymentExpiresAt: null },
+    } as never);
+    (bcrypt.compare as unknown as { mockResolvedValue(value: boolean): void }).mockResolvedValue(true);
+
+    await expect(service.login('legacy@example.com', 'correct-password')).resolves.toMatchObject({
+      user: { requiredAction: null },
     });
   });
 

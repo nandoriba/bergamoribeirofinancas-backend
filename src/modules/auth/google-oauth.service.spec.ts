@@ -8,6 +8,7 @@ import type { AuthService } from './auth.service';
 import { GoogleOAuthService } from './google-oauth.service';
 import type { GoogleOidcClient, GoogleAuthorizationInput } from './google-oidc.client';
 import { OAuthAttemptCryptoService } from './oauth-attempt-crypto.service';
+import { type OwnerOnboardingService, OwnerSignupConflictError } from './owner-onboarding.service';
 
 const currentUser: AuthenticatedUser = {
   id: 'local-user',
@@ -18,7 +19,7 @@ const currentUser: AuthenticatedUser = {
   profileId: 'profile-1',
 };
 
-function setup() {
+function setup(configOverrides: Record<string, unknown> = {}) {
   const configValues: Record<string, unknown> = {
     GOOGLE_OAUTH_ENABLED: true,
     OAUTH_ATTEMPT_SECRET: 'oauth-attempt-test-secret-with-at-least-32-bytes',
@@ -26,6 +27,9 @@ function setup() {
     OAUTH_ATTEMPT_TTL_SECONDS: 300,
     COOKIE_SECURE: false,
     WEB_ORIGIN: 'http://127.0.0.1:8181',
+    OWNER_SIGNUP_ENABLED: true,
+    LEGAL_BUNDLE_VERSION: '2026-08-01',
+    ...configOverrides,
   };
   const config = {
     get: vi.fn((key: string) => configValues[key]),
@@ -58,6 +62,8 @@ function setup() {
           memberInviteId: null,
           legalAcceptanceVersion: null,
           legalAcceptedAt: null,
+          signupOwnerName: null,
+          signupFamilyName: null,
           ...data,
         };
         return storedAttempt;
@@ -77,8 +83,17 @@ function setup() {
   } as unknown as PrismaService;
   const authService = {
     confirmCurrentPassword: vi.fn(),
-    createSessionForUserId: vi.fn().mockResolvedValue({ token: 'new-session-token', user: {} }),
+    createSessionForUserId: vi.fn().mockResolvedValue({
+      token: 'new-session-token',
+      user: { requiredAction: null },
+    }),
   } as unknown as AuthService;
+  const ownerOnboarding = {
+    completeGoogleOwnerSignup: vi.fn().mockResolvedValue({
+      token: 'owner-session-token',
+      user: { requiredAction: 'payment' },
+    }),
+  } as unknown as OwnerOnboardingService;
   const oidcClient = {
     isEnabled: vi.fn().mockReturnValue(true),
     createAuthorizationUrl: vi.fn(async (input: GoogleAuthorizationInput) => {
@@ -90,13 +105,14 @@ function setup() {
     exchangeCode: vi.fn(),
   } as unknown as GoogleOidcClient;
 
-  const service = new GoogleOAuthService(prisma, authService, oidcClient, crypto, config);
+  const service = new GoogleOAuthService(prisma, authService, ownerOnboarding, oidcClient, crypto, config);
   return {
     authService,
     crypto,
     getAuthorizationInput: () => authorizationInput,
     getStoredAttempt: () => storedAttempt,
     oidcClient,
+    ownerOnboarding,
     prisma,
     service,
     setStoredAttempt: (value: Record<string, unknown>) => {
@@ -110,7 +126,10 @@ describe('GoogleOAuthService', () => {
   it('persists only hashes and an encrypted PKCE verifier and issues a transient browser cookie', async () => {
     const { crypto, getAuthorizationInput, getStoredAttempt, service } = setup();
 
-    const result = await service.start({ intent: OAuthIntent.login, returnPath: '/relatorios' });
+    const result = await service.start({
+      intent: OAuthIntent.login,
+      returnPath: '/relatorios',
+    });
     const authorization = getAuthorizationInput();
     const stored = getStoredAttempt();
     if (!authorization || !stored) throw new Error('Expected an OAuth attempt');
@@ -131,7 +150,13 @@ describe('GoogleOAuthService', () => {
     expect(serialized).not.toContain(verifier);
     expect(result.bindingCookie).toMatchObject({
       name: expect.stringMatching(/^financeiro-oauth-/),
-      options: { httpOnly: true, sameSite: 'lax', secure: false, path: '/', maxAge: 300_000 },
+      options: {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: false,
+        path: '/',
+        maxAge: 300_000,
+      },
     });
   });
 
@@ -147,15 +172,10 @@ describe('GoogleOAuthService', () => {
     expect(prisma.oAuthAttempt.deleteMany).toHaveBeenCalledWith({
       where: {
         id: { in: ['expired-attempt', 'consumed-attempt'] },
-        OR: [
-          { consumedAt: null, expiresAt: { lte: expect.any(Date) } },
-          { consumedAt: { lte: expect.any(Date) } },
-        ],
+        OR: [{ consumedAt: null, expiresAt: { lte: expect.any(Date) } }, { consumedAt: { lte: expect.any(Date) } }],
       },
     });
-    expect(prisma.oAuthAttempt.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ take: 250 }),
-    );
+    expect(prisma.oAuthAttempt.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 250 }));
   });
 
   it('does not block a new OAuth attempt when background cleanup fails', async () => {
@@ -163,7 +183,9 @@ describe('GoogleOAuthService', () => {
     vi.mocked(prisma.oAuthAttempt.findMany).mockRejectedValueOnce(new Error('cleanup unavailable'));
 
     await expect(service.start({ intent: OAuthIntent.login })).resolves.toEqual(
-      expect.objectContaining({ authorizationUrl: expect.stringContaining('accounts.google.com') }),
+      expect.objectContaining({
+        authorizationUrl: expect.stringContaining('accounts.google.com'),
+      }),
     );
 
     expect(prisma.oAuthAttempt.create).toHaveBeenCalledOnce();
@@ -180,16 +202,140 @@ describe('GoogleOAuthService', () => {
     },
   );
 
-  it('keeps future signup and invite intents closed until their domain slices are implemented', async () => {
+  it('keeps the future invite intent closed until its domain slice is implemented', async () => {
     const { service } = setup();
 
-    await expect(service.start({ intent: OAuthIntent.signup_owner })).rejects.toMatchObject({ status: 400 });
     await expect(service.start({ intent: OAuthIntent.accept_invite })).rejects.toMatchObject({ status: 400 });
+  });
+
+  it('starts anonymous owner signup with normalized names and server-owned legal facts', async () => {
+    const before = Date.now();
+    const { getStoredAttempt, service } = setup();
+
+    await service.start({
+      intent: OAuthIntent.signup_owner,
+      ownerName: '  Ana   Silva ',
+      familyName: ' Família   Silva ',
+      legalAcceptanceVersion: '2026-08-01',
+    });
+
+    const stored = getStoredAttempt();
+    expect(stored).toMatchObject({
+      intent: OAuthIntent.signup_owner,
+      authenticatedUserId: null,
+      returnPath: null,
+      signupOwnerName: 'Ana Silva',
+      signupFamilyName: 'Família Silva',
+      legalAcceptanceVersion: '2026-08-01',
+      legalAcceptedAt: expect.any(Date),
+    });
+    expect((stored?.legalAcceptedAt as Date).getTime()).toBeGreaterThanOrEqual(before);
+    expect((stored?.legalAcceptedAt as Date).getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('fails owner-signup start closed when disabled, stale, incomplete or bound to a session', async () => {
+    const disabled = setup({ OWNER_SIGNUP_ENABLED: false });
+    await expect(
+      disabled.service.start({
+        intent: OAuthIntent.signup_owner,
+        ownerName: 'Ana Silva',
+        familyName: 'Família Silva',
+        legalAcceptanceVersion: '2026-08-01',
+      }),
+    ).rejects.toMatchObject({ status: 503 });
+    expect(disabled.oidcClient.createAuthorizationUrl).not.toHaveBeenCalled();
+
+    const stale = setup();
+    await expect(
+      stale.service.start({
+        intent: OAuthIntent.signup_owner,
+        ownerName: 'Ana Silva',
+        familyName: 'Família Silva',
+        legalAcceptanceVersion: 'stale-version',
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const incomplete = setup();
+    await expect(
+      incomplete.service.start({
+        intent: OAuthIntent.signup_owner,
+        ownerName: 'Ana Silva',
+        legalAcceptanceVersion: '2026-08-01',
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+
+    const malformed = setup();
+    await expect(
+      malformed.service.start({
+        intent: OAuthIntent.signup_owner,
+        ownerName: 'Ana\nSilva',
+        familyName: 'Família Silva',
+        legalAcceptanceVersion: '2026-08-01',
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(malformed.prisma.oAuthAttempt.create).not.toHaveBeenCalled();
+
+    const authenticated = setup();
+    await expect(
+      authenticated.service.start(
+        {
+          intent: OAuthIntent.signup_owner,
+          ownerName: 'Ana Silva',
+          familyName: 'Família Silva',
+          legalAcceptanceVersion: '2026-08-01',
+        },
+        currentUser,
+      ),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it.each([{ currentPassword: 'not-allowed' }, { returnPath: '/' }])(
+    'rejects extraneous owner-signup context: %o',
+    async (extra) => {
+      const { prisma, service } = setup();
+
+      await expect(
+        service.start({
+          intent: OAuthIntent.signup_owner,
+          ownerName: 'Ana Silva',
+          familyName: 'Família Silva',
+          legalAcceptanceVersion: '2026-08-01',
+          ...extra,
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(prisma.oAuthAttempt.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects owner-signup fields attached to login or link intents', async () => {
+    const login = setup();
+    await expect(
+      login.service.start({
+        intent: OAuthIntent.login,
+        ownerName: 'Injected Owner',
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+
+    const link = setup();
+    await expect(
+      link.service.start(
+        {
+          intent: OAuthIntent.link_account,
+          currentPassword: 'current-password',
+          legalAcceptanceVersion: '2026-08-01',
+        },
+        currentUser,
+      ),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(link.authService.confirmCurrentPassword).not.toHaveBeenCalled();
   });
 
   it('binds link_account to the authenticated user only after checking the current password', async () => {
     const { authService, getStoredAttempt, prisma, service } = setup();
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({ passwordHash: 'hash', identities: [] } as never);
+    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+      passwordHash: 'hash',
+      identities: [],
+    } as never);
 
     await service.start({ intent: OAuthIntent.link_account, currentPassword: 'current-password' }, currentUser);
 
@@ -206,7 +352,11 @@ describe('GoogleOAuthService', () => {
     const start = await service.start({ intent: OAuthIntent.login });
     const state = getAuthorizationInput()?.state;
 
-    const result = await service.complete({ state, code: 'code', browserBinding: `${start.bindingCookie.value}x` });
+    const result = await service.complete({
+      state,
+      code: 'code',
+      browserBinding: `${start.bindingCookie.value}x`,
+    });
 
     expect(new URL(result.redirectUrl).searchParams.get('reason')).toBe('failed');
     expect(prisma.oAuthAttempt.updateMany).not.toHaveBeenCalled();
@@ -215,7 +365,10 @@ describe('GoogleOAuthService', () => {
 
   it('logs in only through an existing Google subject and rotates the local session', async () => {
     const { authService, getAuthorizationInput, oidcClient, prisma, service } = setup();
-    const start = await service.start({ intent: OAuthIntent.login, returnPath: '/contas' });
+    const start = await service.start({
+      intent: OAuthIntent.login,
+      returnPath: '/contas',
+    });
     const nonce = getAuthorizationInput()?.nonce;
     vi.mocked(oidcClient.exchangeCode).mockResolvedValue({
       subject: 'google-subject',
@@ -237,11 +390,217 @@ describe('GoogleOAuthService', () => {
     expect(oidcClient.exchangeCode).toHaveBeenCalledOnce();
     expect(prisma.userIdentity.update).toHaveBeenCalledWith({
       where: { id: 'identity-1' },
-      data: { observedEmail: 'observed@example.com', lastUsedAt: expect.any(Date) },
+      data: {
+        observedEmail: 'observed@example.com',
+        lastUsedAt: expect.any(Date),
+      },
     });
     expect(authService.createSessionForUserId).toHaveBeenCalledWith('local-user');
     expect(result.token).toBe('new-session-token');
     expect(new URL(result.redirectUrl).pathname).toBe('/contas');
+  });
+
+  it('redirects an existing Google login with a payment requirement to the payment boundary', async () => {
+    const { authService, getAuthorizationInput, oidcClient, prisma, service } = setup();
+    const start = await service.start({
+      intent: OAuthIntent.login,
+      returnPath: '/contas',
+    });
+    vi.mocked(oidcClient.exchangeCode).mockResolvedValue({
+      subject: 'google-subject',
+      email: 'observed@example.com',
+      nonce: String(getAuthorizationInput()?.nonce),
+    });
+    vi.mocked(prisma.userIdentity.findUnique).mockResolvedValue({
+      id: 'identity-1',
+      user: { id: 'local-user', isActive: true, profile: { status: 'active' } },
+    } as never);
+    vi.mocked(authService.createSessionForUserId).mockResolvedValue({
+      token: 'pending-payment-session',
+      user: { requiredAction: 'payment' },
+    } as never);
+
+    const result = await service.complete({
+      state: getAuthorizationInput()?.state,
+      code: 'one-time-code',
+      browserBinding: start.bindingCookie.value,
+    });
+
+    expect(result.token).toBe('pending-payment-session');
+    expect(new URL(result.redirectUrl).pathname).toBe('/pagamento/pendente');
+  });
+
+  it('completes Google owner signup exclusively from persisted attempt facts and verified identity', async () => {
+    const { getAuthorizationInput, getStoredAttempt, oidcClient, ownerOnboarding, service } = setup();
+    const start = await service.start({
+      intent: OAuthIntent.signup_owner,
+      ownerName: 'Ana Silva',
+      familyName: 'Família Silva',
+      legalAcceptanceVersion: '2026-08-01',
+    });
+    const attempt = getStoredAttempt();
+    vi.mocked(oidcClient.exchangeCode).mockResolvedValue({
+      subject: 'verified-google-subject',
+      email: 'verified@example.com',
+      nonce: String(getAuthorizationInput()?.nonce),
+    });
+
+    const result = await service.complete({
+      state: getAuthorizationInput()?.state,
+      code: 'one-time-code',
+      browserBinding: start.bindingCookie.value,
+    });
+
+    expect(ownerOnboarding.completeGoogleOwnerSignup).toHaveBeenCalledWith({
+      subject: 'verified-google-subject',
+      email: 'verified@example.com',
+      ownerName: 'Ana Silva',
+      familyName: 'Família Silva',
+      legalAcceptanceVersion: '2026-08-01',
+      legalAcceptedAt: attempt?.legalAcceptedAt,
+    });
+    expect(result.token).toBe('owner-session-token');
+    const redirect = new URL(result.redirectUrl);
+    expect(redirect.pathname).toBe('/pagamento/pendente');
+    expect(redirect.search).toBe('');
+    expect(result.redirectUrl).not.toContain('verified-google-subject');
+    expect(result.redirectUrl).not.toContain('verified%40example.com');
+    expect(result.redirectUrl).not.toContain('Ana');
+  });
+
+  it('fails a signup callback if the browser acquired an authenticated session after start', async () => {
+    const { getAuthorizationInput, oidcClient, ownerOnboarding, service } = setup();
+    const start = await service.start({
+      intent: OAuthIntent.signup_owner,
+      ownerName: 'Ana Silva',
+      familyName: 'Família Silva',
+      legalAcceptanceVersion: '2026-08-01',
+    });
+
+    const result = await service.complete({
+      state: getAuthorizationInput()?.state,
+      code: 'one-time-code',
+      browserBinding: start.bindingCookie.value,
+      currentUser,
+    });
+
+    const redirect = new URL(result.redirectUrl);
+    expect(redirect.pathname).toBe('/cadastro');
+    expect(redirect.searchParams.get('reason')).toBe('failed');
+    expect(oidcClient.exchangeCode).not.toHaveBeenCalled();
+    expect(ownerOnboarding.completeGoogleOwnerSignup).not.toHaveBeenCalled();
+    expect(result.token).toBeUndefined();
+  });
+
+  it('maps a transactional owner-signup conflict to a closed account_exists callback reason', async () => {
+    const { getAuthorizationInput, oidcClient, ownerOnboarding, service } = setup();
+    const start = await service.start({
+      intent: OAuthIntent.signup_owner,
+      ownerName: 'Ana Silva',
+      familyName: 'Família Silva',
+      legalAcceptanceVersion: '2026-08-01',
+    });
+    vi.mocked(oidcClient.exchangeCode).mockResolvedValue({
+      subject: 'existing-google-subject',
+      email: 'existing@example.com',
+      nonce: String(getAuthorizationInput()?.nonce),
+    });
+    vi.mocked(ownerOnboarding.completeGoogleOwnerSignup).mockRejectedValue(new OwnerSignupConflictError());
+
+    const result = await service.complete({
+      state: getAuthorizationInput()?.state,
+      code: 'one-time-code',
+      browserBinding: start.bindingCookie.value,
+    });
+
+    const redirect = new URL(result.redirectUrl);
+    expect(redirect.pathname).toBe('/cadastro');
+    expect(redirect.searchParams.get('oauth')).toBe('error');
+    expect(redirect.searchParams.get('reason')).toBe('account_exists');
+    expect(result.token).toBeUndefined();
+  });
+
+  it('fails closed without a session when the transactional signup delegate rolls back', async () => {
+    const { getAuthorizationInput, oidcClient, ownerOnboarding, service } = setup();
+    const start = await service.start({
+      intent: OAuthIntent.signup_owner,
+      ownerName: 'Ana Silva',
+      familyName: 'Família Silva',
+      legalAcceptanceVersion: '2026-08-01',
+    });
+    vi.mocked(oidcClient.exchangeCode).mockResolvedValue({
+      subject: 'new-google-subject',
+      email: 'new@example.com',
+      nonce: String(getAuthorizationInput()?.nonce),
+    });
+    vi.mocked(ownerOnboarding.completeGoogleOwnerSignup).mockRejectedValue(new Error('transaction rolled back'));
+
+    const result = await service.complete({
+      state: getAuthorizationInput()?.state,
+      code: 'one-time-code',
+      browserBinding: start.bindingCookie.value,
+    });
+
+    const redirect = new URL(result.redirectUrl);
+    expect(redirect.pathname).toBe('/cadastro');
+    expect(redirect.searchParams.get('reason')).toBe('failed');
+    expect(result.token).toBeUndefined();
+  });
+
+  it.each([
+    ['access_denied', 'cancelled'],
+    ['temporarily_unavailable', 'failed'],
+  ] as const)(
+    'returns owner-signup provider %s to cadastro as %s without exchanging claims',
+    async (providerError, expectedReason) => {
+      const { getAuthorizationInput, oidcClient, ownerOnboarding, service } = setup();
+      const start = await service.start({
+        intent: OAuthIntent.signup_owner,
+        ownerName: 'Ana Silva',
+        familyName: 'Família Silva',
+        legalAcceptanceVersion: '2026-08-01',
+      });
+
+      const result = await service.complete({
+        state: getAuthorizationInput()?.state,
+        providerError,
+        browserBinding: start.bindingCookie.value,
+      });
+
+      const redirect = new URL(result.redirectUrl);
+      expect(redirect.pathname).toBe('/cadastro');
+      expect(redirect.searchParams.get('reason')).toBe(expectedReason);
+      expect(oidcClient.exchangeCode).not.toHaveBeenCalled();
+      expect(ownerOnboarding.completeGoogleOwnerSignup).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not delegate signup when its persisted server-owned facts are incomplete', async () => {
+    const { getAuthorizationInput, getStoredAttempt, oidcClient, ownerOnboarding, service, setStoredAttempt } = setup();
+    const start = await service.start({
+      intent: OAuthIntent.signup_owner,
+      ownerName: 'Ana Silva',
+      familyName: 'Família Silva',
+      legalAcceptanceVersion: '2026-08-01',
+    });
+    const attempt = getStoredAttempt();
+    if (!attempt) throw new Error('Expected stored attempt');
+    setStoredAttempt({ ...attempt, signupFamilyName: null });
+    vi.mocked(oidcClient.exchangeCode).mockResolvedValue({
+      subject: 'new-google-subject',
+      email: 'new@example.com',
+      nonce: String(getAuthorizationInput()?.nonce),
+    });
+
+    const result = await service.complete({
+      state: getAuthorizationInput()?.state,
+      code: 'one-time-code',
+      browserBinding: start.bindingCookie.value,
+    });
+
+    expect(new URL(result.redirectUrl).pathname).toBe('/cadastro');
+    expect(new URL(result.redirectUrl).searchParams.get('reason')).toBe('failed');
+    expect(ownerOnboarding.completeGoogleOwnerSignup).not.toHaveBeenCalled();
   });
 
   it('never auto-creates or auto-links an unknown subject, even when its email could match locally', async () => {
@@ -343,7 +702,10 @@ describe('GoogleOAuthService', () => {
 
   it('requires an active local session for the same user at callback and never changes tenant or primary email', async () => {
     const { authService, getAuthorizationInput, oidcClient, prisma, service, tx } = setup();
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({ passwordHash: 'hash', identities: [] } as never);
+    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+      passwordHash: 'hash',
+      identities: [],
+    } as never);
     const start = await service.start(
       { intent: OAuthIntent.link_account, currentPassword: 'current-password' },
       currentUser,
@@ -353,7 +715,11 @@ describe('GoogleOAuthService', () => {
       email: 'different-google-email@example.com',
       nonce: String(getAuthorizationInput()?.nonce),
     });
-    tx.user.findUnique.mockResolvedValue({ id: 'local-user', isActive: true, profile: { status: 'active' } });
+    tx.user.findUnique.mockResolvedValue({
+      id: 'local-user',
+      isActive: true,
+      profile: { status: 'active' },
+    });
     tx.userIdentity.findUnique.mockResolvedValue(null);
 
     const mismatched = await service.complete({
@@ -412,7 +778,9 @@ describe('GoogleOAuthService', () => {
   it('scopes a valid unlink to the current user and rotates the session', async () => {
     const { authService, service, tx } = setup();
 
-    tx.user.findUnique.mockResolvedValue({ passwordHash: 'local-password-hash' });
+    tx.user.findUnique.mockResolvedValue({
+      passwordHash: 'local-password-hash',
+    });
     tx.userIdentity.deleteMany.mockResolvedValue({ count: 1 });
     const result = await service.unlink('local-user', 'current-password');
     expect(authService.confirmCurrentPassword).toHaveBeenCalledWith('local-user', 'current-password');

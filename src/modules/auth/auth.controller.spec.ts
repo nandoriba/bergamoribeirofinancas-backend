@@ -14,6 +14,7 @@ const user: AuthenticatedUser = {
   tenantRole: 'owner',
   familyId: 'family-1',
   profileId: 'profile-1',
+  requiredAction: null,
 };
 
 function setup() {

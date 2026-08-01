@@ -12,6 +12,10 @@ import { ProfilesController } from '../modules/profiles/profiles.controller';
 import { TelegramAuthCodesController } from '../modules/telegram/telegram-auth-codes.controller';
 import { TelegramWebhookController } from '../modules/telegram/telegram-webhook.controller';
 import { UsersController } from '../modules/users/users.controller';
+import {
+  ALLOW_PENDING_PAYMENT_ACCESS_KEY,
+  AllowPendingPaymentAccess,
+} from './allow-pending-payment-access.decorator';
 import { IS_PUBLIC_KEY, Public } from './public.decorator';
 import { TenantOwnerGuard } from './tenant-owner.guard';
 
@@ -25,6 +29,10 @@ const reflector = new Reflector();
 
 function isPublic(controller: ControllerType, handler: (...args: never[]) => unknown) {
   return reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [handler, controller]);
+}
+
+function allowsPendingPayment(controller: ControllerType, handler: (...args: never[]) => unknown) {
+  return reflector.getAllAndOverride<boolean>(ALLOW_PENDING_PAYMENT_ACCESS_KEY, [handler, controller]);
 }
 
 function expectThrottle(handler: (...args: never[]) => unknown, limit: number) {
@@ -46,6 +54,24 @@ describe('metadados de acesso dos controllers', () => {
     }
 
     expect(isPublic(FixtureController, FixtureController.prototype.endpoint)).toBe(true);
+  });
+
+  it('AllowPendingPaymentAccess marca o handler com a chave compartilhada', () => {
+    class FixtureController {
+      @AllowPendingPaymentAccess()
+      endpoint() {}
+    }
+
+    expect(
+      allowsPendingPayment(FixtureController, FixtureController.prototype.endpoint),
+    ).toBe(true);
+  });
+
+  it('libera somente sessão atual e logout durante pagamento pendente', () => {
+    expect(allowsPendingPayment(AuthController, AuthController.prototype.me)).toBe(true);
+    expect(allowsPendingPayment(AuthController, AuthController.prototype.logout)).toBe(true);
+    expect(allowsPendingPayment(AuthController, AuthController.prototype.methods)).toBeUndefined();
+    expect(allowsPendingPayment(UsersController, UsersController.prototype.updateTheme)).toBeUndefined();
   });
 
   it.each([

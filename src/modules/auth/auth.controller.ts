@@ -2,6 +2,7 @@ import { Body, Controller, Get, Post, Query, Req, Res, UseGuards } from '@nestjs
 import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 
+import { AllowPendingPaymentAccess } from '../../shared/allow-pending-payment-access.decorator';
 import { CurrentUser } from '../../shared/current-user.decorator';
 import { Public } from '../../shared/public.decorator';
 import { BrowserOriginGuard } from './browser-origin.guard';
@@ -81,6 +82,7 @@ export class AuthController {
   }
 
   @Get('me')
+  @AllowPendingPaymentAccess()
   async me(@CurrentUser() user: AuthenticatedUser) {
     return this.authService.me(user);
   }
@@ -104,6 +106,7 @@ export class AuthController {
   }
 
   @Post('logout')
+  @AllowPendingPaymentAccess()
   logout(@Res({ passthrough: true }) response: Response) {
     this.authService.clearSessionCookie(response);
     return { ok: true };

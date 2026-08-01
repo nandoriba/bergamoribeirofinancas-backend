@@ -22,9 +22,17 @@ Em `NODE_ENV=development`, o CORS aceita origens loopback. As mutações de aute
 
 O login Google usa Authorization Code Flow no backend, PKCE S256, `state`, `nonce` e cookie de navegador transitório. Crie clientes Google diferentes para desenvolvimento e produção e registre exatamente o callback do ambiente, por exemplo `http://127.0.0.1:8180/auth/google/callback` no desenvolvimento. Depois configure `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, um `OAUTH_ATTEMPT_SECRET` independente e ative `GOOGLE_OAUTH_ENABLED=true`.
 
-O fluxo `login` só aceita uma identidade Google já vinculada; ele nunca cria usuário nem vincula por coincidência de email. O vínculo é iniciado em Configurações e exige a senha local atual. As intenções `signup_owner` e `accept_invite` permanecem fechadas até as fatias específicas de onboarding e convite.
+O fluxo `login` só aceita uma identidade Google já vinculada; ele nunca cria usuário nem vincula por coincidência de email. O vínculo é iniciado em Configurações e exige a senha local atual. `signup_owner` só abre com `OWNER_SIGNUP_ENABLED=true`, persiste nomes e aceite legal na tentativa server-side e cria tenant/owner/identidade em uma única transação. `accept_invite` permanece fechado até a fatia de convites.
 
-Em produção, `COOKIE_SECURE=true` e callback HTTPS são obrigatórios. A configuração Nginx desativa o access log apenas na rota exata do callback para não gravar `code` ou `state` da query.
+Em produção, `COOKIE_SECURE=true` e callback HTTPS são obrigatórios. A configuração Nginx desativa logs apenas nas rotas exatas do callback e da continuação do reset, evitando gravar segredos presentes na query.
+
+## Onboarding e e-mail transacional
+
+O cadastro local cria família, owner, perfil, aceite legal, desafio de verificação e outbox no mesmo commit. O código de seis dígitos fica armazenado somente como HMAC; a cópia necessária ao envio fica cifrada na outbox e é apagada após entrega ou descarte. O worker envia pelo Resend depois do commit, com chave de idempotência e retries limitados.
+
+Configure `EMAIL_PROVIDER=resend`, `RESEND_API_KEY`, `EMAIL_FROM`, `PUBLIC_API_ORIGIN`, `SUPPORT_EMAIL` e segredos independentes em `ACTION_TOKEN_SECRET` e `EMAIL_OUTBOX_SECRET`. Recuperação de senha usa link de uso único, cookie transitório HttpOnly e incrementa `authVersion`, invalidando sessões anteriores. O fluxo também permite que uma conta originalmente Google-only defina uma senha.
+
+Owners novos ficam com `requiredAction=payment`; o guard global libera apenas sessão/logout enquanto `Family.pendingPaymentExpiresAt` estiver preenchido. `OWNER_SIGNUP_ENABLED` permanece `false` até a fatia seguinte publicar checkout e cobrança. Termos e privacidade incluídos no frontend são uma versão operacional preliminar e exigem revisão jurídica antes da ativação.
 
 ## Banco Local
 
@@ -40,6 +48,13 @@ O seed cria apenas estrutura inicial: família, admin local, perfil, contas e ca
 - `GET /auth/google/callback`
 - `GET /auth/methods`
 - `POST /auth/google/unlink`
+- `GET /auth/onboarding/config`
+- `POST /auth/signup/owner`
+- `POST /auth/email-verification/confirm`
+- `POST /auth/email-verification/resend`
+- `POST /auth/password-reset/request`
+- `GET /auth/password-reset/continue`
+- `POST /auth/password-reset/confirm`
 - `GET /auth/me`
 - `POST /auth/logout`
 - `POST /member-invites`
@@ -53,3 +68,5 @@ O seed cria apenas estrutura inicial: família, admin local, perfil, contas e ca
 - `CRUD /recurring`
 - `CRUD /installments`
 - `GET /reports/monthly`
+
+A solicitação de reset persiste primeiro uma fila genérica cifrada; a busca de conta e a emissão atômica de token/outbox acontecem somente no worker recuperável.

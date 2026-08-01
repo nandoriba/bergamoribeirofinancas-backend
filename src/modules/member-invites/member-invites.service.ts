@@ -1,8 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { PlatformRole } from '@prisma/client';
-import bcrypt from 'bcryptjs';
-import { randomBytes } from 'node:crypto';
+import { Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 
 import { PrismaService } from '../../prisma/prisma.service';
 import type { AuthenticatedUser } from '../auth/auth.types';
@@ -11,32 +7,10 @@ import { RegisterWithInviteDto } from './dto/register-with-invite.dto';
 
 @Injectable()
 export class MemberInvitesService {
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly config: ConfigService,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
-  async create(user: AuthenticatedUser, dto: CreateMemberInviteDto) {
-    const token = randomBytes(24).toString('hex');
-    const expiresAt = new Date(Date.now() + (dto.expiresInDays ?? 7) * 24 * 60 * 60 * 1000);
-    const invite = await this.prisma.memberInvite.create({
-      data: {
-        token,
-        email: dto.email?.toLowerCase(),
-        expiresAt,
-        creatorUserId: user.id,
-        familyId: user.familyId,
-      },
-    });
-
-    return {
-      id: invite.id,
-      token: invite.token,
-      email: invite.email,
-      expiresAt: invite.expiresAt,
-      status: invite.status,
-      link: `${this.config.get<string>('WEB_ORIGIN') ?? 'http://127.0.0.1:8181'}/convite/${invite.token}`,
-    };
+  async create(_user: AuthenticatedUser, _dto: CreateMemberInviteDto): Promise<never> {
+    return this.inviteOnboardingUnavailable();
   }
 
   async list(user: AuthenticatedUser) {
@@ -72,68 +46,13 @@ export class MemberInvitesService {
     };
   }
 
-  async register(dto: RegisterWithInviteDto) {
-    const invite = await this.prisma.memberInvite.findUnique({
-      where: { token: dto.token },
-    });
+  async register(_dto: RegisterWithInviteDto): Promise<never> {
+    return this.inviteOnboardingUnavailable();
+  }
 
-    if (!invite || invite.status !== 'active' || invite.expiresAt < new Date()) {
-      throw new BadRequestException('Convite inválido ou expirado');
-    }
-
-    if (invite.email && invite.email !== dto.email.toLowerCase()) {
-      throw new BadRequestException('Convite emitido para outro email');
-    }
-
-    const existing = await this.prisma.user.findUnique({ where: { email: dto.email.toLowerCase() } });
-    if (existing) {
-      throw new BadRequestException('Email já cadastrado');
-    }
-
-    const passwordHash = await bcrypt.hash(dto.password, 12);
-
-    const result = await this.prisma.$transaction(async (tx) => {
-      const createdUser = await tx.user.create({
-        data: {
-          email: dto.email.toLowerCase(),
-          passwordHash,
-          name: dto.name,
-          platformRole: PlatformRole.user,
-          isActive: false,
-          familyId: invite.familyId,
-          profile: {
-            create: {
-              displayName: dto.name,
-              status: 'pending',
-              family: { connect: { id: invite.familyId } },
-            },
-          },
-        },
-        include: { profile: true },
-      });
-
-      const approval = await tx.memberApproval.create({
-        data: {
-          requestedEmail: createdUser.email,
-          requestedName: createdUser.name,
-          inviteId: invite.id,
-          familyId: invite.familyId,
-          userId: createdUser.id,
-        },
-      });
-
-      await tx.memberInvite.update({
-        where: { id: invite.id },
-        data: { status: 'used' },
-      });
-
-      return { user: createdUser, approval };
-    });
-
-    return {
-      status: 'pending',
-      userId: result.user.id,
-      approvalId: result.approval.id,
-    };
+  private inviteOnboardingUnavailable(): never {
+    throw new ServiceUnavailableException(
+      'Novos convites estão temporariamente indisponíveis enquanto a verificação de email é atualizada.',
+    );
   }
 }

@@ -10,6 +10,11 @@ const optionalSecret = z.preprocess(
   z.string().min(32).optional(),
 );
 
+const optionalEmail = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  z.string().trim().email().optional(),
+);
+
 const baseSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8180),
@@ -34,6 +39,30 @@ const baseSchema = z.object({
   OAUTH_ATTEMPT_SECRET: optionalSecret,
   OAUTH_ATTEMPT_KEY_VERSION: z.string().trim().min(1).max(32).default('v1'),
   OAUTH_ATTEMPT_TTL_SECONDS: z.coerce.number().int().min(120).max(600).default(300),
+  OWNER_SIGNUP_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  LEGAL_BUNDLE_VERSION: z.string().trim().regex(/^[A-Za-z0-9._-]{1,64}$/).default('2026-08-01'),
+  PENDING_PAYMENT_TTL_DAYS: z.coerce.number().int().min(1).max(30).default(7),
+  EMAIL_PROVIDER: z.enum(['disabled', 'resend']).default('disabled'),
+  ACTION_TOKEN_SECRET: optionalSecret,
+  EMAIL_OUTBOX_SECRET: optionalSecret,
+  EMAIL_OUTBOX_KEY_VERSION: z.string().trim().min(1).max(32).default('v1'),
+  EMAIL_VERIFICATION_TTL_MINUTES: z.coerce.number().int().min(5).max(60).default(15),
+  PASSWORD_RESET_TTL_MINUTES: z.coerce.number().int().min(10).max(120).default(30),
+  ACTION_TOKEN_MAX_ATTEMPTS: z.coerce.number().int().min(3).max(10).default(5),
+  ACTION_TOKEN_HOURLY_LIMIT: z.coerce.number().int().min(1).max(20).default(5),
+  ACTION_TOKEN_DAILY_LIMIT: z.coerce.number().int().min(1).max(50).default(10),
+  EMAIL_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().min(30).max(600).default(60),
+  EMAIL_DELIVERY_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(10_000),
+  RESEND_API_KEY: optionalNonBlankString,
+  EMAIL_FROM: optionalNonBlankString,
+  SUPPORT_EMAIL: optionalEmail,
+  PUBLIC_API_ORIGIN: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z.string().url().default('http://127.0.0.1:8180'),
+  ),
   INITIAL_ADMIN_EMAIL: z.string().email().default('admin@casaribeiro.local'),
   INITIAL_ADMIN_PASSWORD: z.string().min(8).default('change-me-local'),
   INITIAL_ADMIN_NAME: z.string().default('Administrador Casa Ribeiro'),
@@ -133,6 +162,88 @@ const schema = baseSchema.superRefine((config, context) => {
     }
   }
 
+  let publicApiOrigin: URL | undefined;
+  try {
+    publicApiOrigin = new URL(config.PUBLIC_API_ORIGIN);
+    if (
+      config.PUBLIC_API_ORIGIN !== publicApiOrigin.origin ||
+      !['http:', 'https:'].includes(publicApiOrigin.protocol) ||
+      publicApiOrigin.username ||
+      publicApiOrigin.password
+    ) {
+      throw new Error('Origin não canônica');
+    }
+  } catch {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['PUBLIC_API_ORIGIN'],
+      message: 'PUBLIC_API_ORIGIN deve ser uma origin HTTP(S) canônica.',
+    });
+  }
+
+  if (config.EMAIL_PROVIDER === 'resend') {
+    for (const key of [
+      'ACTION_TOKEN_SECRET',
+      'EMAIL_OUTBOX_SECRET',
+      'RESEND_API_KEY',
+      'EMAIL_FROM',
+    ] as const) {
+      if (!config[key]) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: 'Configuração obrigatória para envio transacional por e-mail.',
+        });
+      }
+    }
+
+    if (config.EMAIL_FROM && !validEmailSender(config.EMAIL_FROM)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['EMAIL_FROM'],
+        message: 'EMAIL_FROM deve conter um endereço de e-mail válido.',
+      });
+    }
+  }
+
+  if (config.OWNER_SIGNUP_ENABLED) {
+    if (config.EMAIL_PROVIDER !== 'resend') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['EMAIL_PROVIDER'],
+        message: 'O cadastro público exige o provedor de e-mail transacional Resend.',
+      });
+    }
+    if (!config.SUPPORT_EMAIL) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SUPPORT_EMAIL'],
+        message: 'O cadastro público exige um canal de suporte explícito.',
+      });
+    }
+  }
+
+  if (config.ACTION_TOKEN_DAILY_LIMIT < config.ACTION_TOKEN_HOURLY_LIMIT) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['ACTION_TOKEN_DAILY_LIMIT'],
+      message: 'O limite diário não pode ser menor que o limite por hora.',
+    });
+  }
+
+  const shortestActionTokenTtlSeconds =
+    Math.min(
+      config.EMAIL_VERIFICATION_TTL_MINUTES,
+      config.PASSWORD_RESET_TTL_MINUTES,
+    ) * 60;
+  if (config.EMAIL_RESEND_COOLDOWN_SECONDS >= shortestActionTokenTtlSeconds) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['EMAIL_RESEND_COOLDOWN_SECONDS'],
+      message: 'O cooldown de reenvio deve ser menor que os TTLs de verificação e reset.',
+    });
+  }
+
   if (config.NODE_ENV !== 'production') return;
 
   for (const origin of parsedWebOrigins) {
@@ -156,6 +267,19 @@ const schema = baseSchema.superRefine((config, context) => {
     });
   }
 
+  if (
+    config.EMAIL_PROVIDER === 'resend' &&
+    publicApiOrigin &&
+    (publicApiOrigin.protocol !== 'https:' ||
+      ['localhost', '127.0.0.1', '[::1]'].includes(publicApiOrigin.hostname))
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['PUBLIC_API_ORIGIN'],
+      message: 'PUBLIC_API_ORIGIN deve usar HTTPS público em produção.',
+    });
+  }
+
   for (const key of ['ABACATEPAY_DEV_API_KEY', 'ABACATEPAY_DEV_MONTHLY_PRODUCT_ID'] as const) {
     if (config[key]) {
       context.addIssue({
@@ -175,4 +299,11 @@ export function validateConfig(config: Record<string, unknown>) {
 
 export function configuration() {
   return validateConfig(process.env);
+}
+
+function validEmailSender(value: string): boolean {
+  const trimmed = value.trim();
+  const friendly = /^[^<>]{1,100}\s<([^<>\s]+@[^<>\s]+)>$/.exec(trimmed);
+  const address = friendly?.[1] ?? (/^[^<>\s]+@[^<>\s]+$/.test(trimmed) ? trimmed : undefined);
+  return Boolean(address && z.string().email().safeParse(address).success);
 }

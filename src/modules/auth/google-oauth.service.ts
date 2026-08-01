@@ -18,6 +18,7 @@ import { AuthService } from './auth.service';
 import type { StartGoogleOAuthDto } from './dto/start-google-oauth.dto';
 import { GoogleOidcClient, type VerifiedGoogleIdentity } from './google-oidc.client';
 import { OAuthAttemptCryptoService } from './oauth-attempt-crypto.service';
+import { OwnerOnboardingService, OwnerSignupConflictError } from './owner-onboarding.service';
 
 const GOOGLE_PROVIDER = IdentityProvider.google;
 const RANDOM_VALUE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -39,7 +40,16 @@ const ALLOWED_LOGIN_RETURN_PATHS = new Set([
   '/contas',
 ]);
 
-type CallbackReason = 'not_linked' | 'cancelled' | 'failed';
+type CallbackReason = 'not_linked' | 'account_exists' | 'cancelled' | 'failed';
+
+interface GoogleOAuthAttemptContext {
+  authenticatedUserId: string | null;
+  returnPath: string | null;
+  signupOwnerName: string | null;
+  signupFamilyName: string | null;
+  legalAcceptanceVersion: string | null;
+  legalAcceptedAt: Date | null;
+}
 
 class GoogleOAuthFlowError extends Error {
   constructor(readonly reason: CallbackReason) {
@@ -78,6 +88,7 @@ export class GoogleOAuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly authService: AuthService,
+    private readonly ownerOnboarding: OwnerOnboardingService,
     private readonly oidcClient: GoogleOidcClient,
     private readonly crypto: OAuthAttemptCryptoService,
     private readonly config: ConfigService,
@@ -88,7 +99,7 @@ export class GoogleOAuthService {
       throw new ServiceUnavailableException('Login com Google indisponível.');
     }
 
-    const returnPath = await this.validateStartContext(dto, currentUser);
+    const attemptContext = await this.validateStartContext(dto, currentUser);
     const secrets = this.crypto.generateAttemptSecrets();
     const persistedSecrets = this.crypto.prepareForPersistence(secrets);
     const authorizationUrl = await this.oidcClient.createAuthorizationUrl({
@@ -104,8 +115,7 @@ export class GoogleOAuthService {
       data: {
         ...persistedSecrets,
         intent: dto.intent,
-        authenticatedUserId: dto.intent === OAuthIntent.link_account ? currentUser?.id : null,
-        returnPath,
+        ...attemptContext,
         expiresAt: new Date(Date.now() + ttlSeconds * 1_000),
       },
     });
@@ -126,10 +136,17 @@ export class GoogleOAuthService {
     try {
       const state = this.validRandomValue(input.state);
       const stateHash = this.crypto.hashState(state);
-      const attempt = await this.prisma.oAuthAttempt.findUnique({ where: { stateHash } });
+      const attempt = await this.prisma.oAuthAttempt.findUnique({
+        where: { stateHash },
+      });
       if (!attempt) throw new GoogleOAuthFlowError('failed');
 
-      errorPath = attempt.intent === OAuthIntent.link_account ? '/configuracoes' : '/login';
+      errorPath =
+        attempt.intent === OAuthIntent.link_account
+          ? '/configuracoes'
+          : attempt.intent === OAuthIntent.signup_owner
+            ? '/cadastro'
+            : '/login';
       const browserBinding = this.validRandomValue(input.browserBinding);
       const browserBindingHash = this.crypto.hashBrowserBinding(browserBinding);
       if (
@@ -144,6 +161,9 @@ export class GoogleOAuthService {
         attempt.intent === OAuthIntent.link_account &&
         (!input.currentUser || input.currentUser.id !== attempt.authenticatedUserId)
       ) {
+        throw new GoogleOAuthFlowError('failed');
+      }
+      if (attempt.intent === OAuthIntent.signup_owner && input.currentUser) {
         throw new GoogleOAuthFlowError('failed');
       }
 
@@ -168,7 +188,10 @@ export class GoogleOAuthService {
         pkceVerifierCiphertext: attempt.pkceVerifierCiphertext,
         pkceVerifierKeyVersion: attempt.pkceVerifierKeyVersion,
       });
-      const identity = await this.oidcClient.exchangeCode({ code, codeVerifier });
+      const identity = await this.oidcClient.exchangeCode({
+        code,
+        codeVerifier,
+      });
       if (!this.crypto.nonceMatchesHash(identity.nonce, attempt.nonceHash)) {
         throw new GoogleOAuthFlowError('failed');
       }
@@ -177,15 +200,48 @@ export class GoogleOAuthService {
         const session = await this.completeLogin(identity);
         return {
           token: session.token,
-          redirectUrl: this.frontendUrl(attempt.returnPath ?? '/'),
+          redirectUrl: this.frontendUrl(
+            session.user.requiredAction === 'payment' ? '/pagamento/pendente' : (attempt.returnPath ?? '/'),
+          ),
         };
+      }
+
+      if (
+        attempt.intent === OAuthIntent.signup_owner &&
+        attempt.signupOwnerName &&
+        attempt.signupFamilyName &&
+        attempt.legalAcceptanceVersion &&
+        attempt.legalAcceptedAt
+      ) {
+        try {
+          const session = await this.ownerOnboarding.completeGoogleOwnerSignup({
+            subject: identity.subject,
+            email: identity.email,
+            ownerName: attempt.signupOwnerName,
+            familyName: attempt.signupFamilyName,
+            legalAcceptanceVersion: attempt.legalAcceptanceVersion,
+            legalAcceptedAt: attempt.legalAcceptedAt,
+          });
+          return {
+            token: session.token,
+            redirectUrl: this.frontendUrl('/pagamento/pendente'),
+          };
+        } catch (error) {
+          if (error instanceof OwnerSignupConflictError) {
+            throw new GoogleOAuthFlowError('account_exists');
+          }
+          throw error;
+        }
       }
 
       if (attempt.intent === OAuthIntent.link_account && attempt.authenticatedUserId) {
         const session = await this.completeLink(attempt.authenticatedUserId, identity);
         return {
           token: session.token,
-          redirectUrl: this.frontendUrl('/configuracoes', { oauth: 'success', action: 'linked' }),
+          redirectUrl: this.frontendUrl('/configuracoes', {
+            oauth: 'success',
+            action: 'linked',
+          }),
         };
       }
 
@@ -230,7 +286,10 @@ export class GoogleOAuthService {
 
     const deleted = await this.prisma.$transaction(
       async (tx) => {
-        const user = await tx.user.findUnique({ where: { id: userId }, select: { passwordHash: true } });
+        const user = await tx.user.findUnique({
+          where: { id: userId },
+          select: { passwordHash: true },
+        });
         if (!user?.passwordHash) throw new ConflictException('Mantenha ao menos um método de acesso.');
 
         return tx.userIdentity.deleteMany({
@@ -280,27 +339,89 @@ export class GoogleOAuthService {
     };
   }
 
-  private async validateStartContext(dto: StartGoogleOAuthDto, currentUser?: AuthenticatedUser) {
+  private async validateStartContext(
+    dto: StartGoogleOAuthDto,
+    currentUser?: AuthenticatedUser,
+  ): Promise<GoogleOAuthAttemptContext> {
     if (dto.intent === OAuthIntent.login) {
-      if (currentUser || dto.currentPassword) {
+      if (currentUser || dto.currentPassword || this.hasOwnerSignupFields(dto)) {
         throw new BadRequestException('Dados incompatíveis com o fluxo de login.');
       }
-      return this.resolveLoginReturnPath(dto.returnPath);
+      return this.attemptContext({
+        returnPath: this.resolveLoginReturnPath(dto.returnPath),
+      });
     }
 
     if (dto.intent === OAuthIntent.link_account) {
       if (!currentUser) throw new UnauthorizedException();
       if (!dto.currentPassword) throw new BadRequestException('Confirme sua senha atual.');
+      if (this.hasOwnerSignupFields(dto)) {
+        throw new BadRequestException('Dados incompatíveis com o vínculo de conta.');
+      }
       if (dto.returnPath && dto.returnPath !== '/configuracoes') {
         throw new BadRequestException('Destino de retorno inválido.');
       }
       await this.authService.confirmCurrentPassword(currentUser.id, dto.currentPassword);
       const methods = await this.getMethods(currentUser.id);
       if (methods.google.linked) throw new ConflictException('Conta Google já vinculada.');
-      return '/configuracoes';
+      return this.attemptContext({
+        authenticatedUserId: currentUser.id,
+        returnPath: '/configuracoes',
+      });
+    }
+
+    if (dto.intent === OAuthIntent.signup_owner) {
+      if (!(this.config.get<boolean>('OWNER_SIGNUP_ENABLED') ?? false)) {
+        throw new ServiceUnavailableException('Cadastro temporariamente indisponível.');
+      }
+      if (currentUser || dto.currentPassword !== undefined || dto.returnPath !== undefined) {
+        throw new BadRequestException('Dados incompatíveis com o cadastro.');
+      }
+
+      const ownerName = this.normalizedSignupName(dto.ownerName, 80);
+      const familyName = this.normalizedSignupName(dto.familyName, 100);
+      const currentLegalVersion = this.config.get<string>('LEGAL_BUNDLE_VERSION') ?? '2026-08-01';
+      if (!ownerName || !familyName) {
+        throw new BadRequestException('Informe os nomes do responsável e da família.');
+      }
+      if (dto.legalAcceptanceVersion !== currentLegalVersion) {
+        throw new ConflictException('Revise os dados e documentos legais antes de continuar.');
+      }
+
+      return this.attemptContext({
+        signupOwnerName: ownerName,
+        signupFamilyName: familyName,
+        legalAcceptanceVersion: currentLegalVersion,
+        legalAcceptedAt: new Date(),
+      });
     }
 
     throw new BadRequestException('Intenção OAuth indisponível nesta etapa.');
+  }
+
+  private attemptContext(overrides: Partial<GoogleOAuthAttemptContext> = {}): GoogleOAuthAttemptContext {
+    return {
+      authenticatedUserId: null,
+      returnPath: null,
+      signupOwnerName: null,
+      signupFamilyName: null,
+      legalAcceptanceVersion: null,
+      legalAcceptedAt: null,
+      ...overrides,
+    };
+  }
+
+  private hasOwnerSignupFields(dto: StartGoogleOAuthDto): boolean {
+    return dto.ownerName !== undefined || dto.familyName !== undefined || dto.legalAcceptanceVersion !== undefined;
+  }
+
+  private normalizedSignupName(value: string | undefined, maxLength: number): string | undefined {
+    if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
+    const normalized = value.trim().replace(/\s+/g, ' ');
+    if (normalized.length < 2 || normalized.length > maxLength) {
+      return undefined;
+    }
+    return normalized;
   }
 
   private resolveLoginReturnPath(returnPath?: string) {
@@ -348,7 +469,11 @@ export class GoogleOAuthService {
         async (tx) => {
           const user = await tx.user.findUnique({
             where: { id: userId },
-            select: { id: true, isActive: true, profile: { select: { status: true } } },
+            select: {
+              id: true,
+              isActive: true,
+              profile: { select: { status: true } },
+            },
           });
           if (!user || !user.isActive || user.profile?.status !== 'active') {
             throw new GoogleOAuthFlowError('failed');
@@ -394,10 +519,7 @@ export class GoogleOAuthService {
     const now = new Date();
     const consumedBefore = new Date(now.getTime() - CONSUMED_ATTEMPT_RETENTION_MS);
     const staleWhere: Prisma.OAuthAttemptWhereInput = {
-      OR: [
-        { consumedAt: null, expiresAt: { lte: now } },
-        { consumedAt: { lte: consumedBefore } },
-      ],
+      OR: [{ consumedAt: null, expiresAt: { lte: now } }, { consumedAt: { lte: consumedBefore } }],
     };
 
     for (let batch = 0; batch < maxBatches; batch += 1) {

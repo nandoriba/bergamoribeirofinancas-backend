@@ -5,7 +5,11 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import type { Request } from 'express';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import type { AuthenticatedUser, JwtPayload } from './auth.types';
+import {
+  requiredActionFromPendingPayment,
+  type AuthenticatedUser,
+  type JwtPayload,
+} from './auth.types';
 
 function extractJwtFromCookie(request: Request): string | null {
   return request.cookies?.financeiro_session ?? null;
@@ -28,11 +32,19 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       where: { id: payload.sub },
       include: {
         profile: true,
-        family: { select: { ownerUserId: true } },
+        family: { select: { ownerUserId: true, pendingPaymentExpiresAt: true } },
       },
     });
 
-    if (!user?.isActive || !user.profile || user.profile.status !== 'active') {
+    if (
+      !user?.isActive ||
+      !user.emailVerifiedAt ||
+      !user.profile ||
+      user.profile.status !== 'active' ||
+      !Number.isInteger(payload.authVersion) ||
+      payload.authVersion < 0 ||
+      user.authVersion !== payload.authVersion
+    ) {
       throw new UnauthorizedException('Sessão inválida');
     }
 
@@ -43,6 +55,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       tenantRole: user.family.ownerUserId === user.id ? 'owner' : 'member',
       familyId: user.familyId,
       profileId: user.profile.id,
+      requiredAction: requiredActionFromPendingPayment(user.family.pendingPaymentExpiresAt),
     };
   }
 }

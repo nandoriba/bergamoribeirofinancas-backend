@@ -7,12 +7,16 @@ import type { Response } from 'express';
 import { randomUUID } from 'node:crypto';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import type { AuthenticatedUser, JwtPayload } from './auth.types';
+import {
+  requiredActionFromPendingPayment,
+  type AuthenticatedUser,
+  type JwtPayload,
+} from './auth.types';
 
 const DUMMY_PASSWORD_HASH = '$2a$12$if2i1aU0zMN0sCeQf1OH2uyr2PwSJfsiaiVxNoRMV.v8KuvXLmjbC';
 const SESSION_USER_INCLUDE = {
   profile: true,
-  family: { select: { name: true, ownerUserId: true } },
+  family: { select: { name: true, ownerUserId: true, pendingPaymentExpiresAt: true } },
 } as const;
 
 type SessionUserRecord = Prisma.UserGetPayload<{ include: typeof SESSION_USER_INCLUDE }>;
@@ -27,12 +31,12 @@ export class AuthService {
 
   async login(email: string, password: string) {
     const user = await this.prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
+      where: { email: email.trim().toLowerCase() },
       include: SESSION_USER_INCLUDE,
     });
 
     const passwordMatches = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_PASSWORD_HASH);
-    if (!user || !user.profile || !user.passwordHash || !passwordMatches) {
+    if (!user || !user.profile || !user.passwordHash || !passwordMatches || !user.emailVerifiedAt) {
       throw new UnauthorizedException('Email ou senha inválidos');
     }
 
@@ -65,7 +69,13 @@ export class AuthService {
       include: SESSION_USER_INCLUDE,
     });
 
-    if (!user || !user.profile || !user.isActive || user.profile.status !== 'active') {
+    if (
+      !user ||
+      !user.profile ||
+      !user.emailVerifiedAt ||
+      !user.isActive ||
+      user.profile.status !== 'active'
+    ) {
       throw new UnauthorizedException('Usuário pendente ou inativo');
     }
 
@@ -97,11 +107,22 @@ export class AuthService {
       include: SESSION_USER_INCLUDE,
     });
 
-    return this.serializeUser(user, dbUser.name, dbUser.themePreference, dbUser.family.name);
+    return this.serializeUser(
+      {
+        ...user,
+        requiredAction: requiredActionFromPendingPayment(dbUser.family.pendingPaymentExpiresAt),
+      },
+      dbUser.name,
+      dbUser.themePreference,
+      dbUser.family.name,
+      dbUser.family.pendingPaymentExpiresAt,
+    );
   }
 
   private async createSession(user: SessionUserRecord) {
-    if (!user.profile) throw new UnauthorizedException('Usuário pendente ou inativo');
+    if (!user.profile || !user.emailVerifiedAt) {
+      throw new UnauthorizedException('Usuário pendente ou inativo');
+    }
 
     const authUser: AuthenticatedUser = {
       id: user.id,
@@ -110,15 +131,22 @@ export class AuthService {
       tenantRole: user.family.ownerUserId === user.id ? 'owner' : 'member',
       familyId: user.familyId,
       profileId: user.profile.id,
+      requiredAction: requiredActionFromPendingPayment(user.family.pendingPaymentExpiresAt),
     };
 
     return {
-      user: this.serializeUser(authUser, user.name, user.themePreference, user.family.name),
-      token: await this.sign(authUser),
+      user: this.serializeUser(
+        authUser,
+        user.name,
+        user.themePreference,
+        user.family.name,
+        user.family.pendingPaymentExpiresAt,
+      ),
+      token: await this.sign(authUser, user.authVersion),
     };
   }
 
-  private async sign(user: AuthenticatedUser) {
+  private async sign(user: AuthenticatedUser, authVersion: number) {
     const payload: JwtPayload = {
       jti: randomUUID(),
       sub: user.id,
@@ -127,6 +155,7 @@ export class AuthService {
       tenantRole: user.tenantRole,
       familyId: user.familyId,
       profileId: user.profileId,
+      authVersion,
     };
 
     return this.jwtService.signAsync(payload);
@@ -137,7 +166,9 @@ export class AuthService {
     name: string,
     themePreference: string,
     familyName?: string,
+    pendingPaymentExpiresAt?: Date | null,
   ) {
+    const supportEmail = this.config.get<string>('SUPPORT_EMAIL');
     return {
       id: user.id,
       email: user.email,
@@ -148,6 +179,11 @@ export class AuthService {
       familyName,
       profileId: user.profileId,
       themePreference,
+      requiredAction: user.requiredAction,
+      ...(supportEmail ? { supportEmail } : {}),
+      ...(pendingPaymentExpiresAt
+        ? { pendingPaymentExpiresAt: pendingPaymentExpiresAt.toISOString() }
+        : {}),
     };
   }
 }

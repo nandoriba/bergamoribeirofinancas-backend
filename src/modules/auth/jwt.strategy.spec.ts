@@ -27,6 +27,7 @@ describe('JwtStrategy', () => {
     tenantRole: 'owner',
     familyId: 'foreign-family',
     profileId: 'foreign-profile',
+    authVersion: 7,
   };
 
   it('ignores authorization claims and rebuilds the context from the database', async () => {
@@ -36,9 +37,14 @@ describe('JwtStrategy', () => {
       email: 'member@example.com',
       platformRole: PlatformRole.user,
       isActive: true,
+      emailVerifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+      authVersion: 7,
       familyId: 'real-family',
       profile: { id: 'real-profile', status: 'active' },
-      family: { ownerUserId: 'another-user' },
+      family: {
+        ownerUserId: 'another-user',
+        pendingPaymentExpiresAt: new Date('2026-08-08T00:00:00.000Z'),
+      },
     } as never);
 
     await expect(strategy.validate(forgedPayload)).resolves.toEqual({
@@ -48,6 +54,7 @@ describe('JwtStrategy', () => {
       tenantRole: 'member',
       familyId: 'real-family',
       profileId: 'real-profile',
+      requiredAction: 'payment',
     });
   });
 
@@ -56,10 +63,50 @@ describe('JwtStrategy', () => {
     vi.mocked(prisma.user.findUnique).mockResolvedValue({
       id: 'member-user',
       isActive: false,
+      emailVerifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+      authVersion: 7,
       profile: { id: 'real-profile', status: 'active' },
-      family: { ownerUserId: 'member-user' },
+      family: { ownerUserId: 'member-user', pendingPaymentExpiresAt: null },
     } as never);
 
     await expect(strategy.validate(forgedPayload)).rejects.toEqual(new UnauthorizedException('Sessão inválida'));
+  });
+
+  it('rejects a token issued before the current credential version', async () => {
+    const { prisma, strategy } = setup();
+    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+      id: 'member-user',
+      email: 'member@example.com',
+      platformRole: PlatformRole.user,
+      isActive: true,
+      emailVerifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+      authVersion: 8,
+      familyId: 'real-family',
+      profile: { id: 'real-profile', status: 'active' },
+      family: { ownerUserId: 'another-user', pendingPaymentExpiresAt: null },
+    } as never);
+
+    await expect(strategy.validate(forgedPayload)).rejects.toEqual(
+      new UnauthorizedException('Sessão inválida'),
+    );
+  });
+
+  it('rejects an unverified account even if every signed claim is current', async () => {
+    const { prisma, strategy } = setup();
+    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+      id: 'member-user',
+      email: 'member@example.com',
+      platformRole: PlatformRole.user,
+      isActive: true,
+      emailVerifiedAt: null,
+      authVersion: 7,
+      familyId: 'real-family',
+      profile: { id: 'real-profile', status: 'active' },
+      family: { ownerUserId: 'another-user', pendingPaymentExpiresAt: null },
+    } as never);
+
+    await expect(strategy.validate(forgedPayload)).rejects.toEqual(
+      new UnauthorizedException('Sessão inválida'),
+    );
   });
 });

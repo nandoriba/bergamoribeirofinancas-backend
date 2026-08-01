@@ -4,11 +4,18 @@ import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 
 import { AuthController } from './auth.controller';
+import { ActionTokenCryptoService } from './action-token-crypto.service';
 import { BrowserOriginGuard } from './browser-origin.guard';
 import { GoogleOAuthService } from './google-oauth.service';
 import { GoogleOidcClient } from './google-oidc.client';
 import { OAuthAttemptCryptoService } from './oauth-attempt-crypto.service';
+import { OwnerOnboardingController } from './owner-onboarding.controller';
+import { OwnerOnboardingService } from './owner-onboarding.service';
 import { OptionalJwtAuthGuard } from './optional-jwt-auth.guard';
+import { EmailOutboxService } from './email-outbox.service';
+import { ResendEmailProvider } from './resend-email.provider';
+import { TRANSACTIONAL_EMAIL_PROVIDER } from './transactional-email.provider';
+import { UserActionTokenService } from './user-action-token.service';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './jwt.strategy';
 
@@ -26,15 +33,24 @@ import { JwtStrategy } from './jwt.strategy';
       }),
     }),
   ],
-  controllers: [AuthController],
+  controllers: [AuthController, OwnerOnboardingController],
   providers: [
     AuthService,
+    ActionTokenCryptoService,
     BrowserOriginGuard,
+    EmailOutboxService,
     GoogleOAuthService,
     GoogleOidcClient,
     JwtStrategy,
     OAuthAttemptCryptoService,
+    OwnerOnboardingService,
     OptionalJwtAuthGuard,
+    ResendEmailProvider,
+    UserActionTokenService,
+    {
+      provide: TRANSACTIONAL_EMAIL_PROVIDER,
+      useExisting: ResendEmailProvider,
+    },
   ],
   exports: [AuthService],
 })

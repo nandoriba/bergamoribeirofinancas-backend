@@ -155,4 +155,99 @@ describe('validateConfig', () => {
       }),
     ).toThrow();
   });
+
+  it('mantém cadastro público fechado por padrão', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+    });
+
+    expect(config.OWNER_SIGNUP_ENABLED).toBe(false);
+    expect(config.EMAIL_PROVIDER).toBe('disabled');
+  });
+
+  it('falha cedo quando cadastro público é ativado sem e-mail e suporte', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        OWNER_SIGNUP_ENABLED: 'true',
+      }),
+    ).toThrow();
+  });
+
+  it('falha cedo quando Resend não possui todos os segredos e remetente', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        EMAIL_PROVIDER: 'resend',
+        RESEND_API_KEY: 're_secret',
+      }),
+    ).toThrow();
+  });
+
+  it('aceita onboarding explicitamente habilitado somente com configuração completa', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+      OWNER_SIGNUP_ENABLED: 'true',
+      EMAIL_PROVIDER: 'resend',
+      ACTION_TOKEN_SECRET: 'a'.repeat(32),
+      EMAIL_OUTBOX_SECRET: 'e'.repeat(32),
+      RESEND_API_KEY: 're_secret',
+      EMAIL_FROM: 'Finanças <hello@example.com>',
+      SUPPORT_EMAIL: 'support@example.com',
+      PUBLIC_API_ORIGIN: 'http://127.0.0.1:8180',
+    });
+
+    expect(config).toMatchObject({
+      OWNER_SIGNUP_ENABLED: true,
+      EMAIL_PROVIDER: 'resend',
+      LEGAL_BUNDLE_VERSION: '2026-08-01',
+    });
+  });
+
+  it('rejeita cooldown que possa sobreviver ao código ou link emitido', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        EMAIL_VERIFICATION_TTL_MINUTES: '5',
+        PASSWORD_RESET_TTL_MINUTES: '10',
+        EMAIL_RESEND_COOLDOWN_SECONDS: '600',
+      }),
+    ).toThrow();
+  });
+
+  it.each(['version with spaces', '../legal', '', 'x'.repeat(65)])(
+    'rejeita versão legal ambígua ou fora do limite: %s',
+    (version) => {
+      expect(() =>
+        validateConfig({
+          ...requiredConfig,
+          JWT_SECRET: 'x'.repeat(32),
+          LEGAL_BUNDLE_VERSION: version,
+        }),
+      ).toThrow();
+    },
+  );
+
+  it('exige PUBLIC_API_ORIGIN HTTPS público quando e-mail está ativo em produção', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        NODE_ENV: 'production',
+        COOKIE_SECURE: 'true',
+        JWT_SECRET: 'x'.repeat(32),
+        WEB_ORIGIN: 'https://app.example.com',
+        EMAIL_PROVIDER: 'resend',
+        ACTION_TOKEN_SECRET: 'a'.repeat(32),
+        EMAIL_OUTBOX_SECRET: 'e'.repeat(32),
+        RESEND_API_KEY: 're_secret',
+        EMAIL_FROM: 'hello@example.com',
+        PUBLIC_API_ORIGIN: 'http://127.0.0.1:8180',
+      }),
+    ).toThrow();
+  });
 });

@@ -43,6 +43,25 @@ enum UserActionTokenPurpose {
   password_reset
 }
 
+enum LegalAcceptanceSource {
+  local
+  google
+}
+
+enum EmailOutboxStatus {
+  pending
+  processing
+  sent
+  discarded
+}
+
+enum PasswordResetRequestStatus {
+  pending
+  processing
+  completed
+  discarded
+}
+
 enum ThemePreference {
   dark
   light
@@ -165,6 +184,7 @@ model User {
   themePreference          ThemePreference           @default(dark)
   isActive                 Boolean                   @default(true)
   emailVerifiedAt          DateTime?
+  authVersion              Int                       @default(0)
   familyId                 String
   family                   Family                    @relation("FamilyMembers", fields: [familyId], references: [id])
   ownedFamily              Family?                   @relation("FamilyOwner")
@@ -172,6 +192,7 @@ model User {
   identities               UserIdentity[]
   oauthAttempts            OAuthAttempt[]            @relation("OAuthAuthenticatedUser")
   actionTokens             UserActionToken[]
+  legalAcceptances         LegalAcceptance[]
   approvalsReceived        MemberApproval[]          @relation("ApprovalUser")
   invitesCreated           MemberInvite[]            @relation("InviteCreator")
   approvalsMade            MemberApproval[]          @relation("ApprovalReviewer")
@@ -197,6 +218,7 @@ model Family {
   subscriptions            Subscription[]
   subscriptionPayments     SubscriptionPayment[]
   paymentWebhookEvents     PaymentWebhookEvent[]
+  legalAcceptances         LegalAcceptance[]
   telegramAuthorizedGroups TelegramAuthorizedGroup[]
   pendingPaymentExpiresAt  DateTime?
   cancelledAt              DateTime?
@@ -265,6 +287,8 @@ model OAuthAttempt {
   memberInvite           MemberInvite? @relation(fields: [memberInviteId], references: [id], onDelete: Cascade)
   legalAcceptanceVersion String?
   legalAcceptedAt        DateTime?
+  signupOwnerName        String?
+  signupFamilyName       String?
   returnPath             String?
   expiresAt              DateTime
   consumedAt             DateTime?
@@ -288,10 +312,66 @@ model UserActionToken {
   revokedAt     DateTime?
   attempts      Int                    @default(0)
   lastAttemptAt DateTime?
+  emailOutbox   EmailOutbox?
   createdAt     DateTime               @default(now())
 
   @@index([userId, purpose, expiresAt])
   @@index([expiresAt, consumedAt, revokedAt])
+}
+
+model LegalAcceptance {
+  id            String                @id @default(uuid())
+  userId        String
+  familyId      String
+  bundleVersion String
+  source        LegalAcceptanceSource
+  acceptedAt    DateTime              @default(now())
+  user          User                  @relation(fields: [userId, familyId], references: [id, familyId], onDelete: Restrict, onUpdate: Restrict)
+  family        Family                @relation(fields: [familyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([userId, bundleVersion])
+  @@index([familyId, acceptedAt])
+}
+
+model EmailOutbox {
+  id                String            @id @default(uuid())
+  userActionTokenId String            @unique
+  token             UserActionToken   @relation(fields: [userActionTokenId], references: [id], onDelete: Cascade)
+  payloadCiphertext String?
+  payloadKeyVersion String
+  status            EmailOutboxStatus @default(pending)
+  attempts          Int               @default(0)
+  nextAttemptAt     DateTime?         @default(now())
+  lockedAt          DateTime?
+  providerMessageId String?
+  sentAt            DateTime?
+  discardedAt       DateTime?
+  lastErrorCode     String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([lockedAt])
+}
+
+model PasswordResetRequest {
+  id                String                     @id @default(uuid())
+  emailCiphertext   String?
+  payloadKeyVersion String
+  status            PasswordResetRequestStatus @default(pending)
+  attempts          Int                        @default(0)
+  nextAttemptAt     DateTime?                  @default(now())
+  lockedAt          DateTime?
+  expiresAt         DateTime
+  completedAt       DateTime?
+  discardedAt       DateTime?
+  lastErrorCode     String?
+  createdAt         DateTime                   @default(now())
+  updatedAt         DateTime                   @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([lockedAt])
+  @@index([expiresAt, status])
 }
 
 model MemberInvite {
