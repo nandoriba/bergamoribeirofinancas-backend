@@ -8,6 +8,7 @@ import { ActionTokenCryptoService } from './action-token-crypto.service';
 import { BrowserOriginGuard } from './browser-origin.guard';
 import { GoogleOAuthService } from './google-oauth.service';
 import { GoogleOidcClient } from './google-oidc.client';
+import { MemberInviteOnboardingService } from './member-invite-onboarding.service';
 import { OAuthAttemptCryptoService } from './oauth-attempt-crypto.service';
 import { OwnerOnboardingController } from './owner-onboarding.controller';
 import { OwnerOnboardingService } from './owner-onboarding.service';
@@ -42,6 +43,7 @@ import { JwtStrategy } from './jwt.strategy';
     GoogleOAuthService,
     GoogleOidcClient,
     JwtStrategy,
+    MemberInviteOnboardingService,
     OAuthAttemptCryptoService,
     OwnerOnboardingService,
     OptionalJwtAuthGuard,
@@ -52,6 +54,6 @@ import { JwtStrategy } from './jwt.strategy';
       useExisting: ResendEmailProvider,
     },
   ],
-  exports: [AuthService],
+  exports: [AuthService, BrowserOriginGuard, MemberInviteOnboardingService],
 })
 export class AuthModule {}

@@ -67,6 +67,7 @@ function setup(overrides: Record<string, unknown> = {}) {
     }),
   } as unknown as PrismaService;
   const actionTokens = {
+    assertEmailVerificationRecipientQuota: vi.fn(),
     prepareEmailVerification: vi.fn((_userId: string, email: string, issuedAt: Date) => ({
       ...prepared,
       token: { ...prepared.token, deliveryEmail: email, createdAt: issuedAt },
@@ -153,7 +154,9 @@ describe('OwnerOnboardingService', () => {
     expect(tx.user.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         id: expect.any(String),
-        email: 'owner@example.com',
+        email: expect.stringMatching(
+          /^pending-owner-[0-9a-f-]{36}@signup\.invalid$/,
+        ),
         passwordHash: 'bcrypt-hash',
         name: dto.ownerName,
         platformRole: PlatformRole.user,
@@ -178,6 +181,11 @@ describe('OwnerOnboardingService', () => {
       }),
     });
     expect(actionTokens.createPrepared).toHaveBeenCalledOnce();
+    expect(actionTokens.assertEmailVerificationRecipientQuota).toHaveBeenCalledWith(
+      tx,
+      'owner@example.com',
+      expect.any(Date),
+    );
     expect(tx.family.update).toHaveBeenCalledWith({
       where: { id: expect.any(String) },
       data: { ownerUserId: expect.any(String) },

@@ -7,6 +7,7 @@ import type { AuthenticatedUser } from './auth.types';
 import type { AuthService } from './auth.service';
 import { GoogleOAuthService } from './google-oauth.service';
 import type { GoogleOidcClient, GoogleAuthorizationInput } from './google-oidc.client';
+import type { MemberInviteOnboardingService } from './member-invite-onboarding.service';
 import { OAuthAttemptCryptoService } from './oauth-attempt-crypto.service';
 import { type OwnerOnboardingService, OwnerSignupConflictError } from './owner-onboarding.service';
 
@@ -87,6 +88,7 @@ function setup(configOverrides: Record<string, unknown> = {}) {
           createdAt: new Date(),
           consumedAt: null,
           memberInviteId: null,
+          inviteDisplayName: null,
           legalAcceptanceVersion: null,
           legalAcceptedAt: null,
           signupOwnerName: null,
@@ -122,6 +124,13 @@ function setup(configOverrides: Record<string, unknown> = {}) {
       user: { id: 'owner-user', requiredAction: 'payment' },
     }),
   } as unknown as OwnerOnboardingService;
+  const memberInviteOnboarding = {
+    prepareGoogleAttempt: vi.fn().mockResolvedValue({
+      memberInviteId: 'invite-1',
+      inviteDisplayName: 'Maria Ribeiro',
+    }),
+    completeGoogleAttempt: vi.fn().mockResolvedValue({ status: 'pending_approval' }),
+  } as unknown as MemberInviteOnboardingService;
   const oidcClient = {
     isEnabled: vi.fn().mockReturnValue(true),
     createAuthorizationUrl: vi.fn(async (input: GoogleAuthorizationInput) => {
@@ -133,13 +142,22 @@ function setup(configOverrides: Record<string, unknown> = {}) {
     exchangeCode: vi.fn(),
   } as unknown as GoogleOidcClient;
 
-  const service = new GoogleOAuthService(prisma, authService, ownerOnboarding, oidcClient, crypto, config);
+  const service = new GoogleOAuthService(
+    prisma,
+    authService,
+    ownerOnboarding,
+    memberInviteOnboarding,
+    oidcClient,
+    crypto,
+    config,
+  );
   return {
     authService,
     crypto,
     getAuthorizationInput: () => authorizationInput,
     getStoredAttempt: () => storedAttempt,
     oidcClient,
+    memberInviteOnboarding,
     ownerOnboarding,
     prisma,
     service,
@@ -156,7 +174,7 @@ describe('GoogleOAuthService', () => {
 
     const result = await service.start({
       intent: OAuthIntent.login,
-      returnPath: '/relatorios',
+      returnPath: '/membros',
     });
     const authorization = getAuthorizationInput();
     const stored = getStoredAttempt();
@@ -170,7 +188,7 @@ describe('GoogleOAuthService', () => {
     expect(stored).toMatchObject({
       intent: OAuthIntent.login,
       authenticatedUserId: null,
-      returnPath: '/relatorios',
+      returnPath: '/membros',
     });
     expect(serialized).not.toContain(authorization.state);
     expect(serialized).not.toContain(authorization.nonce);
@@ -230,10 +248,64 @@ describe('GoogleOAuthService', () => {
     },
   );
 
-  it('keeps the future invite intent closed until its domain slice is implemented', async () => {
-    const { service } = setup();
+  it('resolves an invite server-side and persists only its internal id and normalized member name', async () => {
+    const { getStoredAttempt, memberInviteOnboarding, service } = setup();
+    const inviteToken = 'a'.repeat(43);
 
-    await expect(service.start({ intent: OAuthIntent.accept_invite })).rejects.toMatchObject({ status: 400 });
+    await service.start({
+      intent: OAuthIntent.accept_invite,
+      inviteToken,
+      memberName: 'Maria Ribeiro',
+    });
+
+    expect(memberInviteOnboarding.prepareGoogleAttempt).toHaveBeenCalledWith({
+      token: inviteToken,
+      displayName: 'Maria Ribeiro',
+    });
+    expect(getStoredAttempt()).toMatchObject({
+      intent: OAuthIntent.accept_invite,
+      authenticatedUserId: null,
+      memberInviteId: 'invite-1',
+      inviteDisplayName: 'Maria Ribeiro',
+      returnPath: null,
+    });
+    expect(JSON.stringify(getStoredAttempt())).not.toContain(inviteToken);
+  });
+
+  it('rejects incomplete, authenticated or contaminated invite starts before calling the domain', async () => {
+    const incomplete = setup();
+    await expect(
+      incomplete.service.start({
+        intent: OAuthIntent.accept_invite,
+        inviteToken: 'a'.repeat(43),
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+
+    const authenticated = setup();
+    await expect(
+      authenticated.service.start(
+        {
+          intent: OAuthIntent.accept_invite,
+          inviteToken: 'a'.repeat(43),
+          memberName: 'Maria Ribeiro',
+        },
+        currentUser,
+      ),
+    ).rejects.toMatchObject({ status: 400 });
+
+    const contaminated = setup();
+    await expect(
+      contaminated.service.start({
+        intent: OAuthIntent.accept_invite,
+        inviteToken: 'a'.repeat(43),
+        memberName: 'Maria Ribeiro',
+        ownerName: 'Injected Owner',
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+
+    expect(incomplete.memberInviteOnboarding.prepareGoogleAttempt).not.toHaveBeenCalled();
+    expect(authenticated.memberInviteOnboarding.prepareGoogleAttempt).not.toHaveBeenCalled();
+    expect(contaminated.memberInviteOnboarding.prepareGoogleAttempt).not.toHaveBeenCalled();
   });
 
   it('starts anonymous owner signup with normalized names and server-owned legal facts', async () => {
@@ -464,7 +536,6 @@ describe('GoogleOAuthService', () => {
       getStoredAttempt,
       oidcClient,
       ownerOnboarding,
-      prisma,
       service,
     } = setup();
     const start = await service.start({
@@ -495,16 +566,79 @@ describe('GoogleOAuthService', () => {
       legalAcceptedAt: attempt?.legalAcceptedAt,
     });
     expect(result.token).toBe('owner-session-token');
-    expect(prisma.oAuthAttempt.update).toHaveBeenCalledWith({
-      where: { id: 'attempt-1' },
-      data: { authenticatedUserId: 'owner-user' },
-    });
     const redirect = new URL(result.redirectUrl);
     expect(redirect.pathname).toBe('/pagamento/pendente');
     expect(redirect.search).toBe('');
     expect(result.redirectUrl).not.toContain('verified-google-subject');
     expect(result.redirectUrl).not.toContain('verified%40example.com');
     expect(result.redirectUrl).not.toContain('Ana');
+  });
+
+  it('accepts an invite with the persisted internal reference and never creates a session before approval', async () => {
+    const {
+      getAuthorizationInput,
+      memberInviteOnboarding,
+      oidcClient,
+      service,
+    } = setup();
+    const start = await service.start({
+      intent: OAuthIntent.accept_invite,
+      inviteToken: 'a'.repeat(43),
+      memberName: 'Maria Ribeiro',
+    });
+    vi.mocked(oidcClient.exchangeCode).mockResolvedValue({
+      subject: 'invited-google-subject',
+      email: 'member@example.com',
+      name: 'Ignored Provider Name',
+      nonce: String(getAuthorizationInput()?.nonce),
+    });
+
+    const result = await service.complete({
+      state: getAuthorizationInput()?.state,
+      code: 'one-time-code',
+      browserBinding: start.bindingCookie.value,
+    });
+
+    expect(memberInviteOnboarding.completeGoogleAttempt).toHaveBeenCalledWith({
+      memberInviteId: 'invite-1',
+      inviteDisplayName: 'Maria Ribeiro',
+      identity: {
+        subject: 'invited-google-subject',
+        email: 'member@example.com',
+        name: 'Ignored Provider Name',
+        nonce: String(getAuthorizationInput()?.nonce),
+      },
+    });
+    expect(result.token).toBeUndefined();
+    const redirect = new URL(result.redirectUrl);
+    expect(redirect.pathname).toBe('/convite/resultado');
+    expect(redirect.searchParams.get('oauth')).toBe('success');
+    expect(redirect.searchParams.get('action')).toBe('pending_approval');
+    expect(result.redirectUrl).not.toContain('invite-1');
+    expect(result.redirectUrl).not.toContain('member%40example.com');
+  });
+
+  it('rejects an invite callback if the browser acquired a session after the OAuth start', async () => {
+    const { getAuthorizationInput, memberInviteOnboarding, oidcClient, service } = setup();
+    const start = await service.start({
+      intent: OAuthIntent.accept_invite,
+      inviteToken: 'a'.repeat(43),
+      memberName: 'Maria Ribeiro',
+    });
+
+    const result = await service.complete({
+      state: getAuthorizationInput()?.state,
+      code: 'one-time-code',
+      browserBinding: start.bindingCookie.value,
+      currentUser,
+    });
+
+    const redirect = new URL(result.redirectUrl);
+    expect(redirect.pathname).toBe('/convite/resultado');
+    expect(redirect.searchParams.get('reason')).toBe('failed');
+    expect(oidcClient.exchangeCode).not.toHaveBeenCalled();
+    expect(memberInviteOnboarding.completeGoogleAttempt).not.toHaveBeenCalled();
+    expect(result.token).toBeUndefined();
   });
 
   it('fails a signup callback if the browser acquired an authenticated session after start', async () => {

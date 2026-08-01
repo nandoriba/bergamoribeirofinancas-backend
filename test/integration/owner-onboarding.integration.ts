@@ -12,9 +12,11 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { ActionTokenCryptoService } from '../../src/modules/auth/action-token-crypto.service';
+import { pendingOwnerEmail } from '../../src/modules/auth/auth-security.util';
 import { AuthService } from '../../src/modules/auth/auth.service';
 import { EmailOutboxService } from '../../src/modules/auth/email-outbox.service';
 import { OwnerOnboardingService } from '../../src/modules/auth/owner-onboarding.service';
+import { renderTransactionalEmail } from '../../src/modules/auth/transactional-email.templates';
 import { UserActionTokenService } from '../../src/modules/auth/user-action-token.service';
 
 const WEB_ORIGIN = 'http://127.0.0.1:8181';
@@ -48,6 +50,8 @@ describe('onboarding de owner com PostgreSQL real', () => {
       ACTION_TOKEN_MAX_ATTEMPTS: 5,
       ACTION_TOKEN_HOURLY_LIMIT: 5,
       ACTION_TOKEN_DAILY_LIMIT: 10,
+      ACTION_TOKEN_RECIPIENT_HOURLY_LIMIT: 3,
+      ACTION_TOKEN_RECIPIENT_DAILY_LIMIT: 10,
       EMAIL_RESEND_COOLDOWN_SECONDS: 60,
       PENDING_PAYMENT_TTL_DAYS: 7,
       LEGAL_BUNDLE_VERSION: '2026-08-01',
@@ -92,7 +96,7 @@ describe('onboarding de owner com PostgreSQL real', () => {
     });
     const outbox = token.emailOutbox;
     expect(outbox?.status).toBe(EmailOutboxStatus.pending);
-    expect(token.user.email).toBe(email.toLowerCase());
+    expect(token.user.email).toBe(pendingOwnerEmail(token.user.id));
     expect(token.user.emailVerifiedAt).toBeNull();
     expect(token.user.isActive).toBe(true);
     expect(token.user.profile?.status).toBe('active');
@@ -117,6 +121,21 @@ describe('onboarding de owner com PostgreSQL real', () => {
     });
     expect(payload.kind).toBe('email_verification');
     if (payload.kind !== 'email_verification') throw new Error('Payload inesperado');
+    expect(payload.continuationPath).toBeUndefined();
+    const message = renderTransactionalEmail({
+      outboxId: outbox!.id,
+      tokenId: token.id,
+      recipient: token.deliveryEmail,
+      payload,
+      webOrigin: WEB_ORIGIN,
+      publicApiOrigin: baseUrl,
+      verificationTtlMinutes: 15,
+      resetTtlMinutes: 30,
+    });
+    expect(message.text).toContain(
+      `${WEB_ORIGIN}/verificar-email?challenge=${token.id}`,
+    );
+    expect(message.text).not.toContain('/convite/verificacao');
     expect(outbox?.payloadCiphertext).not.toContain(payload.code);
     expect(token.secretHash).not.toBe(payload.code);
 
@@ -127,7 +146,13 @@ describe('onboarding de owner com PostgreSQL real', () => {
     expect(confirmations.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     expect(confirmations.filter((result) => result.status === 'rejected')).toHaveLength(1);
 
-    const cookie = await login(baseUrl, token.user.email, LOCAL_PASSWORD, 201);
+    const promotedOwner = await prisma.user.findUniqueOrThrow({
+      where: { id: token.user.id },
+    });
+    expect(promotedOwner.email).toBe(email.toLowerCase());
+    expect(promotedOwner.emailVerifiedAt).toBeInstanceOf(Date);
+
+    const cookie = await login(baseUrl, email.toLowerCase(), LOCAL_PASSWORD, 201);
     const meResponse = await fetch(`${baseUrl}/auth/me`, { headers: { cookie } });
     expect(meResponse.status).toBe(200);
     const me = (await meResponse.json()) as Record<string, unknown>;
@@ -140,7 +165,7 @@ describe('onboarding de owner com PostgreSQL real', () => {
     expect(blocked.code).toBe('PAYMENT_REQUIRED');
 
     const resetRequestedAt = new Date();
-    await actionTokens.requestPasswordReset(token.user.email);
+    await actionTokens.requestPasswordReset(email.toLowerCase());
     await actionTokens.dispatchPasswordResetRequests();
     const reset = await latestPayload(token.user.id, UserActionTokenPurpose.password_reset);
     await expectResetRequestCompleted(resetRequestedAt);
@@ -155,41 +180,121 @@ describe('onboarding de owner com PostgreSQL real', () => {
 
     const staleSession = await fetch(`${baseUrl}/auth/me`, { headers: { cookie } });
     expect(staleSession.status).toBe(401);
-    await login(baseUrl, token.user.email, LOCAL_PASSWORD, 401);
-    await login(baseUrl, token.user.email, RESET_PASSWORD, 201);
+    await login(baseUrl, email.toLowerCase(), LOCAL_PASSWORD, 401);
+    await login(baseUrl, email.toLowerCase(), RESET_PASSWORD, 201);
   });
 
-  it('resolve cadastros concorrentes e variantes canônicas de e-mail em um único tenant', async () => {
+  it('não reserva e-mail, aplica quota cross-tenant e promove somente um owner', async () => {
     const suffix = randomUUID();
     const canonicalEmail = `concurrent-${suffix}@example.com`;
-    const first = onboarding.registerLocalOwner({
+    const first = await onboarding.registerLocalOwner({
       ownerName: 'Owner Concorrente',
       familyName: 'Família Concorrente A',
       email: `  ${canonicalEmail.toUpperCase()}  `,
       password: LOCAL_PASSWORD,
       legalAcceptanceVersion: '2026-08-01',
     });
-    const second = onboarding.registerLocalOwner({
+    const second = await onboarding.registerLocalOwner({
       ownerName: 'Outro Owner',
       familyName: 'Família Concorrente B',
       email: canonicalEmail,
       password: LOCAL_PASSWORD,
       legalAcceptanceVersion: '2026-08-01',
     });
+    expect(await prisma.user.count({ where: { email: canonicalEmail } })).toBe(0);
 
-    const results = await Promise.allSettled([first, second]);
-    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
-    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const quotaRace = await Promise.allSettled([
+      onboarding.registerLocalOwner({
+        ownerName: 'Terceiro Owner',
+        familyName: 'Família Concorrente C',
+        email: canonicalEmail,
+        password: LOCAL_PASSWORD,
+        legalAcceptanceVersion: '2026-08-01',
+      }),
+      onboarding.registerLocalOwner({
+        ownerName: 'Quarto Owner',
+        familyName: 'Família Concorrente D',
+        email: canonicalEmail,
+        password: LOCAL_PASSWORD,
+        legalAcceptanceVersion: '2026-08-01',
+      }),
+    ]);
+    const quotaWinner = quotaRace.find(
+      (result): result is PromiseFulfilledResult<typeof first> =>
+        result.status === 'fulfilled',
+    );
+    const quotaLoser = quotaRace.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    expect(quotaWinner).toBeDefined();
+    expect(quotaLoser?.reason).toMatchObject({ status: 429 });
 
-    const users = await prisma.user.findMany({
-      where: { email: canonicalEmail },
-      include: { family: true },
+    const firstWindowChallenges = [
+      first.challengeId,
+      second.challengeId,
+      quotaWinner!.value.challengeId,
+    ];
+    const firstWindowTokens = await prisma.userActionToken.findMany({
+      where: { id: { in: firstWindowChallenges } },
+      include: { user: { include: { family: true } } },
     });
-    expect(users).toHaveLength(1);
-    expect(users[0]?.family.ownerUserId).toBe(users[0]?.id);
-    expect(
-      await prisma.family.count({ where: { id: users[0]?.familyId } }),
-    ).toBe(1);
+    expect(firstWindowTokens).toHaveLength(3);
+    expect(new Set(firstWindowTokens.map(({ userId }) => userId)).size).toBe(3);
+    for (const token of firstWindowTokens) {
+      expect(token.deliveryEmail).toBe(canonicalEmail);
+      expect(token.user.email).toBe(pendingOwnerEmail(token.user.id));
+      expect(token.user.family.ownerUserId).toBe(token.user.id);
+    }
+
+    await prisma.userActionToken.updateMany({
+      where: { id: { in: firstWindowChallenges } },
+      data: { createdAt: new Date(Date.now() - 25 * 60 * 60_000) },
+    });
+    const afterWindow = await onboarding.registerLocalOwner({
+      ownerName: 'Owner após janela',
+      familyName: 'Família após janela',
+      email: canonicalEmail,
+      password: LOCAL_PASSWORD,
+      legalAcceptanceVersion: '2026-08-01',
+    });
+
+    const allChallenges = [...firstWindowChallenges, afterWindow.challengeId];
+    const challengesWithCodes = await Promise.all(
+      allChallenges.map(async (challengeId) => {
+        const stored = await prisma.userActionToken.findUniqueOrThrow({
+          where: { id: challengeId },
+          include: { emailOutbox: true },
+        });
+        if (!stored.emailOutbox?.payloadCiphertext) throw new Error('Outbox ausente');
+        const payload = crypto.decryptOutboxPayload(stored.emailOutbox.id, {
+          payloadCiphertext: stored.emailOutbox.payloadCiphertext,
+          payloadKeyVersion: stored.emailOutbox.payloadKeyVersion,
+        });
+        if (payload.kind !== 'email_verification') throw new Error('Payload inesperado');
+        return { challengeId, userId: stored.userId, code: payload.code };
+      }),
+    );
+    const promotionRace = await Promise.allSettled(
+      challengesWithCodes.map(({ challengeId, code }) =>
+        actionTokens.confirmEmailVerification(challengeId, code),
+      ),
+    );
+    expect(promotionRace.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+    expect(promotionRace.filter(({ status }) => status === 'rejected')).toHaveLength(3);
+
+    const promoted = await prisma.user.findMany({ where: { email: canonicalEmail } });
+    expect(promoted).toHaveLength(1);
+    const loserChallenges = challengesWithCodes
+      .filter(({ userId }) => userId !== promoted[0]!.id)
+      .map(({ challengeId }) => challengeId);
+    const loserTokens = await prisma.userActionToken.findMany({
+      where: { id: { in: loserChallenges } },
+    });
+    expect(loserTokens).toHaveLength(3);
+    expect(loserTokens.every(({ consumedAt }) => consumedAt === null)).toBe(true);
+    await expect(
+      actionTokens.resendEmailVerification(loserChallenges[0]!),
+    ).rejects.toMatchObject({ status: 400 });
   });
 
   it('permite que owner Google-only defina senha sem remover a identidade', async () => {

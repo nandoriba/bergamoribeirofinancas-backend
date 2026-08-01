@@ -49,6 +49,39 @@ describe('StartGoogleOAuthDto', () => {
     });
   });
 
+  it('normalizes only the bounded invite token and member name for accept_invite', async () => {
+    await expect(
+      validate({
+        intent: OAuthIntent.accept_invite,
+        inviteToken: `  ${'a'.repeat(43)}  `,
+        memberName: '  Maria   Ribeiro  ',
+      }),
+    ).resolves.toMatchObject({
+      intent: OAuthIntent.accept_invite,
+      inviteToken: 'a'.repeat(43),
+      memberName: 'Maria Ribeiro',
+    });
+  });
+
+  it('rejects malformed invite credentials and client-owned tenant facts', async () => {
+    await expect(
+      validate({
+        intent: OAuthIntent.accept_invite,
+        inviteToken: 'short',
+        memberName: 'Maria Ribeiro',
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+
+    await expect(
+      validate({
+        intent: OAuthIntent.accept_invite,
+        inviteToken: 'a'.repeat(43),
+        memberName: 'Maria\nRibeiro',
+        familyId: 'forged-family',
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
   it('enforces owner-signup field limits without accepting client-owned facts', async () => {
     await expect(
       validate({

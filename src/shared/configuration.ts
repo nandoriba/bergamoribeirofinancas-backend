@@ -59,6 +59,8 @@ const baseSchema = z.object({
   ACTION_TOKEN_MAX_ATTEMPTS: z.coerce.number().int().min(3).max(10).default(5),
   ACTION_TOKEN_HOURLY_LIMIT: z.coerce.number().int().min(1).max(20).default(5),
   ACTION_TOKEN_DAILY_LIMIT: z.coerce.number().int().min(1).max(50).default(10),
+  ACTION_TOKEN_RECIPIENT_HOURLY_LIMIT: z.coerce.number().int().min(1).max(20).default(3),
+  ACTION_TOKEN_RECIPIENT_DAILY_LIMIT: z.coerce.number().int().min(1).max(100).default(10),
   EMAIL_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().min(30).max(600).default(60),
   EMAIL_DELIVERY_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(10_000),
   RESEND_API_KEY: optionalNonBlankString,
@@ -434,6 +436,17 @@ const schema = baseSchema.superRefine((config, context) => {
       code: z.ZodIssueCode.custom,
       path: ['ACTION_TOKEN_DAILY_LIMIT'],
       message: 'O limite diário não pode ser menor que o limite por hora.',
+    });
+  }
+
+  if (
+    config.ACTION_TOKEN_RECIPIENT_DAILY_LIMIT <
+    config.ACTION_TOKEN_RECIPIENT_HOURLY_LIMIT
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['ACTION_TOKEN_RECIPIENT_DAILY_LIMIT'],
+      message: 'O limite diário por destinatário não pode ser menor que o limite por hora.',
     });
   }
 

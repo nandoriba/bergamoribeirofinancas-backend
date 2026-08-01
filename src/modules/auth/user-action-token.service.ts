@@ -1,5 +1,7 @@
 import {
   BadRequestException,
+  HttpException,
+  HttpStatus,
   Injectable,
   Logger,
   ServiceUnavailableException,
@@ -18,11 +20,23 @@ import { randomUUID } from 'node:crypto';
 
 import { PrismaService } from '../../prisma/prisma.service';
 import {
+  evaluateSubscriptionProjection,
+  SUBSCRIPTION_ACCESS_SELECT,
+} from '../payments/subscription-access.projection';
+import {
   ActionTokenCryptoService,
+  INVITE_EMAIL_CONTINUATION_PATH,
   type ActionTokenPurpose,
   type EmailOutboxPayload,
 } from './action-token-crypto.service';
-import { assertPasswordFitsBcrypt, maskEmail, normalizeEmail } from './auth-security.util';
+import {
+  assertPasswordFitsBcrypt,
+  isInternalPendingEmail,
+  maskEmail,
+  normalizeEmail,
+  pendingInviteEmail,
+  pendingOwnerEmail,
+} from './auth-security.util';
 import { EmailOutboxService } from './email-outbox.service';
 
 const SERIALIZABLE_RETRIES = 3;
@@ -36,6 +50,15 @@ export interface VerificationMetadata {
   resendAvailableAt: Date;
   expiresAt: Date;
 }
+
+export interface PendingInviteVerificationResendResult {
+  verification: VerificationMetadata;
+  sent: boolean;
+}
+
+export type PendingInviteVerificationStatus =
+  | { status: 'verify_email'; verification: VerificationMetadata }
+  | { status: 'pending_approval' };
 
 export interface PreparedActionToken {
   token: {
@@ -77,6 +100,14 @@ interface LockedPasswordResetRequestRow {
   expiresAt: Date;
 }
 
+interface PendingInviteVerificationContext {
+  approvalId: string;
+  familyId: string;
+  inviteId: string;
+  requestedEmail: string;
+  currentSubscription: Parameters<typeof evaluateSubscriptionProjection>[0];
+}
+
 @Injectable()
 export class UserActionTokenService {
   private readonly logger = new Logger(UserActionTokenService.name);
@@ -89,14 +120,23 @@ export class UserActionTokenService {
     private readonly config: ConfigService,
   ) {}
 
-  prepareEmailVerification(userId: string, deliveryEmail: string, now = new Date()): PreparedActionToken {
+  prepareEmailVerification(
+    userId: string,
+    deliveryEmail: string,
+    now = new Date(),
+    continuationPath?: typeof INVITE_EMAIL_CONTINUATION_PATH,
+  ): PreparedActionToken {
     const code = this.crypto.generateVerificationCode();
     return this.prepare({
       purpose: UserActionTokenPurpose.email_verification,
       userId,
       deliveryEmail,
       secret: code,
-      payload: { kind: 'email_verification', code },
+      payload: {
+        kind: 'email_verification',
+        code,
+        ...(continuationPath ? { continuationPath } : {}),
+      },
       ttlMinutes: this.config.get<number>('EMAIL_VERIFICATION_TTL_MINUTES') ?? 15,
       now,
     });
@@ -147,15 +187,67 @@ export class UserActionTokenService {
     };
   }
 
+  verificationMetadataFromPersistedToken(row: {
+    id: string;
+    deliveryEmail: string;
+    expiresAt: Date;
+    createdAt: Date;
+  }): VerificationMetadata {
+    return this.metadataFromRow(row);
+  }
+
   dispatchPrepared(prepared: PreparedActionToken): void {
     this.outbox.kick(prepared.outbox.id);
+  }
+
+  async assertEmailVerificationRecipientQuota(
+    tx: Prisma.TransactionClient,
+    rawDeliveryEmail: string,
+    now = new Date(),
+  ): Promise<void> {
+    const deliveryEmail = validActionDeliveryEmail(rawDeliveryEmail);
+    if (!deliveryEmail) throw recipientRateLimitError();
+
+    const lockKey = [
+      'financeiro',
+      'recipient-action-token',
+      UserActionTokenPurpose.email_verification,
+      deliveryEmail,
+    ].join(':');
+    await tx.$queryRaw<Array<{ locked: string }>>`
+      SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))::text AS "locked"
+    `;
+
+    const [lastHour, lastDay] = await Promise.all([
+      tx.userActionToken.count({
+        where: {
+          purpose: UserActionTokenPurpose.email_verification,
+          deliveryEmail,
+          createdAt: { gte: new Date(now.getTime() - 60 * 60_000) },
+        },
+      }),
+      tx.userActionToken.count({
+        where: {
+          purpose: UserActionTokenPurpose.email_verification,
+          deliveryEmail,
+          createdAt: { gte: new Date(now.getTime() - 24 * 60 * 60_000) },
+        },
+      }),
+    ]);
+    const hourlyLimit =
+      this.config.get<number>('ACTION_TOKEN_RECIPIENT_HOURLY_LIMIT') ?? 3;
+    const dailyLimit =
+      this.config.get<number>('ACTION_TOKEN_RECIPIENT_DAILY_LIMIT') ?? 10;
+    if (lastHour >= hourlyLimit || lastDay >= dailyLimit) {
+      throw recipientRateLimitError();
+    }
   }
 
   async resendEmailVerification(challengeId: string): Promise<VerificationMetadata> {
     this.assertEmailDeliveryEnabled();
     const original = await this.prisma.userActionToken.findUnique({
       where: { id: challengeId },
-      select: { userId: true, purpose: true },
+      select: { userId: true, purpose: true, deliveryEmail: true },
     });
     if (!original || original.purpose !== UserActionTokenPurpose.email_verification) {
       this.crypto.secretMatches(dummyContext(UserActionTokenPurpose.email_verification), '000000', 'invalid');
@@ -164,27 +256,54 @@ export class UserActionTokenService {
 
     const result = await this.withSerializableRetry(async (tx) => {
       await this.lockUser(tx, original.userId);
+      const now = new Date();
       const user = await tx.user.findUnique({
         where: { id: original.userId },
-        select: { id: true, email: true, emailVerifiedAt: true, isActive: true },
+        select: {
+          id: true,
+          familyId: true,
+          email: true,
+          emailVerifiedAt: true,
+          isActive: true,
+        },
       });
       if (!user?.isActive || user.emailVerifiedAt) throw invalidVerificationError();
-
+      const destination = await this.ownerVerificationDestination(
+        tx,
+        user,
+        original.deliveryEmail,
+      );
+      if (!destination) throw invalidVerificationError();
+      if (destination.promoteEmail) {
+        const emailOwner = await tx.user.findUnique({
+          where: { email: destination.email },
+          select: { id: true },
+        });
+        if (emailOwner && emailOwner.id !== user.id) throw invalidVerificationError();
+      }
       const issuance = await this.checkIssuancePolicy(
         tx,
         user.id,
         UserActionTokenPurpose.email_verification,
-        new Date(),
+        now,
       );
       if (!issuance.allowed && issuance.latest) {
+        if (normalizeEmail(issuance.latest.deliveryEmail) !== destination.email) {
+          throw invalidVerificationError();
+        }
         return {
           metadata: this.metadataFromRow(issuance.latest),
           outboxId: undefined,
         };
       }
       if (!issuance.allowed) throw invalidVerificationError();
+      await this.assertEmailVerificationRecipientQuota(
+        tx,
+        destination.email,
+        now,
+      );
 
-      const prepared = this.prepareEmailVerification(user.id, user.email);
+      const prepared = this.prepareEmailVerification(user.id, destination.email, now);
       await this.revokeActiveTokens(tx, user.id, UserActionTokenPurpose.email_verification);
       await this.createPrepared(tx, prepared);
       return {
@@ -197,6 +316,196 @@ export class UserActionTokenService {
     return result.metadata;
   }
 
+  async resendPendingInviteEmailVerification(
+    challengeId: string,
+  ): Promise<PendingInviteVerificationResendResult> {
+    this.assertEmailDeliveryEnabled();
+    const original = await this.prisma.userActionToken.findUnique({
+      where: { id: challengeId },
+      select: { userId: true, purpose: true },
+    });
+    if (!original || original.purpose !== UserActionTokenPurpose.email_verification) {
+      this.crypto.secretMatches(
+        dummyContext(UserActionTokenPurpose.email_verification),
+        '000000',
+        'invalid',
+      );
+      throw invalidVerificationError();
+    }
+
+    const result = await this.withSerializableRetry(async (tx) => {
+      await this.lockUser(tx, original.userId);
+      const now = new Date();
+      const user = await tx.user.findUnique({
+        where: { id: original.userId },
+        select: { id: true, email: true, emailVerifiedAt: true, isActive: true },
+      });
+      const inviteContext = user
+        ? await this.pendingInviteVerificationContext(tx, user)
+        : undefined;
+      if (
+        !user ||
+        user.isActive ||
+        user.emailVerifiedAt ||
+        !inviteContext ||
+        normalizeEmail(user.email) !== pendingInviteEmail(user.id) ||
+        !evaluateSubscriptionProjection(
+          inviteContext.currentSubscription,
+          () => now,
+        ).accessAllowed
+      ) {
+        throw invalidVerificationError();
+      }
+
+      const emailOwner = await tx.user.findUnique({
+        where: { email: inviteContext.requestedEmail },
+        select: { id: true },
+      });
+      if (emailOwner && emailOwner.id !== user.id) throw invalidVerificationError();
+      const issuance = await this.checkIssuancePolicy(
+        tx,
+        user.id,
+        UserActionTokenPurpose.email_verification,
+        now,
+      );
+      if (!issuance.allowed && issuance.latest) {
+        if (
+          normalizeEmail(issuance.latest.deliveryEmail) !==
+          inviteContext.requestedEmail
+        ) {
+          throw invalidVerificationError();
+        }
+        return {
+          metadata: this.metadataFromRow(issuance.latest),
+          outboxId: undefined,
+        };
+      }
+      if (!issuance.allowed) throw invalidVerificationError();
+      await this.assertEmailVerificationRecipientQuota(
+        tx,
+        inviteContext.requestedEmail,
+        now,
+      );
+
+      const prepared = this.prepareEmailVerification(
+        user.id,
+        inviteContext.requestedEmail,
+        now,
+        INVITE_EMAIL_CONTINUATION_PATH,
+      );
+      await this.revokeActiveTokens(tx, user.id, UserActionTokenPurpose.email_verification);
+      await this.createPrepared(tx, prepared);
+      return {
+        metadata: this.verificationMetadata(prepared),
+        outboxId: prepared.outbox.id,
+      };
+    });
+
+    if (result.outboxId) this.outbox.kick(result.outboxId);
+    return {
+      verification: result.metadata,
+      sent: Boolean(result.outboxId),
+    };
+  }
+
+  async pendingInviteEmailVerificationStatus(
+    challengeId: string,
+  ): Promise<PendingInviteVerificationStatus> {
+    const original = await this.prisma.userActionToken.findUnique({
+      where: { id: challengeId },
+      select: { userId: true, purpose: true, deliveryEmail: true },
+    });
+    if (!original || original.purpose !== UserActionTokenPurpose.email_verification) {
+      throw invalidVerificationError();
+    }
+
+    const status = await this.withSerializableRetry(async (tx) => {
+      await this.lockUser(tx, original.userId);
+      const now = new Date();
+      const user = await tx.user.findUnique({
+        where: { id: original.userId },
+        select: {
+          id: true,
+          email: true,
+          passwordHash: true,
+          emailVerifiedAt: true,
+          isActive: true,
+        },
+      });
+      const inviteContext = user
+        ? await this.pendingInviteVerificationContext(tx, user)
+        : undefined;
+      if (
+        !user ||
+        user.isActive ||
+        !inviteContext ||
+        normalizeEmail(original.deliveryEmail) !== inviteContext.requestedEmail ||
+        !evaluateSubscriptionProjection(
+          inviteContext.currentSubscription,
+          () => now,
+        ).accessAllowed
+      ) {
+        return undefined;
+      }
+
+      const emailOwner = await tx.user.findUnique({
+        where: { email: inviteContext.requestedEmail },
+        select: { id: true },
+      });
+      if (emailOwner && emailOwner.id !== user.id) return undefined;
+
+      if (user.emailVerifiedAt) {
+        return normalizeEmail(user.email) === inviteContext.requestedEmail
+          ? ({ status: 'pending_approval' } as const)
+          : undefined;
+      }
+      if (
+        normalizeEmail(user.email) !== pendingInviteEmail(user.id) ||
+        !user.passwordHash
+      ) {
+        return undefined;
+      }
+
+      const latest = await tx.userActionToken.findFirst({
+        where: {
+          userId: user.id,
+          purpose: UserActionTokenPurpose.email_verification,
+          consumedAt: null,
+          deliveryEmail: {
+            equals: inviteContext.requestedEmail,
+            mode: 'insensitive',
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          purpose: true,
+          userId: true,
+          deliveryEmail: true,
+          expiresAt: true,
+          createdAt: true,
+          consumedAt: true,
+        },
+      });
+      if (
+        !latest ||
+        latest.purpose !== UserActionTokenPurpose.email_verification ||
+        latest.userId !== user.id ||
+        latest.consumedAt ||
+        normalizeEmail(latest.deliveryEmail) !== inviteContext.requestedEmail
+      ) {
+        return undefined;
+      }
+      return {
+        status: 'verify_email' as const,
+        verification: this.metadataFromRow(latest),
+      };
+    });
+
+    if (!status) throw invalidVerificationError();
+    return status;
+  }
+
   async confirmEmailVerification(challengeId: string, code: string): Promise<string> {
     const original = await this.prisma.userActionToken.findUnique({
       where: { id: challengeId },
@@ -207,9 +516,11 @@ export class UserActionTokenService {
       throw invalidVerificationError();
     }
 
-    const outcome = await this.withSerializableRetry(async (tx) => {
-      await this.lockUser(tx, original.userId);
-      const token = await this.lockToken(tx, challengeId);
+    let outcome: string | undefined;
+    try {
+      outcome = await this.withSerializableRetry(async (tx) => {
+        await this.lockUser(tx, original.userId);
+        const token = await this.lockToken(tx, challengeId);
       const context = token
         ? tokenContext(token)
         : dummyContext(UserActionTokenPurpose.email_verification);
@@ -244,28 +555,166 @@ export class UserActionTokenService {
         return undefined;
       }
 
-      const user = await tx.user.findUnique({
-        where: { id: token.userId },
-        select: { id: true, isActive: true, emailVerifiedAt: true },
-      });
-      if (!user?.isActive || user.emailVerifiedAt) return undefined;
+        const user = await tx.user.findUnique({
+          where: { id: token.userId },
+          select: {
+            id: true,
+            familyId: true,
+            email: true,
+            isActive: true,
+            emailVerifiedAt: true,
+          },
+        });
+        if (!user?.isActive || user.emailVerifiedAt) return undefined;
+        const destination = await this.ownerVerificationDestination(
+          tx,
+          user,
+          token.deliveryEmail,
+        );
+        if (!destination) return undefined;
+        if (destination.promoteEmail) {
+          const emailOwner = await tx.user.findUnique({
+            where: { email: destination.email },
+            select: { id: true },
+          });
+          if (emailOwner && emailOwner.id !== user.id) return undefined;
+        }
 
-      await tx.userActionToken.update({
-        where: { id: token.id },
-        data: { consumedAt: now, lastAttemptAt: now },
+        await tx.user.update({
+          where: { id: user.id },
+          data: {
+            ...(destination.promoteEmail ? { email: destination.email } : {}),
+            emailVerifiedAt: now,
+          },
+        });
+        await tx.userActionToken.update({
+          where: { id: token.id },
+          data: { consumedAt: now, lastAttemptAt: now },
+        });
+        await this.revokeActiveTokens(
+          tx,
+          user.id,
+          UserActionTokenPurpose.email_verification,
+          token.id,
+        );
+        return user.id;
       });
-      await tx.user.update({
-        where: { id: user.id },
-        data: { emailVerifiedAt: now },
-      });
-      await this.revokeActiveTokens(
-        tx,
-        user.id,
-        UserActionTokenPurpose.email_verification,
-        token.id,
-      );
-      return user.id;
+    } catch (error) {
+      if (isUniqueConflict(error)) throw invalidVerificationError();
+      throw error;
+    }
+
+    if (!outcome) throw invalidVerificationError();
+    return outcome;
+  }
+
+  async confirmPendingInviteEmailVerification(
+    challengeId: string,
+    code: string,
+  ): Promise<string> {
+    const original = await this.prisma.userActionToken.findUnique({
+      where: { id: challengeId },
+      select: { userId: true },
     });
+    if (!original) {
+      this.crypto.secretMatches(
+        dummyContext(UserActionTokenPurpose.email_verification),
+        code,
+        'invalid',
+      );
+      throw invalidVerificationError();
+    }
+
+    let outcome: string | undefined;
+    try {
+      outcome = await this.withSerializableRetry(async (tx) => {
+        await this.lockUser(tx, original.userId);
+        const token = await this.lockToken(tx, challengeId);
+        const context = token
+          ? tokenContext(token)
+          : dummyContext(UserActionTokenPurpose.email_verification);
+        const secretMatches = this.crypto.secretMatches(
+          context,
+          code,
+          token?.secretHash ?? 'invalid',
+        );
+        const now = new Date();
+        const maxAttempts = this.config.get<number>('ACTION_TOKEN_MAX_ATTEMPTS') ?? 5;
+        const active = Boolean(
+          token &&
+            token.purpose === UserActionTokenPurpose.email_verification &&
+            !token.consumedAt &&
+            !token.revokedAt &&
+            token.expiresAt > now &&
+            token.attempts < maxAttempts,
+        );
+
+        if (!token || !active || !secretMatches) {
+          if (token && active) {
+            const attempts = token.attempts + 1;
+            await tx.userActionToken.update({
+              where: { id: token.id },
+              data: {
+                attempts,
+                lastAttemptAt: now,
+                ...(attempts >= maxAttempts ? { revokedAt: now } : {}),
+              },
+            });
+          }
+          return undefined;
+        }
+
+        const user = await tx.user.findUnique({
+          where: { id: token.userId },
+          select: { id: true, email: true, isActive: true, emailVerifiedAt: true },
+        });
+        const inviteContext = user
+          ? await this.pendingInviteVerificationContext(tx, user)
+          : undefined;
+        if (
+          !user ||
+          user.isActive ||
+          user.emailVerifiedAt ||
+          !inviteContext ||
+          normalizeEmail(user.email) !== pendingInviteEmail(user.id) ||
+          !evaluateSubscriptionProjection(
+            inviteContext.currentSubscription,
+            () => now,
+          ).accessAllowed ||
+          normalizeEmail(token.deliveryEmail) !== inviteContext.requestedEmail
+        ) {
+          return undefined;
+        }
+
+        const emailOwner = await tx.user.findUnique({
+          where: { email: inviteContext.requestedEmail },
+          select: { id: true },
+        });
+        if (emailOwner) return undefined;
+
+        await tx.user.update({
+          where: { id: user.id },
+          data: {
+            email: inviteContext.requestedEmail,
+            emailVerifiedAt: now,
+          },
+        });
+        await tx.userActionToken.update({
+          where: { id: token.id },
+          data: { consumedAt: now, lastAttemptAt: now },
+        });
+        await this.revokeActiveTokens(
+          tx,
+          user.id,
+          UserActionTokenPurpose.email_verification,
+          token.id,
+        );
+        return user.id;
+      });
+    } catch (error) {
+      if (isUniqueConflict(error)) throw invalidVerificationError();
+      throw error;
+    }
 
     if (!outcome) throw invalidVerificationError();
     return outcome;
@@ -709,6 +1158,97 @@ export class UserActionTokenService {
     });
   }
 
+  private async pendingInviteVerificationContext(
+    tx: Prisma.TransactionClient,
+    user: { id: string; email: string },
+  ): Promise<PendingInviteVerificationContext | undefined> {
+    const profile = await tx.memberProfile.findUnique({
+      where: { userId: user.id },
+      select: {
+        familyId: true,
+        status: true,
+        family: {
+          select: {
+            currentSubscription: { select: SUBSCRIPTION_ACCESS_SELECT },
+          },
+        },
+      },
+    });
+    if (!profile || profile.status !== 'pending') return undefined;
+
+    const approvals = await tx.memberApproval.findMany({
+      where: {
+        userId: user.id,
+        familyId: profile.familyId,
+        status: 'pending',
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        inviteId: true,
+        familyId: true,
+        requestedEmail: true,
+        invite: { select: { id: true, familyId: true, status: true } },
+      },
+      take: 2,
+    });
+    if (approvals.length !== 1) return undefined;
+    const approval = approvals[0];
+    const requestedEmail = normalizeEmail(approval.requestedEmail);
+    if (
+      !requestedEmail ||
+      isInternalPendingEmail(requestedEmail) ||
+      approval.familyId !== profile.familyId ||
+      approval.inviteId !== approval.invite.id ||
+      approval.invite.familyId !== profile.familyId ||
+      approval.invite.status !== 'used'
+    ) {
+      return undefined;
+    }
+    return {
+      approvalId: approval.id,
+      familyId: profile.familyId,
+      inviteId: approval.inviteId,
+      requestedEmail,
+      currentSubscription: profile.family.currentSubscription,
+    };
+  }
+
+  private async ownerVerificationDestination(
+    tx: Prisma.TransactionClient,
+    user: { id: string; familyId: string; email: string },
+    rawDeliveryEmail: string,
+  ): Promise<{ email: string; promoteEmail: boolean } | undefined> {
+    const deliveryEmail = validActionDeliveryEmail(rawDeliveryEmail);
+    if (!deliveryEmail) return undefined;
+
+    const storedEmail = normalizeEmail(user.email);
+    const isLegacyRealEmail =
+      storedEmail === deliveryEmail && !isInternalPendingEmail(storedEmail);
+    const isPendingOwner = storedEmail === pendingOwnerEmail(user.id);
+    if (!isLegacyRealEmail && !isPendingOwner) return undefined;
+
+    const [profile, ownedFamily] = await Promise.all([
+      tx.memberProfile.findUnique({
+        where: { userId: user.id },
+        select: { familyId: true, status: true },
+      }),
+      tx.family.findFirst({
+        where: { id: user.familyId, ownerUserId: user.id },
+        select: { id: true },
+      }),
+    ]);
+    if (
+      !profile ||
+      profile.familyId !== user.familyId ||
+      profile.status !== 'active' ||
+      !ownedFamily
+    ) {
+      return undefined;
+    }
+    return { email: deliveryEmail, promoteEmail: isPendingOwner };
+  }
+
   private async lockUser(tx: Prisma.TransactionClient, userId: string) {
     await tx.$queryRaw<Array<{ id: string }>>`
       SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE
@@ -908,8 +1448,28 @@ function invalidVerificationError() {
   return new BadRequestException('Código inválido ou expirado.');
 }
 
+function recipientRateLimitError() {
+  return new HttpException(
+    'Não foi possível enviar a verificação.',
+    HttpStatus.TOO_MANY_REQUESTS,
+  );
+}
+
 function invalidResetError() {
   return new BadRequestException('Link de redefinição inválido ou expirado.');
+}
+
+function isUniqueConflict(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'P2002');
+}
+
+function validActionDeliveryEmail(value: string): string | undefined {
+  const email = normalizeEmail(value);
+  return email.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) &&
+    !isInternalPendingEmail(email)
+    ? email
+    : undefined;
 }
 
 function isRetryableTransactionError(error: unknown): boolean {

@@ -451,6 +451,25 @@ describe('validateConfig', () => {
     ).toThrow();
   });
 
+  it('valida limites persistentes por destinatário e aplica defaults seguros', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+    });
+    expect(config).toMatchObject({
+      ACTION_TOKEN_RECIPIENT_HOURLY_LIMIT: 3,
+      ACTION_TOKEN_RECIPIENT_DAILY_LIMIT: 10,
+    });
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ACTION_TOKEN_RECIPIENT_HOURLY_LIMIT: '4',
+        ACTION_TOKEN_RECIPIENT_DAILY_LIMIT: '3',
+      }),
+    ).toThrow();
+  });
+
   it.each(['version with spaces', '../legal', '', 'x'.repeat(65)])(
     'rejeita versão legal ambígua ou fora do limite: %s',
     (version) => {

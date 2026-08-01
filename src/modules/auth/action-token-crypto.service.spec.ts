@@ -103,6 +103,35 @@ describe('ActionTokenCryptoService', () => {
     );
   });
 
+  it('aceita somente a continuationPath fixa e chaves exatas na verificação', () => {
+    const service = createService();
+    const valid = service.encryptOutboxPayload('outbox-invite', {
+      kind: 'email_verification',
+      code: '123456',
+      continuationPath: '/convite/verificacao',
+    });
+    expect(service.decryptOutboxPayload('outbox-invite', valid)).toEqual({
+      kind: 'email_verification',
+      code: '123456',
+      continuationPath: '/convite/verificacao',
+    });
+    expect(() =>
+      service.encryptOutboxPayload('outbox-unsafe', {
+        kind: 'email_verification',
+        code: '123456',
+        continuationPath: 'https://evil.example',
+      } as never),
+    ).toThrow('Invalid email payload');
+    expect(() =>
+      service.encryptOutboxPayload('outbox-extra', {
+        kind: 'email_verification',
+        code: '123456',
+        continuationPath: '/convite/verificacao',
+        inviteToken: 'secret',
+      } as never),
+    ).toThrow('Invalid email payload');
+  });
+
   it('rejects ciphertext, tag and key-version tampering with one generic error', () => {
     const service = createService();
     const encrypted = service.encryptOutboxPayload('outbox-1', {

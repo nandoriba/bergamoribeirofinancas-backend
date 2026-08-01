@@ -18,7 +18,7 @@ identidade verificada no aceite Google.
 O cadastro local executa, sob isolamento `Serializable`, um único commit com:
 
 1. `Family` sem entitlement e com prazo de pagamento definido pelo servidor;
-2. `User` canônico, `emailVerifiedAt=null`, role de plataforma `user` e perfil ativo;
+2. `User` com placeholder interno `@signup.invalid`, `emailVerifiedAt=null`, role de plataforma `user` e perfil ativo; o e-mail solicitado fica somente no token/outbox até o OTP;
 3. owner da própria família;
 4. `LegalAcceptance` append-only com versão vigente e horário do servidor;
 5. `UserActionToken` de verificação;
@@ -36,12 +36,16 @@ O cadastro Google armazena nomes e aceite na tentativa OAuth antes do redirect. 
 - O payload necessário ao envio fica em AES-256-GCM com chave separada e AAD vinculada ao ID da outbox.
 - O dispatcher revalida o token antes de enviar, usa `Idempotency-Key`, recupera locks abandonados e limpa o ciphertext ao enviar ou descartar.
 - Reenvios possuem cooldown, limites persistentes por hora/dia, revogam desafios anteriores e serializam concorrência por usuário.
+- A emissão inicial e os reenvios que realmente criariam outro token também usam quota persistente por destinatário, cruzando usuários e tenants. Um advisory lock transacional impede que concorrência ultrapasse o limite; cooldown que apenas reapresenta metadados não consome quota.
 - Confirmação, consumo e mutação do usuário usam lock de linha. Tentativas inválidas incrementam atomicamente até o lockout.
+- A confirmação promove o e-mail real antes de consumir o desafio, no mesmo commit. Cadastros pendentes iguais não reservam o endereço: somente uma promoção vence a unicidade, e o desafio perdedor permanece não consumido. Owners legados com e-mail real e ainda não verificado continuam aceitos somente quando perfil e ownership da família conferem.
 - A solicitação pública de reset aguarda somente a inserção genérica de `PasswordResetRequest`, antes de qualquer busca de conta. O e-mail canônico fica cifrado em AES-256-GCM com domínio e AAD próprios, separados da outbox.
 - O worker reivindica a solicitação com lease persistente, recupera locks abandonados e limpa o ciphertext ao concluir ou descartar. Para contas elegíveis, token, outbox e conclusão da solicitação são gravados no mesmo commit; uma falha antes do commit permanece recuperável sem perder a solicitação.
 - Solicitações desconhecidas, inelegíveis ou limitadas por cooldown terminam no mesmo estado público, sem envio. Com o provider desabilitado, ficam pendentes até expirar e então são descartadas com limpeza do ciphertext.
 
 O link de reset é trocado por cookie transitório HttpOnly em `/auth/password-reset/continue`; o frontend recebe uma URL limpa. O Nginx desativa access/error logs na rota exata que recebe o segredo. A troca de senha consome o token e incrementa `authVersion` no mesmo commit, invalidando todos os JWTs anteriores. Uma conta Google-only pode criar sua primeira senha sem perder a identidade Google.
+
+O e-mail de owner continua em `/verificar-email?challenge=<UUID>`. Convites usam somente a continuation allowlisted `/convite/verificacao?challenge=<UUID>`; o payload cifrado nunca controla origin, query ou bearer do convite.
 
 ## Configuração
 
@@ -54,6 +58,8 @@ Além das variáveis de autenticação existentes:
 - `ACTION_TOKEN_SECRET`
 - `EMAIL_OUTBOX_SECRET`
 - `EMAIL_OUTBOX_KEY_VERSION`
+- `ACTION_TOKEN_RECIPIENT_HOURLY_LIMIT=3`
+- `ACTION_TOKEN_RECIPIENT_DAILY_LIMIT=10`
 - `RESEND_API_KEY`
 - `EMAIL_FROM`
 - `SUPPORT_EMAIL`

@@ -18,6 +18,8 @@ const TOKEN_DOMAIN = 'financeiro:user-action-token';
 const OUTBOX_DOMAIN = 'financeiro:email-outbox';
 const PASSWORD_RESET_REQUEST_DOMAIN = 'financeiro:password-reset-request';
 
+export const INVITE_EMAIL_CONTINUATION_PATH = '/convite/verificacao' as const;
+
 export type ActionTokenPurpose = 'email_verification' | 'password_reset';
 
 export interface ActionTokenContext {
@@ -28,7 +30,11 @@ export interface ActionTokenContext {
 }
 
 export type EmailOutboxPayload =
-  | { kind: 'email_verification'; code: string }
+  | {
+      kind: 'email_verification';
+      code: string;
+      continuationPath?: typeof INVITE_EMAIL_CONTINUATION_PATH;
+    }
   | { kind: 'password_reset'; resetToken: string };
 
 export interface EncryptedOutboxPayload {
@@ -107,6 +113,9 @@ export class ActionTokenCryptoService {
     outboxId: string,
     payload: EmailOutboxPayload,
   ): EncryptedOutboxPayload {
+    if (!isEmailOutboxPayload(payload)) {
+      throw new Error('Invalid email payload');
+    }
     const iv = randomBytes(AES_GCM_IV_BYTES);
     const cipher = createCipheriv('aes-256-gcm', this.outboxEncryptionKey, iv, {
       authTagLength: AES_GCM_TAG_BYTES,
@@ -325,10 +334,23 @@ function isEmailOutboxPayload(value: unknown): value is EmailOutboxPayload {
   const record = value as Record<string, unknown>;
 
   if (record.kind === 'email_verification') {
-    return typeof record.code === 'string' && /^\d{6}$/.test(record.code);
+    const keys = Object.keys(record).sort();
+    const continuationPath = record.continuationPath;
+    const allowedKeys = continuationPath === undefined
+      ? ['code', 'kind']
+      : ['code', 'continuationPath', 'kind'];
+    return (
+      keys.length === allowedKeys.length &&
+      keys.every((key, index) => key === allowedKeys[index]) &&
+      typeof record.code === 'string' &&
+      /^\d{6}$/.test(record.code) &&
+      (continuationPath === undefined ||
+        continuationPath === INVITE_EMAIL_CONTINUATION_PATH)
+    );
   }
 
   return (
+    Object.keys(record).length === 2 &&
     record.kind === 'password_reset' &&
     typeof record.resetToken === 'string' &&
     /^[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/.test(record.resetToken)

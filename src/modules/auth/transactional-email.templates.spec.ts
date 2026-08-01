@@ -47,6 +47,33 @@ describe('renderTransactionalEmail', () => {
     expect(message.html).toContain('Criar nova senha');
   });
 
+  it('usa a rota tokenless fixa do convite e injeta somente o challenge persistido', () => {
+    const message = renderTransactionalEmail({
+      ...base,
+      payload: {
+        kind: 'email_verification',
+        code: '123456',
+        continuationPath: '/convite/verificacao',
+      },
+    });
+
+    expect(message.text).toContain(
+      'https://app.example.com/convite/verificacao?challenge=11111111-1111-4111-8111-111111111111',
+    );
+    expect(message.text).not.toMatch(/\/convite\/[A-Za-z0-9_-]{43}/);
+
+    const unsafe = renderTransactionalEmail({
+      ...base,
+      payload: {
+        kind: 'email_verification',
+        code: '123456',
+        continuationPath: 'https://evil.example/steal',
+      } as never,
+    });
+    expect(unsafe.text).toContain('https://app.example.com/verificar-email?challenge=');
+    expect(unsafe.text).not.toContain('evil.example');
+  });
+
   it('escapes data interpolated into HTML and omits absent support contacts', () => {
     const message = renderTransactionalEmail({
       ...base,

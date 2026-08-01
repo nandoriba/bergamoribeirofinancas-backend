@@ -22,6 +22,7 @@ import type { AuthenticatedUser } from './auth.types';
 import { AuthService } from './auth.service';
 import type { StartGoogleOAuthDto } from './dto/start-google-oauth.dto';
 import { GoogleOidcClient, type VerifiedGoogleIdentity } from './google-oidc.client';
+import { MemberInviteOnboardingService } from './member-invite-onboarding.service';
 import { OAuthAttemptCryptoService } from './oauth-attempt-crypto.service';
 import { OwnerOnboardingService, OwnerSignupConflictError } from './owner-onboarding.service';
 
@@ -41,6 +42,7 @@ const ALLOWED_LOGIN_RETURN_PATHS = new Set([
   '/recorrentes',
   '/parcelamentos',
   '/relatorios',
+  '/membros',
   '/configuracoes',
   '/contas',
 ]);
@@ -49,6 +51,8 @@ type CallbackReason = 'not_linked' | 'account_exists' | 'cancelled' | 'failed';
 
 interface GoogleOAuthAttemptContext {
   authenticatedUserId: string | null;
+  memberInviteId: string | null;
+  inviteDisplayName: string | null;
   returnPath: string | null;
   signupOwnerName: string | null;
   signupFamilyName: string | null;
@@ -94,6 +98,7 @@ export class GoogleOAuthService {
     private readonly prisma: PrismaService,
     private readonly authService: AuthService,
     private readonly ownerOnboarding: OwnerOnboardingService,
+    private readonly memberInviteOnboarding: MemberInviteOnboardingService,
     private readonly oidcClient: GoogleOidcClient,
     private readonly crypto: OAuthAttemptCryptoService,
     private readonly config: ConfigService,
@@ -151,7 +156,9 @@ export class GoogleOAuthService {
           ? '/configuracoes'
           : attempt.intent === OAuthIntent.signup_owner
             ? '/cadastro'
-            : '/login';
+            : attempt.intent === OAuthIntent.accept_invite
+              ? '/convite/resultado'
+              : '/login';
       const browserBinding = this.validRandomValue(input.browserBinding);
       const browserBindingHash = this.crypto.hashBrowserBinding(browserBinding);
       if (
@@ -175,6 +182,9 @@ export class GoogleOAuthService {
         throw new GoogleOAuthFlowError('failed');
       }
       if (attempt.intent === OAuthIntent.signup_owner && input.currentUser) {
+        throw new GoogleOAuthFlowError('failed');
+      }
+      if (attempt.intent === OAuthIntent.accept_invite && input.currentUser) {
         throw new GoogleOAuthFlowError('failed');
       }
 
@@ -233,10 +243,6 @@ export class GoogleOAuthService {
             legalAcceptanceVersion: attempt.legalAcceptanceVersion,
             legalAcceptedAt: attempt.legalAcceptedAt,
           });
-          await this.prisma.oAuthAttempt.update({
-            where: { id: attempt.id },
-            data: { authenticatedUserId: session.user.id },
-          });
           return {
             token: session.token,
             redirectUrl: this.frontendUrl('/pagamento/pendente'),
@@ -247,6 +253,24 @@ export class GoogleOAuthService {
           }
           throw error;
         }
+      }
+
+      if (
+        attempt.intent === OAuthIntent.accept_invite &&
+        attempt.memberInviteId &&
+        attempt.inviteDisplayName
+      ) {
+        await this.memberInviteOnboarding.completeGoogleAttempt({
+          memberInviteId: attempt.memberInviteId,
+          inviteDisplayName: attempt.inviteDisplayName,
+          identity,
+        });
+        return {
+          redirectUrl: this.frontendUrl('/convite/resultado', {
+            oauth: 'success',
+            action: 'pending_approval',
+          }),
+        };
       }
 
       if (attempt.intent === OAuthIntent.link_account && attempt.authenticatedUserId) {
@@ -359,7 +383,12 @@ export class GoogleOAuthService {
     currentUser?: AuthenticatedUser,
   ): Promise<GoogleOAuthAttemptContext> {
     if (dto.intent === OAuthIntent.login) {
-      if (currentUser || dto.currentPassword || this.hasOwnerSignupFields(dto)) {
+      if (
+        currentUser ||
+        dto.currentPassword ||
+        this.hasOwnerSignupFields(dto) ||
+        this.hasInviteFields(dto)
+      ) {
         throw new BadRequestException('Dados incompatíveis com o fluxo de login.');
       }
       return this.attemptContext({
@@ -377,6 +406,9 @@ export class GoogleOAuthService {
       }
       if (!dto.currentPassword) throw new BadRequestException('Confirme sua senha atual.');
       if (this.hasOwnerSignupFields(dto)) {
+        throw new BadRequestException('Dados incompatíveis com o vínculo de conta.');
+      }
+      if (this.hasInviteFields(dto)) {
         throw new BadRequestException('Dados incompatíveis com o vínculo de conta.');
       }
       if (dto.returnPath && dto.returnPath !== '/configuracoes') {
@@ -398,6 +430,9 @@ export class GoogleOAuthService {
       if (currentUser || dto.currentPassword !== undefined || dto.returnPath !== undefined) {
         throw new BadRequestException('Dados incompatíveis com o cadastro.');
       }
+      if (this.hasInviteFields(dto)) {
+        throw new BadRequestException('Dados incompatíveis com o cadastro.');
+      }
 
       const ownerName = this.normalizedSignupName(dto.ownerName, 80);
       const familyName = this.normalizedSignupName(dto.familyName, 100);
@@ -417,12 +452,33 @@ export class GoogleOAuthService {
       });
     }
 
+    if (dto.intent === OAuthIntent.accept_invite) {
+      if (
+        currentUser ||
+        dto.currentPassword !== undefined ||
+        dto.returnPath !== undefined ||
+        this.hasOwnerSignupFields(dto) ||
+        !dto.inviteToken ||
+        !dto.memberName
+      ) {
+        throw new BadRequestException('Dados incompatíveis com o aceite do convite.');
+      }
+
+      const invite = await this.memberInviteOnboarding.prepareGoogleAttempt({
+        token: dto.inviteToken,
+        displayName: dto.memberName,
+      });
+      return this.attemptContext(invite);
+    }
+
     throw new BadRequestException('Intenção OAuth indisponível nesta etapa.');
   }
 
   private attemptContext(overrides: Partial<GoogleOAuthAttemptContext> = {}): GoogleOAuthAttemptContext {
     return {
       authenticatedUserId: null,
+      memberInviteId: null,
+      inviteDisplayName: null,
       returnPath: null,
       signupOwnerName: null,
       signupFamilyName: null,
@@ -434,6 +490,10 @@ export class GoogleOAuthService {
 
   private hasOwnerSignupFields(dto: StartGoogleOAuthDto): boolean {
     return dto.ownerName !== undefined || dto.familyName !== undefined || dto.legalAcceptanceVersion !== undefined;
+  }
+
+  private hasInviteFields(dto: StartGoogleOAuthDto): boolean {
+    return dto.inviteToken !== undefined || dto.memberName !== undefined;
   }
 
   private normalizedSignupName(value: string | undefined, maxLength: number): string | undefined {

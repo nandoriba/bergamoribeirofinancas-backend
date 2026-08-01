@@ -307,6 +307,7 @@ model OAuthAttempt {
   legalAcceptedAt        DateTime?
   signupOwnerName        String?
   signupFamilyName       String?
+  inviteDisplayName      String?
   returnPath             String?
   expiresAt              DateTime
   consumedAt             DateTime?
@@ -335,6 +336,7 @@ model UserActionToken {
 
   @@index([userId, purpose, expiresAt])
   @@index([expiresAt, consumedAt, revokedAt])
+  @@index([purpose, deliveryEmail, createdAt])
 }
 
 model LegalAcceptance {
@@ -416,7 +418,7 @@ model MemberApproval {
   status         ApprovalStatus @default(pending)
   requestedName  String
   requestedEmail String
-  inviteId       String
+  inviteId       String         @unique
   familyId       String
   invite         MemberInvite   @relation(fields: [inviteId, familyId], references: [id, familyId], onUpdate: Restrict)
   family         Family         @relation(fields: [familyId], references: [id])

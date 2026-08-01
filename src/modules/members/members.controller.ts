@@ -13,35 +13,25 @@ import { CurrentUser } from '../../shared/current-user.decorator';
 import { TenantOwnerGuard } from '../../shared/tenant-owner.guard';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { BrowserOriginGuard } from '../auth/browser-origin.guard';
-import { MemberApprovalsService } from './member-approvals.service';
+import { MembersService } from './members.service';
 
-@Controller('member-approvals')
+@Controller('members')
 @UseGuards(TenantOwnerGuard)
-export class MemberApprovalsController {
-  constructor(private readonly memberApprovalsService: MemberApprovalsService) {}
+export class MembersController {
+  constructor(private readonly membersService: MembersService) {}
 
   @Get()
   list(@CurrentUser() user: AuthenticatedUser) {
-    return this.memberApprovalsService.list(user);
+    return this.membersService.list(user);
   }
 
-  @Post(':id/approve')
+  @Post(':id/deactivate')
   @HttpCode(HttpStatus.OK)
   @UseGuards(BrowserOriginGuard)
-  approve(
+  deactivate(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id', new ParseUUIDPipe()) id: string,
   ) {
-    return this.memberApprovalsService.approve(user, id);
-  }
-
-  @Post(':id/reject')
-  @HttpCode(HttpStatus.OK)
-  @UseGuards(BrowserOriginGuard)
-  reject(
-    @CurrentUser() user: AuthenticatedUser,
-    @Param('id', new ParseUUIDPipe()) id: string,
-  ) {
-    return this.memberApprovalsService.reject(user, id);
+    return this.membersService.deactivate(user, id);
   }
 }

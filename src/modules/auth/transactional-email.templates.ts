@@ -1,4 +1,7 @@
-import type { EmailOutboxPayload } from './action-token-crypto.service';
+import {
+  INVITE_EMAIL_CONTINUATION_PATH,
+  type EmailOutboxPayload,
+} from './action-token-crypto.service';
 import type { TransactionalEmailMessage } from './transactional-email.provider';
 
 interface TemplateInput {
@@ -15,7 +18,11 @@ interface TemplateInput {
 
 export function renderTransactionalEmail(input: TemplateInput): TransactionalEmailMessage {
   if (input.payload.kind === 'email_verification') {
-    const verificationUrl = new URL('/verificar-email', input.webOrigin);
+    const continuationPath =
+      input.payload.continuationPath === INVITE_EMAIL_CONTINUATION_PATH
+        ? INVITE_EMAIL_CONTINUATION_PATH
+        : '/verificar-email';
+    const verificationUrl = new URL(continuationPath, input.webOrigin);
     verificationUrl.searchParams.set('challenge', input.tokenId);
     const code = input.payload.code;
     const support = supportSentence(input.supportEmail);

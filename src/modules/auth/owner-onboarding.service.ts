@@ -15,7 +15,12 @@ import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { assertPasswordFitsBcrypt, normalizeEmail } from './auth-security.util';
+import {
+  assertPasswordFitsBcrypt,
+  isInternalPendingEmail,
+  normalizeEmail,
+  pendingOwnerEmail,
+} from './auth-security.util';
 import { AuthService } from './auth.service';
 import type { RegisterOwnerDto } from './dto/register-owner.dto';
 import {
@@ -76,6 +81,9 @@ export class OwnerOnboardingService {
     const userId = randomUUID();
     const profileId = randomUUID();
     const email = normalizeEmail(dto.email);
+    if (isInternalPendingEmail(email)) {
+      throw new ConflictException('Não foi possível concluir o cadastro.');
+    }
     const passwordHash = await bcrypt.hash(dto.password, 12);
     const verification = this.actionTokens.prepareEmailVerification(userId, email, now);
     const pendingPaymentExpiresAt = new Date(
@@ -86,6 +94,11 @@ export class OwnerOnboardingService {
       await this.withSerializableRetry(async (tx) => {
         const existing = await tx.user.findUnique({ where: { email }, select: { id: true } });
         if (existing) throw new OwnerSignupConflictError();
+        await this.actionTokens.assertEmailVerificationRecipientQuota(
+          tx,
+          email,
+          now,
+        );
 
         await tx.family.create({
           data: {
@@ -97,7 +110,7 @@ export class OwnerOnboardingService {
         await tx.user.create({
           data: {
             id: userId,
-            email,
+            email: pendingOwnerEmail(userId),
             passwordHash,
             name: dto.ownerName,
             platformRole: PlatformRole.user,

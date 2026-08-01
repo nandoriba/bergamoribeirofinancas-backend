@@ -8,6 +8,7 @@ import { OptionalJwtAuthGuard } from '../modules/auth/optional-jwt-auth.guard';
 import { HealthController } from '../modules/health/health.controller';
 import { MemberApprovalsController } from '../modules/member-approvals/member-approvals.controller';
 import { MemberInvitesController } from '../modules/member-invites/member-invites.controller';
+import { MembersController } from '../modules/members/members.controller';
 import { ProfilesController } from '../modules/profiles/profiles.controller';
 import { PaymentsController } from '../modules/payments/payments.controller';
 import { AbacatePayWebhookController } from '../modules/payments/webhooks/abacatepay-webhook.controller';
@@ -98,14 +99,35 @@ describe('metadados de acesso dos controllers', () => {
     ).toBe(true);
     expect(allowsPendingPayment(AuthController, AuthController.prototype.methods)).toBeUndefined();
     expect(allowsPendingPayment(UsersController, UsersController.prototype.updateTheme)).toBeUndefined();
+    expect(
+      allowsPendingPayment(MembersController, MembersController.prototype.list),
+    ).toBeUndefined();
+    expect(
+      allowsPendingPayment(MembersController, MembersController.prototype.deactivate),
+    ).toBeUndefined();
   });
 
   it.each([
     ['login', AuthController, AuthController.prototype.login],
     ['início Google OAuth', AuthController, AuthController.prototype.startGoogle],
     ['callback Google OAuth', AuthController, AuthController.prototype.googleCallback],
-    ['consulta de convite', MemberInvitesController, MemberInvitesController.prototype.getPublic],
+    ['consulta de convite', MemberInvitesController, MemberInvitesController.prototype.resolve],
     ['cadastro de membro', MemberInvitesController, MemberInvitesController.prototype.register],
+    [
+      'confirmação de email do convite',
+      MemberInvitesController,
+      MemberInvitesController.prototype.confirmEmail,
+    ],
+    [
+      'reenvio de email do convite',
+      MemberInvitesController,
+      MemberInvitesController.prototype.resendEmail,
+    ],
+    [
+      'status de email do convite',
+      MemberInvitesController,
+      MemberInvitesController.prototype.emailVerificationStatus,
+    ],
     ['webhook do Telegram', TelegramWebhookController, TelegramWebhookController.prototype.receiveWebhook],
     [
       'webhook autenticado da AbacatePay',
@@ -124,7 +146,10 @@ describe('metadados de acesso dos controllers', () => {
     ['logout', AuthController, AuthController.prototype.logout],
     ['criação de convite', MemberInvitesController, MemberInvitesController.prototype.create],
     ['listagem de convites', MemberInvitesController, MemberInvitesController.prototype.list],
+    ['revogação de convite', MemberInvitesController, MemberInvitesController.prototype.revoke],
     ['aprovações de membros', MemberApprovalsController, MemberApprovalsController.prototype.list],
+    ['listagem de membros', MembersController, MembersController.prototype.list],
+    ['inativação de membro', MembersController, MembersController.prototype.deactivate],
     ['listagem de perfis', ProfilesController, ProfilesController.prototype.list],
     ['atualização de tema', UsersController, UsersController.prototype.updateTheme],
     ['código do grupo Telegram', TelegramAuthCodesController, TelegramAuthCodesController.prototype.createGroupCode],
@@ -160,6 +185,37 @@ describe('metadados de acesso dos controllers', () => {
     expectThrottle(MemberInvitesController.prototype.register, 3);
   });
 
+  it('limita resolução e verificação pública de convites', () => {
+    expectThrottle(MemberInvitesController.prototype.resolve, 30);
+    expectThrottle(MemberInvitesController.prototype.confirmEmail, 10);
+    expectThrottle(MemberInvitesController.prototype.resendEmail, 3);
+    expectThrottle(MemberInvitesController.prototype.emailVerificationStatus, 30);
+  });
+
+  it('exige Origin exata em todas as mutações e consultas públicas com token de convite', () => {
+    for (const handler of [
+      MemberInvitesController.prototype.create,
+      MemberInvitesController.prototype.resolve,
+      MemberInvitesController.prototype.register,
+      MemberInvitesController.prototype.confirmEmail,
+      MemberInvitesController.prototype.resendEmail,
+      MemberInvitesController.prototype.emailVerificationStatus,
+      MemberInvitesController.prototype.revoke,
+    ]) {
+      expect(guardsFor(MemberInvitesController, handler)).toContain(BrowserOriginGuard);
+    }
+  });
+
+  it('exige Origin exata nas decisões e na inativação de membros', () => {
+    for (const [controller, handler] of [
+      [MemberApprovalsController, MemberApprovalsController.prototype.approve],
+      [MemberApprovalsController, MemberApprovalsController.prototype.reject],
+      [MembersController, MembersController.prototype.deactivate],
+    ] as const) {
+      expect(guardsFor(controller, handler)).toContain(BrowserOriginGuard);
+    }
+  });
+
   it('limita requisições do webhook Telegram a 60 por minuto', () => {
     expectThrottle(TelegramWebhookController.prototype.receiveWebhook, 60);
   });
@@ -167,17 +223,35 @@ describe('metadados de acesso dos controllers', () => {
   it.each([
     ['criação de convite', MemberInvitesController, MemberInvitesController.prototype.create],
     ['listagem de convites', MemberInvitesController, MemberInvitesController.prototype.list],
+    ['revogação de convite', MemberInvitesController, MemberInvitesController.prototype.revoke],
     ['listagem de aprovações', MemberApprovalsController, MemberApprovalsController.prototype.list],
     ['aprovação de membro', MemberApprovalsController, MemberApprovalsController.prototype.approve],
     ['rejeição de membro', MemberApprovalsController, MemberApprovalsController.prototype.reject],
+    ['listagem de membros', MembersController, MembersController.prototype.list],
+    ['inativação de membro', MembersController, MembersController.prototype.deactivate],
     ['código do grupo Telegram', TelegramAuthCodesController, TelegramAuthCodesController.prototype.createGroupCode],
   ] as const)('protege %s com TenantOwnerGuard', (_label, controller, handler) => {
     expect(guardsFor(controller, handler)).toContain(TenantOwnerGuard);
   });
 
   it.each([
-    ['consulta pública de convite', MemberInvitesController, MemberInvitesController.prototype.getPublic],
+    ['consulta pública de convite', MemberInvitesController, MemberInvitesController.prototype.resolve],
     ['cadastro público por convite', MemberInvitesController, MemberInvitesController.prototype.register],
+    [
+      'confirmação pública de email do convite',
+      MemberInvitesController,
+      MemberInvitesController.prototype.confirmEmail,
+    ],
+    [
+      'reenvio público de email do convite',
+      MemberInvitesController,
+      MemberInvitesController.prototype.resendEmail,
+    ],
+    [
+      'status público de email do convite',
+      MemberInvitesController,
+      MemberInvitesController.prototype.emailVerificationStatus,
+    ],
     [
       'código Telegram do próprio membro',
       TelegramAuthCodesController,

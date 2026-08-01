@@ -1,9 +1,36 @@
 import { BadRequestException } from '@nestjs/common';
 
 const BCRYPT_MAX_PASSWORD_BYTES = 72;
+const PENDING_INVITE_EMAIL_DOMAIN = 'invite.invalid';
+const PENDING_OWNER_EMAIL_DOMAIN = 'signup.invalid';
 
 export function normalizeEmail(value: string): string {
   return value.trim().toLowerCase();
+}
+
+/**
+ * Endereço interno não entregável usado até o convidado provar a posse do
+ * endereço solicitado. `.invalid` é reservado e nunca deve receber e-mail.
+ */
+export function pendingInviteEmail(userId: string): string {
+  return `pending-${userId.toLowerCase()}@${PENDING_INVITE_EMAIL_DOMAIN}`;
+}
+
+export function isPendingInviteEmail(email: string): boolean {
+  return normalizeEmail(email).endsWith(`@${PENDING_INVITE_EMAIL_DOMAIN}`);
+}
+
+/** Placeholder exclusivo do cadastro local de owner antes da confirmação. */
+export function pendingOwnerEmail(userId: string): string {
+  return `pending-owner-${userId.toLowerCase()}@${PENDING_OWNER_EMAIL_DOMAIN}`;
+}
+
+export function isPendingOwnerEmail(email: string): boolean {
+  return normalizeEmail(email).endsWith(`@${PENDING_OWNER_EMAIL_DOMAIN}`);
+}
+
+export function isInternalPendingEmail(email: string): boolean {
+  return isPendingInviteEmail(email) || isPendingOwnerEmail(email);
 }
 
 export function assertPasswordFitsBcrypt(password: string): void {
