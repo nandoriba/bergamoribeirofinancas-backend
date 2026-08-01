@@ -1,4 +1,4 @@
-import { PlatformRole, PrismaClient } from '@prisma/client';
+import { OAuthIntent, PlatformRole, PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -234,6 +234,76 @@ describe('isolamento PostgreSQL com dois tenants', () => {
   it('rejeita mês inválido antes de materializar recorrências', async () => {
     await expectStatus(baseUrl, cookieA, '/recurring/generate?month=abc', 400, { method: 'POST' });
   });
+
+  it('consome uma tentativa OAuth exatamente uma vez sob callbacks concorrentes', async () => {
+    const attempt = await prisma.oAuthAttempt.create({
+      data: {
+        stateHash: `state-${randomUUID()}`,
+        nonceHash: `nonce-${randomUUID()}`,
+        browserBindingHash: `browser-${randomUUID()}`,
+        pkceVerifierCiphertext: 'oa1.integration.iv.ciphertext.tag',
+        pkceVerifierKeyVersion: 'v1',
+        intent: OAuthIntent.login,
+        returnPath: '/',
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+    });
+
+    const claims = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        prisma.oAuthAttempt.updateMany({
+          where: { id: attempt.id, consumedAt: null, expiresAt: { gt: new Date() } },
+          data: { consumedAt: new Date() },
+        }),
+      ),
+    );
+
+    expect(claims.reduce((total, claim) => total + claim.count, 0)).toBe(1);
+  });
+
+  it('impede que o mesmo Google subject atravesse usuários ou famílias', async () => {
+    const providerSubject = `google-${randomUUID()}`;
+    await prisma.userIdentity.create({
+      data: {
+        provider: 'google',
+        providerSubject,
+        observedEmail: 'tenant-a-google@example.test',
+        userId: fixture.tenantA.userId,
+      },
+    });
+
+    await expect(
+      prisma.userIdentity.create({
+        data: {
+          provider: 'google',
+          providerSubject,
+          observedEmail: 'tenant-b-google@example.test',
+          userId: fixture.tenantB.userId,
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'P2002' });
+    await expect(
+      prisma.userIdentity.create({
+        data: {
+          provider: 'google',
+          providerSubject: `another-${providerSubject}`,
+          observedEmail: 'tenant-a-second@example.test',
+          userId: fixture.tenantA.userId,
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'P2002' });
+  });
+
+  it('rejeita login local iniciado por uma origem externa', async () => {
+    const response = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://attacker.example' },
+      body: JSON.stringify({ email: fixture.tenantA.email, password: 'integration-password' }),
+    });
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get('set-cookie')).toBeNull();
+  });
 });
 
 async function createFixtures(prisma: PrismaClient): Promise<FixtureIds> {
@@ -427,7 +497,7 @@ function createTransaction(
 async function login(baseUrl: string, email: string) {
   const response = await fetch(`${baseUrl}/auth/login`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', origin: 'http://127.0.0.1:8181' },
     body: JSON.stringify({ email, password: 'integration-password' }),
   });
   expect(response.status).toBe(201);

@@ -12,6 +12,7 @@ export interface AuthenticatedUser {
 }
 
 export interface JwtPayload {
+  jti: string;
   sub: string;
   email: string;
   platformRole: PlatformRole;

@@ -57,9 +57,101 @@ describe('validateConfig', () => {
       validateConfig({
         ...requiredConfig,
         NODE_ENV: 'production',
+        COOKIE_SECURE: 'true',
         JWT_SECRET: 'x'.repeat(32),
         ABACATEPAY_DEV_API_KEY: 'dev-key',
         ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod-monthly',
+      }),
+    ).toThrow();
+  });
+
+  it('exige cookies Secure em produção', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        NODE_ENV: 'production',
+        COOKIE_SECURE: 'false',
+        JWT_SECRET: 'x'.repeat(32),
+      }),
+    ).toThrow();
+  });
+
+  it('falha cedo quando o Google OAuth é habilitado sem credenciais completas', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        GOOGLE_OAUTH_ENABLED: 'true',
+        GOOGLE_CLIENT_ID: 'client.apps.googleusercontent.com',
+      }),
+    ).toThrow();
+  });
+
+  it('aceita configuração Google completa em desenvolvimento', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+      GOOGLE_OAUTH_ENABLED: 'true',
+      GOOGLE_CLIENT_ID: 'client.apps.googleusercontent.com',
+      GOOGLE_CLIENT_SECRET: 'google-client-secret',
+      GOOGLE_REDIRECT_URI: 'http://127.0.0.1:8180/auth/google/callback',
+      OAUTH_ATTEMPT_SECRET: 'o'.repeat(32),
+    });
+
+    expect(config.GOOGLE_OAUTH_ENABLED).toBe(true);
+    expect(config.OAUTH_ATTEMPT_TTL_SECONDS).toBe(300);
+  });
+
+  it.each([
+    'https://app.example.com/',
+    'https://app.example.com/path',
+    'https://app.example.com?debug=true',
+    'https://user@app.example.com',
+    'ftp://app.example.com',
+    'https://app.example.com,,https://admin.example.com',
+  ])('rejeita WEB_ORIGIN não canônica: %s', (webOrigin) => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        WEB_ORIGIN: webOrigin,
+      }),
+    ).toThrow();
+  });
+
+  it('exige WEB_ORIGIN HTTPS público e explícito em produção', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        NODE_ENV: 'production',
+        COOKIE_SECURE: 'true',
+        JWT_SECRET: 'x'.repeat(32),
+      }),
+    ).toThrow();
+
+    expect(
+      validateConfig({
+        ...requiredConfig,
+        NODE_ENV: 'production',
+        COOKIE_SECURE: 'true',
+        JWT_SECRET: 'x'.repeat(32),
+        WEB_ORIGIN: 'https://app.example.com',
+      }).WEB_ORIGIN,
+    ).toBe('https://app.example.com');
+  });
+
+  it('rejeita redirect Google sem HTTPS em produção', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        NODE_ENV: 'production',
+        COOKIE_SECURE: 'true',
+        JWT_SECRET: 'x'.repeat(32),
+        GOOGLE_OAUTH_ENABLED: 'true',
+        GOOGLE_CLIENT_ID: 'client.apps.googleusercontent.com',
+        GOOGLE_CLIENT_SECRET: 'google-client-secret',
+        GOOGLE_REDIRECT_URI: 'http://api.example.com/auth/google/callback',
+        OAUTH_ATTEMPT_SECRET: 'o'.repeat(32),
       }),
     ).toThrow();
   });

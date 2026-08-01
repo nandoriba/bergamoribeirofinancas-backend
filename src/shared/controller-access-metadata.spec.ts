@@ -3,6 +3,8 @@ import { Reflector } from '@nestjs/core';
 import { describe, expect, it } from 'vitest';
 
 import { AuthController } from '../modules/auth/auth.controller';
+import { BrowserOriginGuard } from '../modules/auth/browser-origin.guard';
+import { OptionalJwtAuthGuard } from '../modules/auth/optional-jwt-auth.guard';
 import { HealthController } from '../modules/health/health.controller';
 import { MemberApprovalsController } from '../modules/member-approvals/member-approvals.controller';
 import { MemberInvitesController } from '../modules/member-invites/member-invites.controller';
@@ -48,6 +50,8 @@ describe('metadados de acesso dos controllers', () => {
 
   it.each([
     ['login', AuthController, AuthController.prototype.login],
+    ['início Google OAuth', AuthController, AuthController.prototype.startGoogle],
+    ['callback Google OAuth', AuthController, AuthController.prototype.googleCallback],
     ['consulta de convite', MemberInvitesController, MemberInvitesController.prototype.getPublic],
     ['cadastro de membro', MemberInvitesController, MemberInvitesController.prototype.register],
     ['webhook do Telegram', TelegramWebhookController, TelegramWebhookController.prototype.receiveWebhook],
@@ -58,6 +62,8 @@ describe('metadados de acesso dos controllers', () => {
 
   it.each([
     ['sessão atual', AuthController, AuthController.prototype.me],
+    ['métodos de acesso', AuthController, AuthController.prototype.methods],
+    ['desvínculo Google', AuthController, AuthController.prototype.unlinkGoogle],
     ['logout', AuthController, AuthController.prototype.logout],
     ['criação de convite', MemberInvitesController, MemberInvitesController.prototype.create],
     ['listagem de convites', MemberInvitesController, MemberInvitesController.prototype.list],
@@ -76,6 +82,21 @@ describe('metadados de acesso dos controllers', () => {
 
   it('limita tentativas de login a 5 por minuto', () => {
     expectThrottle(AuthController.prototype.login, 5);
+  });
+
+  it('limita início, callback e desvínculo Google sem estrangular o retorno do provedor', () => {
+    expectThrottle(AuthController.prototype.startGoogle, 10);
+    expectThrottle(AuthController.prototype.googleCallback, 60);
+    expectThrottle(AuthController.prototype.unlinkGoogle, 5);
+  });
+
+  it('exige Origin exata nas mutações Google e usa autenticação opcional nos handlers públicos', () => {
+    expect(guardsFor(AuthController, AuthController.prototype.login)).toContain(BrowserOriginGuard);
+    expect(guardsFor(AuthController, AuthController.prototype.startGoogle)).toEqual(
+      expect.arrayContaining([BrowserOriginGuard, OptionalJwtAuthGuard]),
+    );
+    expect(guardsFor(AuthController, AuthController.prototype.googleCallback)).toContain(OptionalJwtAuthGuard);
+    expect(guardsFor(AuthController, AuthController.prototype.unlinkGoogle)).toContain(BrowserOriginGuard);
   });
 
   it('limita cadastros de membros a 3 por minuto', () => {

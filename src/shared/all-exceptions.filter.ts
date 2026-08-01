@@ -17,18 +17,21 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const response = ctx.getResponse<Response>();
     const status = exception instanceof HttpException ? exception.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
     const payload = exception instanceof HttpException ? exception.getResponse() : undefined;
-    const message =
+    const publicMessage =
       typeof payload === 'object' && payload !== null && 'message' in payload
         ? (payload as { message: string | string[] }).message
         : exception instanceof Error
           ? exception.message
           : 'Erro interno';
+    const message = status >= 500 ? 'Erro interno' : publicMessage;
 
     if (status >= 500) {
-      this.logger.error(exception instanceof Error ? exception.stack : String(exception));
+      const errorType = exception instanceof Error ? exception.name : 'UnknownError';
+      this.logger.error(`Unhandled server error (${errorType})`);
     }
 
-    const details = typeof payload === 'object' && payload !== null ? payload : {};
+    const details =
+      status < 500 && typeof payload === 'object' && payload !== null ? payload : {};
 
     response.status(status).json({
       ...details,

@@ -1,7 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import path from 'node:path';
 
@@ -48,8 +48,10 @@ async function main() {
     runNodeCli(path.join(process.cwd(), 'node_modules', '@nestjs', 'cli', 'bin', 'nest.js'), ['build'], {
       DATABASE_URL: testUrl,
     });
+    const apiEntrypoint = path.join(process.cwd(), 'dist', 'src', 'main.js');
+    await waitForBuildArtifact(apiEntrypoint);
     const port = await reservePort();
-    api = spawn(process.execPath, [path.join(process.cwd(), 'dist', 'src', 'main.js')], {
+    api = spawn(process.execPath, [apiEntrypoint], {
       cwd: process.cwd(),
       env: { ...process.env, DATABASE_URL: testUrl, PORT: String(port) },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -71,6 +73,14 @@ async function main() {
     process.off('SIGTERM', handleSignal);
     await cleanup();
   }
+}
+
+async function waitForBuildArtifact(entrypoint: string) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (existsSync(entrypoint)) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Artefato da API não foi gerado: ${entrypoint}`);
 }
 
 function reservePort(): Promise<number> {

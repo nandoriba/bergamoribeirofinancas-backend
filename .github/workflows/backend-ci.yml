@@ -22,6 +22,26 @@ jobs:
   test:
     name: Lint, typecheck e testes
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: bergamoribeirofinancas_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d bergamoribeirofinancas_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/bergamoribeirofinancas_test?schema=public
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/bergamoribeirofinancas_test?schema=public
+      JWT_SECRET: ci-jwt-secret-with-at-least-32-characters
+      NODE_ENV: test
+      WEB_ORIGIN: http://127.0.0.1:8181
     permissions:
       contents: read
     steps:
@@ -48,6 +68,9 @@ jobs:
 
       - name: Tests
         run: npm run test
+
+      - name: PostgreSQL integration tests
+        run: npm run test:integration
 
   build-and-push:
     name: Build e push da imagem

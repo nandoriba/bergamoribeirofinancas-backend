@@ -82,6 +82,7 @@ describe('AuthService', () => {
       profileId: 'profile-1',
     });
     expect(jwtService.signAsync).toHaveBeenCalledWith({
+      jti: expect.any(String),
       sub: 'owner-user',
       email: 'owner@example.com',
       platformRole: PlatformRole.user,
@@ -89,5 +90,19 @@ describe('AuthService', () => {
       familyId: 'family-1',
       profileId: 'profile-1',
     });
+  });
+
+  it('rejects current-password confirmation for a Google-only account without skipping bcrypt work', async () => {
+    const { prisma, service } = setup();
+    vi.mocked(prisma.user.findUnique).mockResolvedValue({
+      passwordHash: null,
+      isActive: true,
+      profile: { status: 'active' },
+    } as never);
+
+    await expect(service.confirmCurrentPassword('google-user', 'attempt')).rejects.toEqual(
+      new UnauthorizedException('Senha atual inválida'),
+    );
+    expect(bcrypt.compare).toHaveBeenCalledWith('attempt', expect.any(String));
   });
 });

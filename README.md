@@ -16,7 +16,15 @@ API local: `http://127.0.0.1:8180`.
 
 Crie um `.env` local a partir de `.env.example`. O arquivo `.env` é ignorado pelo Git para não versionar senhas ou dados locais.
 
-Em `NODE_ENV=development`, o CORS aceita automaticamente origens `http://127.0.0.1:<porta>` e `http://localhost:<porta>`. Isso evita falha de login quando o Vite muda de porta porque `8181` já estava ocupada.
+Em `NODE_ENV=development`, o CORS aceita origens loopback. As mutações de autenticação validam `Origin` de forma estrita contra `WEB_ORIGIN`; se a porta do Vite mudar, atualize essa variável antes de entrar ou iniciar o Google OAuth.
+
+## Google OpenID Connect
+
+O login Google usa Authorization Code Flow no backend, PKCE S256, `state`, `nonce` e cookie de navegador transitório. Crie clientes Google diferentes para desenvolvimento e produção e registre exatamente o callback do ambiente, por exemplo `http://127.0.0.1:8180/auth/google/callback` no desenvolvimento. Depois configure `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, um `OAUTH_ATTEMPT_SECRET` independente e ative `GOOGLE_OAUTH_ENABLED=true`.
+
+O fluxo `login` só aceita uma identidade Google já vinculada; ele nunca cria usuário nem vincula por coincidência de email. O vínculo é iniciado em Configurações e exige a senha local atual. As intenções `signup_owner` e `accept_invite` permanecem fechadas até as fatias específicas de onboarding e convite.
+
+Em produção, `COOKIE_SECURE=true` e callback HTTPS são obrigatórios. A configuração Nginx desativa o access log apenas na rota exata do callback para não gravar `code` ou `state` da query.
 
 ## Banco Local
 
@@ -28,6 +36,10 @@ O seed cria apenas estrutura inicial: família, admin local, perfil, contas e ca
 
 - `GET /health`
 - `POST /auth/login`
+- `POST /auth/google/start`
+- `GET /auth/google/callback`
+- `GET /auth/methods`
+- `POST /auth/google/unlink`
 - `GET /auth/me`
 - `POST /auth/logout`
 - `POST /member-invites`

@@ -20,6 +20,7 @@ function setup() {
 
 describe('JwtStrategy', () => {
   const forgedPayload: JwtPayload = {
+    jti: 'forged-token-id',
     sub: 'member-user',
     email: 'forged@example.com',
     platformRole: PlatformRole.admin,
