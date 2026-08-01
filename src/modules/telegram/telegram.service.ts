@@ -18,11 +18,18 @@ import {
   type SubscriptionAccessDecision,
 } from '../payments/subscription-access.policy';
 import { TransactionsService } from '../transactions/transactions.service';
-import { AI_PROVIDER, type AiProvider } from './ai-provider';
+import { AI_PROVIDER, type AiProvider, type AiParseResult } from './ai-provider';
+import {
+  AiUsageService,
+  type AiUsageAlertDelivery,
+  type AiUsageMeasurement,
+  type AiUsageReservation,
+} from './ai-usage.service';
 import {
   financialDraftSchema,
   type FinancialDraft,
   type TelegramAiResponse,
+  telegramAiResponseSchema,
   telegramPendingPayloadSchema,
   type TelegramPendingPayload,
 } from './telegram-ai.schema';
@@ -72,6 +79,7 @@ export class TelegramService {
     private readonly installmentsService: InstallmentsService,
     private readonly subscriptionAccessPolicy: SubscriptionAccessPolicy,
     private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
+    private readonly aiUsage: AiUsageService = new AiUsageService(config, prisma),
   ) {}
 
   async receiveWebhook(payload: TelegramUpdatePayload, secretToken?: string) {
@@ -136,14 +144,18 @@ export class TelegramService {
   }
 
   async getStatus(context: TenantContext) {
-    const group = await this.prisma.telegramAuthorizedGroup.findFirst({
-      where: { familyId: context.familyId, revokedAt: null },
-      select: { chatId: true },
-    });
+    const [group, usage] = await Promise.all([
+      this.prisma.telegramAuthorizedGroup.findFirst({
+        where: { familyId: context.familyId, revokedAt: null },
+        select: { chatId: true },
+      }),
+      this.aiUsage.getCurrentUsage(context),
+    ]);
     if (!group) {
       return {
         group: { authorized: false },
         member: { linked: false },
+        usage,
       };
     }
 
@@ -160,7 +172,12 @@ export class TelegramService {
     return {
       group: { authorized: true },
       member: { linked: Boolean(link) },
+      usage,
     };
+  }
+
+  getMemberUsage(context: TenantContext, month?: string) {
+    return this.aiUsage.getMemberBreakdown(context, month);
   }
 
   @Cron('*/1 * * * *')
@@ -169,6 +186,10 @@ export class TelegramService {
     this.recovering = true;
 
     try {
+      const ambiguous = await this.aiUsage.reconcileStaleEvents();
+      if (ambiguous.count > 0) {
+        this.logger.warn(`Eventos de IA abandonados marcados como ambíguos: ${ambiguous.count}`);
+      }
       const minutes = this.config.get<number>('TELEGRAM_UPDATE_RECOVERY_MINUTES') ?? 5;
       const cutoff = new Date(Date.now() - minutes * 60_000);
       const stuck = await this.prisma.telegramUpdate.findMany({
@@ -193,6 +214,14 @@ export class TelegramService {
     const expected = this.config.get<string>('TELEGRAM_WEBHOOK_SECRET');
     if (!timingSafeStringEqual(expected, secretToken)) {
       throw new UnauthorizedException('Telegram webhook secret inválido');
+    }
+  }
+
+  @Cron('17 3 * * *')
+  async deleteExpiredMessageLogs() {
+    const result = await this.aiUsage.deleteExpiredMessageLogs();
+    if (result.count > 0) {
+      this.logger.log(`Telegram message logs removidos pela retenção: ${result.count}`);
     }
   }
 
@@ -679,46 +708,154 @@ export class TelegramService {
     if (!context) return false;
 
     const aiContext = await this.buildAiContext(context);
-    const contextBeforeAi = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
-    if (!contextBeforeAi || contextBeforeAi.memberProfileId !== context.memberProfileId) return false;
-    context = contextBeforeAi;
-
-    const aiResult = await this.aiProvider.parseFinancialMessage({
-      text,
-      today: todayKey(),
-      timezone: 'America/Sao_Paulo',
-      accounts: aiContext.accounts.map((account) => ({
-        id: account.id,
-        name: account.name,
-        type: account.type,
-        institution: account.institution,
-        lastFourDigits: account.lastFourDigits,
-      })),
-      categories: aiContext.categories.map((category) => ({
-        id: category.id,
-        name: category.name,
-        type: category.type,
-        aliases: category.aliases,
-      })),
+    const reservedContext = context;
+    const reservation = await this.withLockedFamilyTransaction(reservedContext.familyId, async (tx) => {
+      const currentContext = await this.resolveLinkedContextFromIds(
+        reservedContext.chatId,
+        reservedContext.tgUserId,
+        tx,
+      );
+      if (!currentContext || currentContext.memberProfileId !== reservedContext.memberProfileId) return null;
+      return this.aiUsage.reserveInTransaction(
+        tx,
+        currentContext,
+        updateId,
+        message.message_id,
+      );
     });
+    if (!reservation) return false;
+
+    if (reservation.kind === 'quota_exceeded') {
+      const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+      if (!currentContext || currentContext.memberProfileId !== context.memberProfileId) return false;
+      context = currentContext;
+      const delivery = await this.deliverAiUsageAlerts(
+        context,
+        reservationAlerts(reservation),
+      );
+      if (!delivery.contextValid) return false;
+      if (!delivery.exhaustedDelivered) {
+        const latestContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+        if (!latestContext || latestContext.memberProfileId !== context.memberProfileId) return false;
+        await this.sendAiQuotaExceeded(latestContext.chatId, reservation);
+      }
+      return false;
+    }
+    if (
+      reservation.kind === 'replay' &&
+      reservation.status === 'BLOCKED_QUOTA'
+    ) {
+      const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+      if (!currentContext || currentContext.memberProfileId !== context.memberProfileId) return false;
+      const delivery = await this.deliverAiUsageAlerts(
+        currentContext,
+        reservationAlerts(reservation),
+      );
+      if (!delivery.contextValid) return false;
+      if (!delivery.exhaustedDelivered) {
+        const latestContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+        if (!latestContext || latestContext.memberProfileId !== context.memberProfileId) return false;
+        await this.sendAiQuotaExceeded(latestContext.chatId, reservation);
+      }
+      return false;
+    }
+
+    let aiResult: AiParseResult;
+    if (reservation.kind === 'replay') {
+      if (reservation.status !== 'SUCCEEDED' || !reservation.replayResult) {
+        const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+        if (!currentContext || currentContext.memberProfileId !== context.memberProfileId) return false;
+        const delivery = await this.deliverAiUsageAlerts(
+          currentContext,
+          reservationAlerts(reservation),
+        );
+        if (!delivery.contextValid) return false;
+        if (reservation.status === 'AMBIGUOUS') {
+          const latestContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+          if (!latestContext || latestContext.memberProfileId !== context.memberProfileId) return false;
+          await this.safeSendMessage(
+            latestContext.chatId,
+            'A análise anterior ficou inconclusiva e não será repetida automaticamente. Nenhum lançamento novo foi criado; envie uma nova mensagem para tentar de novo.',
+          );
+        }
+        return false;
+      }
+      const replayed = telegramAiResponseSchema.safeParse(reservation.replayResult.raw);
+      if (!replayed.success) return false;
+      aiResult = { ...reservation.replayResult, parsed: replayed.data };
+    } else {
+      try {
+        // The reservation transaction revalidated tenant access while holding
+        // the family lock. Keep the provider call as the very next await so no
+        // external I/O can widen the authorization window.
+        aiResult = await this.aiProvider.parseFinancialMessage({
+          text,
+          today: todayKey(),
+          timezone: 'America/Sao_Paulo',
+          accounts: aiContext.accounts.map((account) => ({
+            id: account.id,
+            name: account.name,
+            type: account.type,
+            institution: account.institution,
+            lastFourDigits: account.lastFourDigits,
+          })),
+          categories: aiContext.categories.map((category) => ({
+            id: category.id,
+            name: category.name,
+            type: category.type,
+            aliases: category.aliases,
+          })),
+        });
+      } catch (error) {
+        try {
+          await this.aiUsage.fail(reservation.eventId, error);
+        } catch (finalizationError) {
+          await this.markAiUsageAmbiguous(
+            reservation.eventId,
+            usageMeasurementFromError(error),
+            'provider_failure_persistence_ambiguous',
+          );
+          this.logger.error(
+            `Falha ao persistir erro do provedor de IA: ${formatError(finalizationError)}`,
+          );
+        }
+        throw error;
+      }
+
+      let completion: Awaited<ReturnType<AiUsageService['complete']>>;
+      try {
+        completion = await this.aiUsage.complete(reservation.eventId, aiResult, {
+          chatId: context.chatId,
+          tgUserId: context.tgUserId,
+          messageId: message.message_id,
+          memberProfileId: context.memberProfileId,
+          textRaw: text,
+        });
+      } catch (error) {
+        await this.markAiUsageAmbiguous(
+          reservation.eventId,
+          aiResult,
+          'provider_success_persistence_ambiguous',
+        );
+        throw error;
+      }
+      if (!completion.applied) {
+        const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+        if (currentContext?.memberProfileId === context.memberProfileId) {
+          await this.safeSendMessage(
+            currentContext.chatId,
+            'A análise foi interrompida por segurança e nenhum lançamento foi criado. Tente novamente com uma nova mensagem.',
+          );
+        }
+        return false;
+      }
+    }
 
     const contextAfterAi = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
     if (!contextAfterAi || contextAfterAi.memberProfileId !== context.memberProfileId) return false;
     context = contextAfterAi;
-
-    await this.prisma.telegramMessageLog.create({
-      data: {
-        chatId: context.chatId,
-        tgUserId: context.tgUserId,
-        messageId: message.message_id,
-        memberProfileId: context.memberProfileId,
-        textRaw: text,
-        aiResponseJson: aiResult.raw as Prisma.InputJsonValue,
-        model: aiResult.model,
-        tokensIn: aiResult.tokensIn,
-        tokensOut: aiResult.tokensOut,
-      },
-    });
+    const alertDelivery = await this.deliverAiUsageAlerts(context, reservationAlerts(reservation));
+    if (!alertDelivery.contextValid) return false;
 
     const ai = aiResult.parsed;
     if (ai.intent === 'NON_FINANCIAL') return false;
@@ -746,12 +883,21 @@ export class TelegramService {
         context,
         { kind: 'FINANCIAL_DRAFT', draft },
         `Confirma este lançamento?\n${this.formatDraft(draft, aiContext)}`,
+        undefined,
+        reservation.eventId,
       );
       return false;
     }
 
     const idempotencyKey = `tg:msg:${context.chatId}:${message.message_id}`;
-    const operation = await this.tryCreateFinancialOperation(updateId, context, draft, idempotencyKey);
+    const operation = await this.tryCreateFinancialOperation(
+      updateId,
+      context,
+      draft,
+      idempotencyKey,
+      undefined,
+      reservation.eventId,
+    );
     if (operation.duplicate) {
       await this.safeSendMessage(
         context.chatId,
@@ -837,6 +983,7 @@ export class TelegramService {
       payload.draft,
       idempotencyKey,
       pending.id,
+      pending.aiUsageEventId ?? undefined,
     );
     if (operation.duplicate) {
       await this.prisma.$transaction(async (tx) => {
@@ -1017,6 +1164,7 @@ export class TelegramService {
     draft: FinancialDraft,
     idempotencyKey: string,
     pendingConfirmationId?: string,
+    aiUsageEventId?: string,
   ) {
     try {
       return await this.withLockedFamilyTransaction(
@@ -1034,6 +1182,7 @@ export class TelegramService {
             idempotencyKey,
             updateId,
             pendingConfirmationId,
+            aiUsageEventId,
           );
           if (pendingConfirmationId) {
             await tx.telegramPendingConfirmation.update({
@@ -1068,6 +1217,7 @@ export class TelegramService {
     idempotencyKey: string,
     sourceUpdateId: string,
     pendingConfirmationId?: string,
+    aiUsageEventId?: string,
   ) {
     const existing = await tx.telegramFinancialOperation.findUnique({ where: { idempotencyKey } });
     if (existing) {
@@ -1105,8 +1255,15 @@ export class TelegramService {
           sourceMessageId: draft.sourceMessageId,
           pendingConfirmationId,
           installmentPlanId: plan.id,
+          aiUsageEventId,
         },
       });
+      await this.aiUsage.recordFinancialOperationInTransaction(
+        tx,
+        aiUsageEventId,
+        context,
+        operation.createdAt,
+      );
       return { alreadyExisted: false, operation };
     }
 
@@ -1134,8 +1291,15 @@ export class TelegramService {
         sourceMessageId: draft.sourceMessageId,
         pendingConfirmationId,
         transactionId: transaction.id,
+        aiUsageEventId,
       },
     });
+    await this.aiUsage.recordFinancialOperationInTransaction(
+      tx,
+      aiUsageEventId,
+      context,
+      operation.createdAt,
+    );
     return { alreadyExisted: false, operation };
   }
 
@@ -1188,6 +1352,7 @@ export class TelegramService {
     payload: TelegramPendingPayload,
     text: string,
     expiresAt?: Date,
+    aiUsageEventId?: string,
   ) {
     const ttlHours = this.config.get<number>('TELEGRAM_PENDING_TTL_HOURS') ?? 24;
     const defaultExpiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
@@ -1202,7 +1367,14 @@ export class TelegramService {
         return null;
       }
 
-      return tx.telegramPendingConfirmation.create({
+      if (aiUsageEventId) {
+        const existing = await tx.telegramPendingConfirmation.findUnique({
+          where: { aiUsageEventId },
+        });
+        if (existing) return { pending: existing, created: false };
+      }
+
+      const created = await tx.telegramPendingConfirmation.create({
         data: {
           id,
           chatId: currentContext.chatId,
@@ -1210,23 +1382,26 @@ export class TelegramService {
           tgUserId: currentContext.tgUserId,
           payload: toJsonInput(payload),
           expiresAt: effectiveExpiresAt,
+          aiUsageEventId,
         },
       });
+      return { pending: created, created: true };
     });
     if (!pending) return false;
+    if (!pending.created && pending.pending.messageId) return true;
 
     const sent = await this.telegram.sendMessage(context.chatId, text, {
       inline_keyboard: [
         [
-          { text: 'Confirmar', callback_data: `tg:${pending.id}:confirm` },
-          { text: 'Cancelar', callback_data: `tg:${pending.id}:cancel` },
+          { text: 'Confirmar', callback_data: `tg:${pending.pending.id}:confirm` },
+          { text: 'Cancelar', callback_data: `tg:${pending.pending.id}:cancel` },
         ],
       ],
     });
     const messageId = readTelegramMessageId(sent);
     if (messageId) {
       await this.prisma.telegramPendingConfirmation.update({
-        where: { id: pending.id },
+        where: { id: pending.pending.id },
         data: { messageId },
       });
     }
@@ -1384,6 +1559,59 @@ export class TelegramService {
         lastError: formatError(error).slice(0, 2000),
       },
     });
+  }
+
+  private async deliverAiUsageAlerts(context: LinkedTelegramContext, alerts: AiUsageAlertDelivery[]) {
+    let exhaustedDelivered = false;
+    for (const alert of alerts) {
+      const claimed = await this.aiUsage.claimAlertDelivery(alert.id);
+      if (!claimed) continue;
+      const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+      if (
+        !currentContext ||
+        currentContext.familyId !== context.familyId ||
+        currentContext.memberProfileId !== context.memberProfileId
+      ) {
+        return { exhaustedDelivered, contextValid: false };
+      }
+      const remaining = Math.max(0, alert.messageLimit - alert.messageCount);
+      const reset = formatUtcDate(alert.resetAt);
+      const text =
+        alert.kind === 'EXHAUSTED'
+          ? `A franquia familiar de ${alert.messageLimit} mensagens com IA chegou ao limite deste mês. O chatbot volta em ${reset}; o acesso às finanças pelo app continua disponível.`
+          : `A família está perto do limite mensal do chatbot: ${alert.messageCount} de ${alert.messageLimit} mensagens com IA usadas. Restam ${remaining} até ${reset}.`;
+      try {
+        await this.telegram.sendMessage(currentContext.chatId, text);
+        await this.aiUsage.markAlertDelivery(alert.id, true);
+        if (alert.kind === 'EXHAUSTED') exhaustedDelivered = true;
+      } catch (error) {
+        this.logger.warn(`Falha ao entregar alerta de consumo da IA: ${formatError(error)}`);
+        await this.aiUsage.markAlertDelivery(alert.id, false);
+      }
+    }
+    return { exhaustedDelivered, contextValid: true };
+  }
+
+  private async markAiUsageAmbiguous(
+    eventId: string,
+    measurement: AiUsageMeasurement,
+    failureCode: string,
+  ) {
+    try {
+      await this.aiUsage.markAmbiguous(eventId, measurement, failureCode);
+    } catch (error) {
+      this.logger.error(`Falha ao marcar evento de IA como ambíguo: ${formatError(error)}`);
+    }
+  }
+
+  private async sendAiQuotaExceeded(
+    chatId: string,
+    usage: { messageLimit: number; messageCount: number; resetAt: Date },
+  ) {
+    await this.safeSendMessage(
+      chatId,
+      `A franquia familiar de ${usage.messageLimit} mensagens com IA foi atingida. O chatbot volta em ${formatUtcDate(usage.resetAt)}. O sistema financeiro web continua disponível normalmente.`,
+    );
   }
 
   private async notifyBlockedTenant(
@@ -1599,6 +1827,30 @@ function isStrongDuplicateError(error: unknown) {
   const response = error.getResponse();
   if (!response || typeof response !== 'object' || Array.isArray(response)) return false;
   return 'code' in response && response.code === 'STRONG_DUPLICATE';
+}
+
+function formatUtcDate(date: Date) {
+  return new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'UTC',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  }).format(date);
+}
+
+function reservationAlerts(reservation: AiUsageReservation) {
+  return 'alerts' in reservation ? reservation.alerts : [];
+}
+
+function usageMeasurementFromError(error: unknown): AiUsageMeasurement {
+  if (!error || typeof error !== 'object') return {};
+  const candidate = error as Record<string, unknown>;
+  return {
+    model: typeof candidate.model === 'string' ? candidate.model : undefined,
+    requestId: typeof candidate.requestId === 'string' ? candidate.requestId : undefined,
+    tokensIn: typeof candidate.tokensIn === 'number' ? candidate.tokensIn : undefined,
+    tokensOut: typeof candidate.tokensOut === 'number' ? candidate.tokensOut : undefined,
+  };
 }
 
 function isTelegramTransactionConflict(error: unknown) {

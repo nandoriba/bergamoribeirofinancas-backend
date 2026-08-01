@@ -173,6 +173,38 @@ describe('validateConfig', () => {
     expect(config.ABACATEPAY_ENABLED).toBe(false);
   });
 
+  it('carrega franquia e pricing decimal auditável da IA com defaults do plano', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+    });
+
+    expect(config).toMatchObject({
+      TELEGRAM_AI_PLAN_CODE: 'monthly-card-v1',
+      TELEGRAM_AI_MONTHLY_MESSAGE_LIMIT: 200,
+      TELEGRAM_AI_WARNING_PERCENT: 80,
+      OPENAI_PRICING_VERSION: 'openai-gpt-4o-mini-2026-08-01',
+      OPENAI_INPUT_USD_PER_MILLION_TOKENS: '0.15',
+      OPENAI_OUTPUT_USD_PER_MILLION_TOKENS: '0.60',
+    });
+  });
+
+  it.each([
+    ['limite zero', { TELEGRAM_AI_MONTHLY_MESSAGE_LIMIT: '0' }],
+    ['alerta sem proximidade', { TELEGRAM_AI_WARNING_PERCENT: '100' }],
+    ['preço negativo', { OPENAI_INPUT_USD_PER_MILLION_TOKENS: '-0.15' }],
+    ['preço exponencial', { OPENAI_OUTPUT_USD_PER_MILLION_TOKENS: '6e-1' }],
+    ['versão de pricing inválida', { OPENAI_PRICING_VERSION: 'pricing com espaço' }],
+  ])('rejeita configuração inválida de consumo da IA: %s', (_label, invalid) => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ...invalid,
+      }),
+    ).toThrow();
+  });
+
   it('falha cedo quando a AbacatePay é habilitada sem produto, chave ou preço', () => {
     expect(() =>
       validateConfig({

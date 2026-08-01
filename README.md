@@ -36,7 +36,7 @@ Owners novos ficam com `requiredAction=payment`; o guard global libera somente s
 
 ## Telegram
 
-Cada família autoriza exatamente um grupo e cada membro vincula o próprio Telegram ao próprio perfil. O worker reavalia o mesmo entitlement fail-closed do HTTP antes da IA e das mutações. O MVP exige **uma única réplica da API** porque a fila é serial e mantida em memória; não escale o serviço `backend` horizontalmente. Consulte [docs/TELEGRAM_TENANT_ACCESS.md](docs/TELEGRAM_TENANT_ACCESS.md).
+Cada família autoriza exatamente um grupo e cada membro vincula o próprio Telegram ao próprio perfil. O worker reavalia o mesmo entitlement fail-closed do HTTP antes da IA e das mutações. O MVP exige **uma única réplica da API** porque a fila é serial e mantida em memória; não escale o serviço `backend` horizontalmente. Consulte [docs/TELEGRAM_TENANT_ACCESS.md](docs/TELEGRAM_TENANT_ACCESS.md) e [docs/AI_USAGE_LIMITS.md](docs/AI_USAGE_LIMITS.md).
 
 ## Banco Local
 

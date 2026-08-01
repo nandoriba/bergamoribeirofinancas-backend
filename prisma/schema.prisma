@@ -190,6 +190,26 @@ enum TelegramFinancialOperationStatus {
   UNDONE
 }
 
+enum AiUsageEventStatus {
+  IN_FLIGHT
+  SUCCEEDED
+  PROVIDER_FAILED
+  RESPONSE_INVALID
+  AMBIGUOUS
+  BLOCKED_QUOTA
+}
+
+enum AiUsageAlertKind {
+  NEAR_LIMIT
+  EXHAUSTED
+}
+
+enum AiUsageAlertStatus {
+  PENDING
+  SENT
+  SUPERSEDED
+}
+
 model User {
   id                       String                    @id @default(uuid())
   email                    String                    @unique
@@ -237,6 +257,7 @@ model Family {
   paymentWebhookEvents     PaymentWebhookEvent[]
   legalAcceptances         LegalAcceptance[]
   telegramAuthorizedGroups TelegramAuthorizedGroup[]
+  aiMonthlyUsages          AiTenantMonthlyUsage[]
   pendingPaymentExpiresAt  DateTime?
   cancelledAt              DateTime?
   purgeAfter               DateTime?
@@ -269,6 +290,8 @@ model MemberProfile {
   telegramPendingConfirmations TelegramPendingConfirmation[]
   telegramFinancialOperations  TelegramFinancialOperation[]
   telegramMessageLogs          TelegramMessageLog[]
+  aiMonthlyUsages               AiMemberMonthlyUsage[]
+  aiUsageEvents                 AiUsageEvent[]
   createdAt                    DateTime                      @default(now())
   updatedAt                    DateTime                      @updatedAt
 
@@ -833,11 +856,14 @@ model TelegramPendingConfirmation {
   expiresAt               DateTime
   createdAt               DateTime                     @default(now())
   resolvedAt              DateTime?
+  aiUsageEventId          String?                      @unique
+  aiUsageEvent            AiUsageEvent?                @relation(fields: [aiUsageEventId, memberProfileId], references: [id, memberProfileId], onDelete: Restrict, onUpdate: Restrict)
   financialOperations     TelegramFinancialOperation[] @relation("OperationPendingConfirmation")
   undoFinancialOperations TelegramFinancialOperation[] @relation("UndoPendingConfirmation")
 
   @@index([chatId, tgUserId, status])
   @@index([expiresAt])
+  @@unique([aiUsageEventId, memberProfileId])
 }
 
 model TelegramUpdate {
@@ -849,6 +875,9 @@ model TelegramUpdate {
   processedAt         DateTime?
   lastError           String?
   financialOperations TelegramFinancialOperation[]
+  aiUsageEvent        AiUsageEvent?
+
+  @@index([status, receivedAt])
 }
 
 model TelegramFinancialOperation {
@@ -873,9 +902,12 @@ model TelegramFinancialOperation {
   undoneAt                  DateTime?
   undoPendingConfirmationId String?
   undoPendingConfirmation   TelegramPendingConfirmation?     @relation("UndoPendingConfirmation", fields: [undoPendingConfirmationId], references: [id])
+  aiUsageEventId             String?                          @unique
+  aiUsageEvent               AiUsageEvent?                    @relation(fields: [aiUsageEventId, memberProfileId], references: [id, memberProfileId], onDelete: Restrict, onUpdate: Restrict)
 
   @@index([memberProfileId, tgUserId, status, createdAt])
   @@index([sourceUpdateId])
+  @@unique([aiUsageEventId, memberProfileId])
 }
 
 model TelegramMessageLog {
@@ -890,9 +922,123 @@ model TelegramMessageLog {
   model           String?
   tokensIn        Int?
   tokensOut       Int?
-  costUsd         Decimal?       @db.Decimal(10, 6)
+  costUsd         Decimal?       @db.Decimal(18, 6)
+  aiUsageEventId  String?        @unique
+  aiUsageEvent    AiUsageEvent?  @relation(fields: [aiUsageEventId, memberProfileId], references: [id, memberProfileId], onDelete: Restrict, onUpdate: Restrict)
   createdAt       DateTime       @default(now())
 
   @@index([createdAt])
   @@index([chatId, messageId])
+  @@unique([aiUsageEventId, memberProfileId])
+}
+
+model AiTenantMonthlyUsage {
+  id                         String                 @id @default(uuid())
+  familyId                   String
+  family                     Family                 @relation(fields: [familyId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+  periodStart                DateTime               @db.Date
+  planCode                   String
+  messageLimit               Int
+  nearLimitMessageCount      Int
+  messages                   Int                    @default(0)
+  blockedMessages            Int                    @default(0)
+  tokensIn                   BigInt                 @default(0)
+  tokensOut                  BigInt                 @default(0)
+  estimatedCostUsd           Decimal                @default(0) @db.Decimal(18, 6)
+  measurementIncompleteCount Int                    @default(0)
+  financialOperations        Int                    @default(0)
+  memberUsages               AiMemberMonthlyUsage[]
+  events                     AiUsageEvent[]
+  alerts                     AiUsageAlert[]
+  createdAt                  DateTime               @default(now())
+  updatedAt                  DateTime               @updatedAt
+
+  @@unique([familyId, periodStart])
+  @@unique([id, familyId])
+  @@unique([id, familyId, periodStart])
+  @@index([periodStart])
+}
+
+model AiMemberMonthlyUsage {
+  id                         String               @id @default(uuid())
+  tenantUsageId              String
+  familyId                   String
+  tenantUsage                AiTenantMonthlyUsage @relation(fields: [tenantUsageId, familyId, periodStart], references: [id, familyId, periodStart], onDelete: Cascade, onUpdate: Restrict)
+  memberProfileId            String
+  memberProfile              MemberProfile        @relation(fields: [memberProfileId, familyId], references: [id, familyId], onDelete: Restrict, onUpdate: Restrict)
+  periodStart                DateTime             @db.Date
+  messages                   Int                  @default(0)
+  blockedMessages            Int                  @default(0)
+  tokensIn                   BigInt               @default(0)
+  tokensOut                  BigInt               @default(0)
+  estimatedCostUsd           Decimal              @default(0) @db.Decimal(18, 6)
+  measurementIncompleteCount Int                  @default(0)
+  financialOperations        Int                  @default(0)
+  events                     AiUsageEvent[]
+  createdAt                  DateTime             @default(now())
+  updatedAt                  DateTime             @updatedAt
+
+  @@unique([familyId, memberProfileId, periodStart])
+  @@unique([id, familyId])
+  @@unique([id, tenantUsageId, familyId, memberProfileId])
+  @@index([tenantUsageId])
+  @@index([memberProfileId, periodStart])
+}
+
+model AiUsageEvent {
+  id                            String                    @id @default(uuid())
+  sourceUpdateId                String                    @unique
+  sourceUpdate                  TelegramUpdate            @relation(fields: [sourceUpdateId], references: [updateId], onDelete: Restrict, onUpdate: Restrict)
+  sourceMessageId               Int
+  familyId                      String
+  tenantUsageId                 String
+  tenantUsage                   AiTenantMonthlyUsage      @relation(fields: [tenantUsageId, familyId], references: [id, familyId], onDelete: Cascade, onUpdate: Restrict)
+  memberUsageId                 String
+  memberUsage                   AiMemberMonthlyUsage      @relation(fields: [memberUsageId, tenantUsageId, familyId, memberProfileId], references: [id, tenantUsageId, familyId, memberProfileId], onDelete: Cascade, onUpdate: Restrict)
+  memberProfileId               String
+  memberProfile                 MemberProfile             @relation(fields: [memberProfileId, familyId], references: [id, familyId], onDelete: Restrict, onUpdate: Restrict)
+  chatId                        String
+  tgUserId                      String
+  status                        AiUsageEventStatus         @default(IN_FLIGHT)
+  provider                      String
+  requestedModel                String
+  usedModel                     String?
+  providerRequestId             String?
+  pricingVersion                String
+  inputUsdPerMillionTokens      Decimal                   @db.Decimal(18, 6)
+  outputUsdPerMillionTokens     Decimal                   @db.Decimal(18, 6)
+  tokensIn                      Int?
+  tokensOut                     Int?
+  estimatedCostUsd              Decimal?                  @db.Decimal(18, 6)
+  measurementComplete           Boolean                   @default(false)
+  failureCode                   String?
+  startedAt                     DateTime                  @default(now())
+  finishedAt                    DateTime?
+  messageLog                    TelegramMessageLog?
+  pendingConfirmation           TelegramPendingConfirmation?
+  financialOperation            TelegramFinancialOperation?
+  createdAt                     DateTime                  @default(now())
+  updatedAt                     DateTime                  @updatedAt
+
+  @@index([familyId, startedAt])
+  @@index([memberProfileId, startedAt])
+  @@index([status, startedAt])
+  @@unique([id, memberProfileId])
+}
+
+model AiUsageAlert {
+  id              String                @id @default(uuid())
+  tenantUsageId   String
+  familyId        String
+  tenantUsage     AiTenantMonthlyUsage  @relation(fields: [tenantUsageId, familyId], references: [id, familyId], onDelete: Cascade, onUpdate: Restrict)
+  kind            AiUsageAlertKind
+  status          AiUsageAlertStatus    @default(PENDING)
+  attempts        Int                   @default(0)
+  lastAttemptAt   DateTime?
+  sentAt          DateTime?
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  @@unique([tenantUsageId, kind])
+  @@index([familyId, status, createdAt])
 }

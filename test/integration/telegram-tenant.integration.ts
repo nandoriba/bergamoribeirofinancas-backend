@@ -15,6 +15,7 @@ import {
   evaluateSubscriptionProjection,
   SUBSCRIPTION_ACCESS_SELECT,
 } from '../../src/modules/payments/subscription-access.projection';
+import { AiUsageService } from '../../src/modules/telegram/ai-usage.service';
 import { TelegramService } from '../../src/modules/telegram/telegram.service';
 
 interface TenantFixture {
@@ -750,13 +751,14 @@ function createService(
   parseFinancialMessage: ReturnType<typeof vi.fn> = vi.fn(),
   transactionsService: object = { createInTransaction: vi.fn() },
 ) {
+  const config = {
+    get: vi.fn((key: string) => {
+      if (key === 'TELEGRAM_WEBHOOK_SECRET') return 'integration-telegram-secret';
+      return undefined;
+    }),
+  };
   return new TelegramService(
-    {
-      get: vi.fn((key: string) => {
-        if (key === 'TELEGRAM_WEBHOOK_SECRET') return 'integration-telegram-secret';
-        return undefined;
-      }),
-    } as never,
+    config as never,
     prisma as never,
     telegram as never,
     { parseFinancialMessage } as never,
@@ -764,6 +766,7 @@ function createService(
     { createInTransaction: vi.fn(), removeTelegramCreatedPlanInTransaction: vi.fn() } as never,
     new SubscriptionAccessPolicy(),
     { consistentTransactionRelations: vi.fn().mockReturnValue({}) } as never,
+    new AiUsageService(config as never, prisma as never),
   );
 }
 

@@ -1,6 +1,7 @@
 import { ConfigService } from "@nestjs/config";
 import {
   AccountType,
+  AiUsageAlertKind,
   CategoryType,
   CheckoutProvisioningStatus,
   LegalAcceptanceSource,
@@ -541,6 +542,58 @@ async function seedAggregate(prisma: PrismaClient, ids: TenantIds) {
         },
       },
     });
+    const periodStart = new Date(
+      Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1),
+    );
+    const tenantUsage = await tx.aiTenantMonthlyUsage.create({
+      data: {
+        familyId: ids.familyId,
+        periodStart,
+        planCode: "retention-integration-v1",
+        messageLimit: 200,
+        nearLimitMessageCount: 160,
+        messages: 1,
+        measurementIncompleteCount: 1,
+      },
+    });
+    const memberUsage = await tx.aiMemberMonthlyUsage.create({
+      data: {
+        tenantUsageId: tenantUsage.id,
+        familyId: ids.familyId,
+        memberProfileId: ids.profileId,
+        periodStart,
+        messages: 1,
+        measurementIncompleteCount: 1,
+      },
+    });
+    const usageEvent = await tx.aiUsageEvent.create({
+      data: {
+        sourceUpdateId: update.updateId,
+        sourceMessageId: messageLog.messageId,
+        familyId: ids.familyId,
+        tenantUsageId: tenantUsage.id,
+        memberUsageId: memberUsage.id,
+        memberProfileId: ids.profileId,
+        chatId: group.chatId,
+        tgUserId: link.tgUserId,
+        provider: "openai",
+        requestedModel: "gpt-4o-mini",
+        pricingVersion: "retention-integration-v1",
+        inputUsdPerMillionTokens: "0.150000",
+        outputUsdPerMillionTokens: "0.600000",
+      },
+    });
+    const usageAlert = await tx.aiUsageAlert.create({
+      data: {
+        tenantUsageId: tenantUsage.id,
+        familyId: ids.familyId,
+        kind: AiUsageAlertKind.NEAR_LIMIT,
+      },
+    });
+    await tx.telegramMessageLog.update({
+      where: { id: messageLog.id },
+      data: { aiUsageEventId: usageEvent.id },
+    });
     const operation = await tx.telegramFinancialOperation.create({
       data: {
         idempotencyKey: randomUUID(),
@@ -550,6 +603,7 @@ async function seedAggregate(prisma: PrismaClient, ids: TenantIds) {
         chatId: group.chatId,
         sourceUpdateId: update.updateId,
         transactionId: transaction.id,
+        aiUsageEventId: usageEvent.id,
       },
     });
     return {
@@ -567,6 +621,10 @@ async function seedAggregate(prisma: PrismaClient, ids: TenantIds) {
       orphanUpdateId: orphanUpdate.updateId,
       unrelatedUpdateId: unrelatedUpdate.updateId,
       operationId: operation.id,
+      tenantUsageId: tenantUsage.id,
+      memberUsageId: memberUsage.id,
+      usageEventId: usageEvent.id,
+      usageAlertId: usageAlert.id,
     };
   });
 }
@@ -595,6 +653,14 @@ async function expectAggregateMissing(
     prisma.telegramFinancialOperation.count({
       where: { id: related.operationId },
     }),
+    prisma.aiTenantMonthlyUsage.count({
+      where: { id: related.tenantUsageId },
+    }),
+    prisma.aiMemberMonthlyUsage.count({
+      where: { id: related.memberUsageId },
+    }),
+    prisma.aiUsageEvent.count({ where: { id: related.usageEventId } }),
+    prisma.aiUsageAlert.count({ where: { id: related.usageAlertId } }),
   ]);
   expect(counts).toEqual(new Array(counts.length).fill(0));
   await expect(

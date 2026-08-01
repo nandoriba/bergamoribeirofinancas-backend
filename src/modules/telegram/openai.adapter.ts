@@ -2,7 +2,13 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import type { AppConfig } from '../../shared/configuration';
-import type { AiParseInput, AiParseResult, AiProvider } from './ai-provider';
+import {
+  AiProviderError,
+  type AiParseInput,
+  type AiParseResult,
+  type AiProvider,
+  type AiProviderErrorMetadata,
+} from './ai-provider';
 import { telegramAiResponseSchema } from './telegram-ai.schema';
 
 @Injectable()
@@ -11,73 +17,102 @@ export class OpenAiAdapter implements AiProvider {
 
   async parseFinancialMessage(input: AiParseInput): Promise<AiParseResult> {
     const apiKey = this.config.get<string>('OPENAI_API_KEY');
+    const model = this.config.get<string>('OPENAI_MODEL') ?? 'gpt-4o-mini';
     if (!apiKey) {
-      throw new Error('OPENAI_API_KEY não configurada');
+      throw new AiProviderError('PROVIDER_FAILED', { model });
     }
 
-    const model = this.config.get<string>('OPENAI_MODEL') ?? 'gpt-4o-mini';
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0,
-        response_format: {
-          type: 'json_schema',
-          json_schema: {
-            name: 'telegram_financial_message',
-            strict: true,
-            schema: telegramFinancialJsonSchema,
-          },
+    let response: Response;
+    try {
+      response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
         },
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Você interpreta mensagens curtas de Telegram em pt-BR para um sistema financeiro familiar. Responda somente no JSON do schema. Datas relativas devem usar o campo today/timezone informado. Não invente conta ou categoria: use hints quando a mensagem permitir inferir.',
+        body: JSON.stringify({
+          model,
+          temperature: 0,
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: 'telegram_financial_message',
+              strict: true,
+              schema: telegramFinancialJsonSchema,
+            },
           },
-          {
-            role: 'user',
-            content: JSON.stringify({
-              text: input.text,
-              today: input.today,
-              timezone: input.timezone,
-              availableAccounts: input.accounts,
-              availableCategories: input.categories,
-            }),
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(30_000),
-    });
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Você interpreta mensagens curtas de Telegram em pt-BR para um sistema financeiro familiar. Responda somente no JSON do schema. Datas relativas devem usar o campo today/timezone informado. Não invente conta ou categoria: use hints quando a mensagem permitir inferir.',
+            },
+            {
+              role: 'user',
+              content: JSON.stringify({
+                text: input.text,
+                today: input.today,
+                timezone: input.timezone,
+                availableAccounts: input.accounts,
+                availableCategories: input.categories,
+              }),
+            },
+          ],
+        }),
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch {
+      throw new AiProviderError('PROVIDER_FAILED', { model });
+    }
+
+    const requestId = readRequestId(response);
 
     if (!response.ok) {
-      throw new Error(`OpenAI falhou com HTTP ${response.status}`);
+      throw new AiProviderError('PROVIDER_FAILED', {
+        model,
+        requestId,
+        httpStatus: response.status,
+      });
     }
 
-    const raw = (await response.json()) as OpenAiChatCompletionResponse;
+    let raw: OpenAiChatCompletionResponse;
+    try {
+      raw = readChatCompletionResponse(await response.json());
+    } catch {
+      throw new AiProviderError('RESPONSE_INVALID', { model, requestId });
+    }
+
+    const metadata = readResponseMetadata(raw, model, requestId);
     const content = raw.choices?.[0]?.message?.content;
     if (!content) {
-      throw new Error('OpenAI não retornou conteúdo');
+      throw new AiProviderError('RESPONSE_INVALID', metadata);
     }
 
-    const parsedJson = JSON.parse(content) as unknown;
-    const parsed = telegramAiResponseSchema.parse(parsedJson);
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(content) as unknown;
+    } catch {
+      throw new AiProviderError('RESPONSE_INVALID', metadata);
+    }
+
+    const validation = telegramAiResponseSchema.safeParse(parsedJson);
+    if (!validation.success) {
+      throw new AiProviderError('RESPONSE_INVALID', metadata);
+    }
 
     return {
-      parsed,
+      parsed: validation.data,
       raw: parsedJson,
-      model: raw.model ?? model,
-      tokensIn: raw.usage?.prompt_tokens,
-      tokensOut: raw.usage?.completion_tokens,
+      model: metadata.model ?? model,
+      requestId: metadata.requestId,
+      tokensIn: metadata.tokensIn,
+      tokensOut: metadata.tokensOut,
     };
   }
 }
 
 interface OpenAiChatCompletionResponse {
+  id?: string;
   model?: string;
   choices?: Array<{
     message?: {
@@ -88,6 +123,40 @@ interface OpenAiChatCompletionResponse {
     prompt_tokens?: number;
     completion_tokens?: number;
   };
+}
+
+function readRequestId(response: Response): string | undefined {
+  const requestId = response.headers.get('x-request-id')?.trim();
+  return requestId || undefined;
+}
+
+function readChatCompletionResponse(value: unknown): OpenAiChatCompletionResponse {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Invalid chat completion response');
+  }
+  return value as OpenAiChatCompletionResponse;
+}
+
+function readResponseMetadata(
+  response: OpenAiChatCompletionResponse,
+  requestedModel: string,
+  requestId?: string,
+): AiProviderErrorMetadata {
+  return {
+    model: typeof response.model === 'string' && response.model.trim() ? response.model : requestedModel,
+    requestId,
+    tokensIn: readTokenCount(response.usage?.prompt_tokens),
+    tokensOut: readTokenCount(response.usage?.completion_tokens),
+  };
+}
+
+function readTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= 2_147_483_647
+    ? value
+    : undefined;
 }
 
 const nullableString = { type: ['string', 'null'] };

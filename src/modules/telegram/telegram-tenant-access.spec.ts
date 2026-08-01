@@ -12,6 +12,7 @@ function createService(dependencies: {
   transactionsService?: unknown;
   installmentsService?: unknown;
   subscriptionAccessPolicy?: unknown;
+  aiUsage?: unknown;
 }) {
   return new TelegramService(
     { get: vi.fn() } as never,
@@ -24,7 +25,49 @@ function createService(dependencies: {
     {
       consistentTransactionRelations: vi.fn().mockReturnValue({}),
     } as never,
+    (dependencies.aiUsage ?? {
+      getCurrentUsage: vi.fn().mockResolvedValue(emptyUsage()),
+      reserveInTransaction: vi.fn().mockResolvedValue({
+        kind: 'reserved',
+        eventId: 'usage-event-a',
+        alerts: [],
+      }),
+      complete: vi.fn().mockResolvedValue({ applied: true }),
+      fail: vi.fn().mockResolvedValue({ applied: true }),
+      recordFinancialOperationInTransaction: vi.fn(),
+      reconcileStaleEvents: vi.fn().mockResolvedValue({ count: 0 }),
+      markAmbiguous: vi.fn().mockResolvedValue({ applied: true }),
+      claimAlertDelivery: vi.fn().mockResolvedValue(true),
+      markAlertDelivery: vi.fn(),
+      deleteExpiredMessageLogs: vi.fn().mockResolvedValue({ count: 0 }),
+    }) as never,
   );
+}
+
+function emptyUsage() {
+  return {
+    periodStart: '2026-08-01T00:00:00.000Z',
+    resetAt: '2026-09-01T00:00:00.000Z',
+    status: 'available',
+    messageLimit: 200,
+    messageCount: 0,
+    remaining: 200,
+    measurementComplete: true,
+    tenant: {
+      messages: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCostUsd: '0.000000',
+      financialOperationsCompleted: 0,
+    },
+    currentMember: {
+      messages: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCostUsd: '0.000000',
+      financialOperationsCompleted: 0,
+    },
+  };
 }
 
 function activeSubscription() {
@@ -329,6 +372,85 @@ describe('policy compartilhada no Telegram', () => {
     );
   });
 
+  it('bloqueia somente a nova chamada de IA quando a franquia familiar acabou', async () => {
+    const sendMessage = vi.fn().mockResolvedValue({});
+    const parseFinancialMessage = vi.fn();
+    const reserveInTransaction = vi.fn().mockResolvedValue({
+      kind: 'quota_exceeded',
+      eventId: 'usage-blocked-a',
+      messageLimit: 2,
+      messageCount: 2,
+      resetAt: new Date('2026-09-01T00:00:00.000Z'),
+      alerts: [],
+    });
+    const prisma: Record<string, unknown> = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-a' }]),
+      telegramAuthorizedGroup: { findUnique: vi.fn().mockResolvedValue(group(activeSubscription())) },
+      telegramUserLink: { findUnique: vi.fn().mockResolvedValue(link()) },
+      account: { findMany: vi.fn().mockResolvedValue([]) },
+      category: { findMany: vi.fn().mockResolvedValue([]) },
+    };
+    prisma.$transaction = vi.fn((callback: (tx: unknown) => unknown) => callback(prisma));
+    const service = createService({
+      prisma,
+      telegram: { sendMessage },
+      aiProvider: { parseFinancialMessage },
+      aiUsage: {
+        reserveInTransaction,
+        claimAlertDelivery: vi.fn().mockResolvedValue(true),
+        markAlertDelivery: vi.fn(),
+      },
+    });
+
+    await expect(
+      (
+        service as unknown as {
+          processPayload(updateId: string, payload: unknown): Promise<boolean>;
+        }
+      ).processPayload('update-quota', financialMessage()),
+    ).resolves.toBe(false);
+
+    expect(reserveInTransaction).toHaveBeenCalledOnce();
+    expect(parseFinancialMessage).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage).toHaveBeenCalledWith(
+      'chat-a',
+      expect.stringMatching(/franquia familiar.*sistema financeiro web/isu),
+    );
+  });
+
+  it('não reserva franquia para /saldo, que é uma resposta local', async () => {
+    const reserveInTransaction = vi.fn();
+    const parseFinancialMessage = vi.fn();
+    const sendMessage = vi.fn().mockResolvedValue({});
+    const service = createService({
+      prisma: {
+        telegramAuthorizedGroup: { findUnique: vi.fn().mockResolvedValue(group(activeSubscription())) },
+        telegramUserLink: { findUnique: vi.fn().mockResolvedValue(link()) },
+        account: { findMany: vi.fn().mockResolvedValue([]) },
+        transaction: { findMany: vi.fn().mockResolvedValue([]) },
+      },
+      telegram: { sendMessage },
+      aiProvider: { parseFinancialMessage },
+      aiUsage: { reserveInTransaction },
+    });
+
+    await expect(
+      (
+        service as unknown as {
+          processPayload(updateId: string, payload: unknown): Promise<boolean>;
+        }
+      ).processPayload('update-balance', {
+        ...financialMessage(),
+        message: { ...financialMessage().message, text: '/saldo' },
+      }),
+    ).resolves.toBe(false);
+
+    expect(reserveInTransaction).not.toHaveBeenCalled();
+    expect(parseFinancialMessage).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith('chat-a', expect.stringContaining('Saldo atual'));
+  });
+
   it('reavalia imediatamente antes da IA', async () => {
     const sendMessage = vi.fn().mockResolvedValue({});
     const parseFinancialMessage = vi.fn();
@@ -337,13 +459,15 @@ describe('policy compartilhada no Telegram', () => {
       .mockResolvedValueOnce(group(activeSubscription()))
       .mockResolvedValueOnce(group(null));
     const messageLogCreate = vi.fn();
-    const prisma = {
+    const prisma: Record<string, unknown> = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-a' }]),
       telegramAuthorizedGroup: { findUnique: groupFindUnique },
       telegramUserLink: { findUnique: vi.fn().mockResolvedValue(link()) },
       account: { findMany: vi.fn().mockResolvedValue([]) },
       category: { findMany: vi.fn().mockResolvedValue([]) },
       telegramMessageLog: { create: messageLogCreate },
     };
+    prisma.$transaction = vi.fn((callback: (tx: unknown) => unknown) => callback(prisma));
     const service = createService({
       prisma,
       telegram: { sendMessage },
@@ -398,6 +522,101 @@ describe('policy compartilhada no Telegram', () => {
     expect(parseFinancialMessage).toHaveBeenCalledOnce();
     expect(createTransaction).not.toHaveBeenCalled();
     expect(sendMessage).toHaveBeenCalledWith('chat-a', expect.stringContaining('restabelecer o acesso'));
+  });
+
+  it('não cria confirmação nem operação quando AMBIGUOUS vence o CAS de conclusão', async () => {
+    const sendMessage = vi.fn().mockResolvedValue({});
+    const parseFinancialMessage = vi.fn().mockResolvedValue(parsedExpense());
+    const pendingCreate = vi.fn();
+    const operationCreate = vi.fn();
+    const prisma: Record<string, unknown> = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-a' }]),
+      telegramAuthorizedGroup: {
+        findUnique: vi.fn().mockResolvedValue(group(activeSubscription())),
+      },
+      telegramUserLink: { findUnique: vi.fn().mockResolvedValue(link()) },
+      account: { findMany: vi.fn().mockResolvedValue([]) },
+      category: { findMany: vi.fn().mockResolvedValue([]) },
+      telegramPendingConfirmation: { create: pendingCreate },
+      telegramFinancialOperation: { create: operationCreate },
+    };
+    prisma.$transaction = vi.fn((callback: (tx: unknown) => unknown) => callback(prisma));
+    const service = createService({
+      prisma,
+      telegram: { sendMessage },
+      aiProvider: { parseFinancialMessage },
+      aiUsage: {
+        reserveInTransaction: vi.fn().mockResolvedValue({
+          kind: 'reserved',
+          eventId: 'usage-event-a',
+          alerts: [],
+        }),
+        complete: vi.fn().mockResolvedValue({ applied: false }),
+        fail: vi.fn(),
+        markAmbiguous: vi.fn(),
+        claimAlertDelivery: vi.fn(),
+      },
+    });
+
+    await expect(
+      (
+        service as unknown as {
+          processPayload(updateId: string, payload: unknown): Promise<boolean>;
+        }
+      ).processPayload('update-ambiguous', financialMessage()),
+    ).resolves.toBe(false);
+
+    expect(parseFinancialMessage).toHaveBeenCalledOnce();
+    expect(pendingCreate).not.toHaveBeenCalled();
+    expect(operationCreate).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith(
+      'chat-a',
+      expect.stringContaining('nenhum lançamento foi criado'),
+    );
+  });
+
+  it('orienta nova mensagem ao recuperar replay AMBIGUOUS sem repetir a IA', async () => {
+    const sendMessage = vi.fn().mockResolvedValue({});
+    const parseFinancialMessage = vi.fn();
+    const prisma: Record<string, unknown> = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-a' }]),
+      telegramAuthorizedGroup: {
+        findUnique: vi.fn().mockResolvedValue(group(activeSubscription())),
+      },
+      telegramUserLink: { findUnique: vi.fn().mockResolvedValue(link()) },
+      account: { findMany: vi.fn().mockResolvedValue([]) },
+      category: { findMany: vi.fn().mockResolvedValue([]) },
+    };
+    prisma.$transaction = vi.fn((callback: (tx: unknown) => unknown) => callback(prisma));
+    const service = createService({
+      prisma,
+      telegram: { sendMessage },
+      aiProvider: { parseFinancialMessage },
+      aiUsage: {
+        reserveInTransaction: vi.fn().mockResolvedValue({
+          kind: 'replay',
+          eventId: 'usage-event-a',
+          status: 'AMBIGUOUS',
+          messageLimit: 100,
+          messageCount: 1,
+          resetAt: new Date('2026-09-01T00:00:00.000Z'),
+        }),
+      },
+    });
+
+    await expect(
+      (
+        service as unknown as {
+          processPayload(updateId: string, payload: unknown): Promise<boolean>;
+        }
+      ).processPayload('update-recovered-ambiguous', financialMessage()),
+    ).resolves.toBe(false);
+
+    expect(parseFinancialMessage).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith(
+      'chat-a',
+      expect.stringMatching(/inconclusiva.*nova mensagem/isu),
+    );
   });
 
   it('reavalia dentro da transação antes de desfazer', async () => {
@@ -694,7 +913,11 @@ describe('autorização, vínculo e status do grupo familiar', () => {
 
     const status = await service.getStatus(context);
 
-    expect(status).toEqual({ group: { authorized: true }, member: { linked: true } });
+    expect(status).toEqual({
+      group: { authorized: true },
+      member: { linked: true },
+      usage: emptyUsage(),
+    });
     expect(JSON.stringify(status)).not.toContain('secret');
     expect(prisma.telegramUserLink.findFirst).toHaveBeenCalledWith({
       where: {
@@ -727,6 +950,7 @@ describe('autorização, vínculo e status do grupo familiar', () => {
     await expect(service.getStatus(context)).resolves.toEqual({
       group: { authorized: false },
       member: { linked: false },
+      usage: emptyUsage(),
     });
     expect(findLink).not.toHaveBeenCalled();
   });

@@ -20,6 +20,15 @@ const optionalPositiveInteger = z.preprocess(
   z.coerce.number().int().positive().max(2_147_483_647).optional(),
 );
 
+const usdPerMillionTokens = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  z
+    .string()
+    .trim()
+    .regex(/^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/)
+    .refine((value) => Number(value) <= 1_000_000, 'Preço por milhão de tokens fora do limite.'),
+);
+
 const baseSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8180),
@@ -84,7 +93,21 @@ const baseSchema = z.object({
   AI_PROVIDER: z.enum(['openai']).default('openai'),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_MODEL: z.string().default('gpt-4o-mini'),
+  OPENAI_PRICING_VERSION: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9._:-]{1,80}$/)
+    .default('openai-gpt-4o-mini-2026-08-01'),
+  OPENAI_INPUT_USD_PER_MILLION_TOKENS: usdPerMillionTokens.default('0.15'),
+  OPENAI_OUTPUT_USD_PER_MILLION_TOKENS: usdPerMillionTokens.default('0.60'),
   TELEGRAM_AI_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.85),
+  TELEGRAM_AI_PLAN_CODE: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9._-]{1,64}$/)
+    .default('monthly-card-v1'),
+  TELEGRAM_AI_MONTHLY_MESSAGE_LIMIT: z.coerce.number().int().min(1).max(1_000_000).default(200),
+  TELEGRAM_AI_WARNING_PERCENT: z.coerce.number().int().min(50).max(99).default(80),
   TELEGRAM_PENDING_TTL_HOURS: z.coerce.number().int().positive().default(24),
   TELEGRAM_UNDO_WINDOW_MINUTES: z.coerce.number().int().positive().default(10),
   TELEGRAM_MESSAGE_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(30),

@@ -1,9 +1,10 @@
-import { Controller, Get, Post, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 
 import { CurrentTenant } from '../../shared/current-tenant.decorator';
 import type { TenantContext } from '../../shared/tenant-context';
 import { TenantOwnerGuard } from '../../shared/tenant-owner.guard';
+import { AiUsageMonthQueryDto } from './dto/ai-usage-month-query.dto';
 import { TelegramService } from './telegram.service';
 
 @Controller('telegram')
@@ -13,6 +14,15 @@ export class TelegramAuthCodesController {
   @Get('status')
   status(@CurrentTenant() context: TenantContext) {
     return this.telegramService.getStatus(context);
+  }
+
+  @Get('usage/members')
+  @UseGuards(TenantOwnerGuard)
+  memberUsage(
+    @CurrentTenant() context: TenantContext,
+    @Query() query: AiUsageMonthQueryDto,
+  ) {
+    return this.telegramService.getMemberUsage(context, query.month);
   }
 
   @Post('auth-codes/group')

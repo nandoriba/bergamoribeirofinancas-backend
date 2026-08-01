@@ -247,7 +247,7 @@ export class TenantRetentionService {
     tx: Prisma.TransactionClient,
     familyId: string,
   ): Promise<void> {
-    const [profiles, users, invites, groups] = await Promise.all([
+    const [profiles, users, invites, groups, aiEvents] = await Promise.all([
       tx.memberProfile.findMany({
         where: { familyId },
         select: {
@@ -260,6 +260,10 @@ export class TenantRetentionService {
       tx.telegramAuthorizedGroup.findMany({
         where: { familyId },
         select: { chatId: true },
+      }),
+      tx.aiUsageEvent.findMany({
+        where: { familyId },
+        select: { sourceUpdateId: true },
       }),
     ]);
     const profileIds = profiles.map(({ id }) => id);
@@ -282,7 +286,7 @@ export class TenantRetentionService {
       : [];
     const sourceUpdateIds = [
       ...new Set(
-        operations
+        [...operations, ...aiEvents]
           .map(({ sourceUpdateId }) => sourceUpdateId)
           .filter((value): value is string => value !== null),
       ),
@@ -328,6 +332,13 @@ export class TenantRetentionService {
         where: { chatId: { in: chatIds } },
       });
     }
+
+    // The usage aggregate owns events and alerts. Its event links are
+    // intentionally RESTRICTed from operational Telegram rows, so dismantle
+    // those dependants first and then remove the ledger before source updates
+    // and member profiles.
+    await tx.aiTenantMonthlyUsage.deleteMany({ where: { familyId } });
+
     await tx.telegramAuthorizedGroup.deleteMany({ where: { familyId } });
     if (sourceUpdateIds.length) {
       await tx.telegramUpdate.deleteMany({

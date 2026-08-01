@@ -16,7 +16,7 @@
 
 O MVP exige **exatamente uma réplica da API `financeiro-api`**. Não execute o backend em cluster e não use `docker compose up --scale backend=...`.
 
-O worker atual mantém uma única fila serial em memória (`Promise`). Uma chamada lenta à IA bloqueia temporariamente todos os chats, e duas réplicas poderiam disputar o mesmo `TelegramUpdate`, chamar a IA mais de uma vez e produzir respostas concorrentes. O banco continua sendo a fonte de verdade para updates e idempotência financeira, mas isso não torna o worker seguro para múltiplos consumidores.
+O worker atual mantém uma única fila serial em memória (`Promise`). Uma chamada lenta à IA bloqueia temporariamente todos os chats. O ledger de consumo reserva cada `TelegramUpdate` uma única vez e evita repetir automaticamente a chamada externa, mas duas réplicas ainda poderiam disputar processamento, respostas e estados que ficam fora desse claim. O banco continua sendo a fonte de verdade para updates, consumo e idempotência financeira; isso não torna o worker inteiro seguro para múltiplos consumidores.
 
 `TelegramService.recoverStuckUpdates` apenas reenfileira updates persistidos que ficaram presos. Ele não concede acesso, não calcula saldo e não substitui a reavaliação da assinatura. Monitore falhas e atraso desse cron separadamente.
 
