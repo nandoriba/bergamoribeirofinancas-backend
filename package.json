@@ -16,6 +16,7 @@
     "test:integration": "tsx scripts/run-tenant-isolation-integration.ts",
     "test:watch": "vitest",
     "prisma:generate": "prisma generate",
+    "prisma:validate": "prisma validate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "tsx prisma/seed.ts",

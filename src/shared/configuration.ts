@@ -15,6 +15,11 @@ const optionalEmail = z.preprocess(
   z.string().trim().email().optional(),
 );
 
+const optionalPositiveInteger = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  z.coerce.number().int().positive().max(2_147_483_647).optional(),
+);
+
 const baseSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8180),
@@ -82,8 +87,22 @@ const baseSchema = z.object({
   TELEGRAM_UNDO_WINDOW_MINUTES: z.coerce.number().int().positive().default(10),
   TELEGRAM_MESSAGE_LOG_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   TELEGRAM_UPDATE_RECOVERY_MINUTES: z.coerce.number().int().positive().default(5),
+  ABACATEPAY_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
   ABACATEPAY_DEV_API_KEY: optionalNonBlankString,
   ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: optionalNonBlankString,
+  ABACATEPAY_DEV_API_URL: z.string().url().default('https://api.abacatepay.com/v2'),
+  ABACATEPAY_PROD_API_KEY: optionalNonBlankString,
+  ABACATEPAY_PROD_MONTHLY_PRODUCT_ID: optionalNonBlankString,
+  ABACATEPAY_PROD_API_URL: z.string().url().default('https://api.abacatepay.com/v2'),
+  ABACATEPAY_MONTHLY_AMOUNT_CENTS: optionalPositiveInteger,
+  ABACATEPAY_PLAN_NAME: z.string().trim().min(1).max(120).default('Plano familiar'),
+  ABACATEPAY_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(10_000),
+  ABACATEPAY_RETRY_MAX: z.coerce.number().int().min(1).max(10).default(3),
+  ABACATEPAY_RETRY_EVERY_DAYS: z.coerce.number().int().min(1).max(30).default(2),
+  ABACATEPAY_CHECKOUT_LOCK_SECONDS: z.coerce.number().int().min(30).max(600).default(90),
 });
 
 const schema = baseSchema.superRefine((config, context) => {
@@ -221,6 +240,82 @@ const schema = baseSchema.superRefine((config, context) => {
         message: 'O cadastro público exige um canal de suporte explícito.',
       });
     }
+    if (!config.ABACATEPAY_ENABLED) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ABACATEPAY_ENABLED'],
+        message: 'O cadastro público exige checkout AbacatePay configurado.',
+      });
+    }
+  }
+
+  for (const key of ['ABACATEPAY_DEV_API_URL', 'ABACATEPAY_PROD_API_URL'] as const) {
+    if (!isCanonicalAbacatePayApiUrl(config[key])) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [key],
+        message: 'A URL da AbacatePay deve ser exatamente a base HTTPS oficial /v2.',
+      });
+    }
+  }
+
+  for (const key of [
+    'ABACATEPAY_DEV_MONTHLY_PRODUCT_ID',
+    'ABACATEPAY_PROD_MONTHLY_PRODUCT_ID',
+  ] as const) {
+    if (config[key] && !/^prod[_-][A-Za-z0-9_-]+$/.test(config[key])) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [key],
+        message: 'O produto mensal deve usar um identificador prod_ ou prod- válido da AbacatePay.',
+      });
+    }
+  }
+
+  if (config.ABACATEPAY_ENABLED) {
+    if (!config.ABACATEPAY_MONTHLY_AMOUNT_CENTS) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ABACATEPAY_MONTHLY_AMOUNT_CENTS'],
+        message: 'Informe o valor mensal esperado em centavos.',
+      });
+    }
+
+    const requiredKeys =
+      config.NODE_ENV === 'production'
+        ? (['ABACATEPAY_PROD_API_KEY', 'ABACATEPAY_PROD_MONTHLY_PRODUCT_ID'] as const)
+        : (['ABACATEPAY_DEV_API_KEY', 'ABACATEPAY_DEV_MONTHLY_PRODUCT_ID'] as const);
+    for (const key of requiredKeys) {
+      if (!config[key]) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: 'Configuração obrigatória quando a integração AbacatePay está habilitada.',
+        });
+      }
+    }
+  }
+
+  if (
+    config.ABACATEPAY_CHECKOUT_LOCK_SECONDS * 1_000 <
+    config.ABACATEPAY_TIMEOUT_MS * 2 + 15_000
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['ABACATEPAY_CHECKOUT_LOCK_SECONDS'],
+      message: 'O lease do checkout deve cobrir consulta, criação, timeouts e margem operacional.',
+    });
+  }
+
+  if (
+    config.NODE_ENV !== 'production' &&
+    (config.ABACATEPAY_PROD_API_KEY || config.ABACATEPAY_PROD_MONTHLY_PRODUCT_ID)
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['ABACATEPAY_PROD_API_KEY'],
+      message: 'Credenciais de produção não podem ser carregadas fora de produção.',
+    });
   }
 
   if (config.ACTION_TOKEN_DAILY_LIMIT < config.ACTION_TOKEN_HOURLY_LIMIT) {
@@ -306,4 +401,23 @@ function validEmailSender(value: string): boolean {
   const friendly = /^[^<>]{1,100}\s<([^<>\s]+@[^<>\s]+)>$/.exec(trimmed);
   const address = friendly?.[1] ?? (/^[^<>\s]+@[^<>\s]+$/.test(trimmed) ? trimmed : undefined);
   return Boolean(address && z.string().email().safeParse(address).success);
+}
+
+function isCanonicalAbacatePayApiUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      url.hostname === 'api.abacatepay.com' &&
+      url.port === '' &&
+      url.pathname === '/v2' &&
+      !url.search &&
+      !url.hash &&
+      !url.username &&
+      !url.password &&
+      value === url.toString().replace(/\/$/, '')
+    );
+  } catch {
+    return false;
+  }
 }

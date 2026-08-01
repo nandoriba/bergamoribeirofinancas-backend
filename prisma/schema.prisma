@@ -38,6 +38,14 @@ enum SubscriptionPaymentMethod {
   CARD
 }
 
+enum CheckoutProvisioningStatus {
+  pending
+  processing
+  ready
+  ambiguous
+  failed
+}
+
 enum UserActionTokenPurpose {
   email_verification
   password_reset
@@ -413,7 +421,7 @@ model MemberApproval {
   @@index([familyId])
 }
 
-/// The SQL migration enforces at most one non-cancelled subscription per family.
+/// SQL enforces at most one non-cancelled subscription with an open checkout per family.
 model Subscription {
   id                      String                     @id @default(uuid())
   familyId                String
@@ -423,6 +431,8 @@ model Subscription {
   providerSubscriptionId  String?
   providerCustomerId      String?
   providerCheckoutId      String?
+  providerCheckoutUrl     String?
+  providerCheckoutStatus  String?
   providerProductId       String
   providerStatus          String?
   lastProviderEvent       String?
@@ -440,6 +450,15 @@ model Subscription {
   providerPaymentMethod   String?
   billingCycle            SubscriptionCycle          @default(MONTHLY)
   devMode                 Boolean
+  checkoutProvisioningStatus CheckoutProvisioningStatus @default(pending)
+  checkoutCreationAllowed Boolean                    @default(true)
+  checkoutAttempts        Int                        @default(0)
+  checkoutClaimToken      String?
+  checkoutLockedAt        DateTime?
+  checkoutReadyAt         DateTime?
+  checkoutClosedAt        DateTime?
+  checkoutCloseReason     String?
+  checkoutLastErrorCode   String?
   payments                SubscriptionPayment[]
   webhookEvents           PaymentWebhookEvent[]
   createdAt               DateTime                   @default(now())
@@ -452,6 +471,7 @@ model Subscription {
   @@index([familyId, providerStatus])
   @@index([provider, providerCustomerId])
   @@index([providerProductId])
+  @@index([checkoutProvisioningStatus, checkoutLockedAt])
 }
 
 model SubscriptionPayment {

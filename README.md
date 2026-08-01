@@ -32,7 +32,7 @@ O cadastro local cria família, owner, perfil, aceite legal, desafio de verifica
 
 Configure `EMAIL_PROVIDER=resend`, `RESEND_API_KEY`, `EMAIL_FROM`, `PUBLIC_API_ORIGIN`, `SUPPORT_EMAIL` e segredos independentes em `ACTION_TOKEN_SECRET` e `EMAIL_OUTBOX_SECRET`. Recuperação de senha usa link de uso único, cookie transitório HttpOnly e incrementa `authVersion`, invalidando sessões anteriores. O fluxo também permite que uma conta originalmente Google-only defina uma senha.
 
-Owners novos ficam com `requiredAction=payment`; o guard global libera apenas sessão/logout enquanto `Family.pendingPaymentExpiresAt` estiver preenchido. `OWNER_SIGNUP_ENABLED` permanece `false` até a fatia seguinte publicar checkout e cobrança. Termos e privacidade incluídos no frontend são uma versão operacional preliminar e exigem revisão jurídica antes da ativação.
+Owners novos ficam com `requiredAction=payment`; o guard global libera sessão, logout e as rotas explícitas de assinatura/checkout enquanto `Family.pendingPaymentExpiresAt` estiver preenchido. O checkout mensal hospedado da AbacatePay usa somente cartão e não altera entitlement pelo retorno do navegador. `OWNER_SIGNUP_ENABLED` permanece `false` até a próxima fatia publicar e validar o webhook autoritativo, o paywall derivado e a fronteira contratual do ciclo no sandbox. Consulte [docs/ABACATEPAY_CHECKOUT.md](docs/ABACATEPAY_CHECKOUT.md). Termos e privacidade incluídos no frontend são uma versão operacional preliminar e exigem revisão jurídica antes da ativação.
 
 ## Banco Local
 
@@ -57,6 +57,8 @@ O seed cria apenas estrutura inicial: família, admin local, perfil, contas e ca
 - `POST /auth/password-reset/confirm`
 - `GET /auth/me`
 - `POST /auth/logout`
+- `GET /payments/subscription`
+- `POST /payments/checkout`
 - `POST /member-invites`
 - `POST /member-approvals/:id/approve`
 - `GET /dashboard?family=true`

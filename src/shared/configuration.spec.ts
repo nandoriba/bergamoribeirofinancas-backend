@@ -7,6 +7,12 @@ describe('validateConfig', () => {
     NODE_ENV: 'test',
     DATABASE_URL: 'postgresql://user:password@localhost:5432/finances',
   };
+  const abacatePayDevConfig = {
+    ABACATEPAY_ENABLED: 'true',
+    ABACATEPAY_DEV_API_KEY: 'dev-key',
+    ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod_monthly',
+    ABACATEPAY_MONTHLY_AMOUNT_CENTS: '2990',
+  };
 
   it('rejeita secrets JWT menores que 32 caracteres', () => {
     expect(() =>
@@ -45,11 +51,11 @@ describe('validateConfig', () => {
       ...requiredConfig,
       JWT_SECRET: 'x'.repeat(32),
       ABACATEPAY_DEV_API_KEY: 'dev-key',
-      ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod-monthly',
+      ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod_monthly',
     });
 
     expect(config.ABACATEPAY_DEV_API_KEY).toBe('dev-key');
-    expect(config.ABACATEPAY_DEV_MONTHLY_PRODUCT_ID).toBe('prod-monthly');
+    expect(config.ABACATEPAY_DEV_MONTHLY_PRODUCT_ID).toBe('prod_monthly');
   });
 
   it('rejeita credenciais de sandbox em produção', () => {
@@ -60,7 +66,7 @@ describe('validateConfig', () => {
         COOKIE_SECURE: 'true',
         JWT_SECRET: 'x'.repeat(32),
         ABACATEPAY_DEV_API_KEY: 'dev-key',
-        ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod-monthly',
+        ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod_monthly',
       }),
     ).toThrow();
   });
@@ -164,6 +170,119 @@ describe('validateConfig', () => {
 
     expect(config.OWNER_SIGNUP_ENABLED).toBe(false);
     expect(config.EMAIL_PROVIDER).toBe('disabled');
+    expect(config.ABACATEPAY_ENABLED).toBe(false);
+  });
+
+  it('falha cedo quando a AbacatePay é habilitada sem produto, chave ou preço', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ABACATEPAY_ENABLED: 'true',
+      }),
+    ).toThrow();
+  });
+
+  it('aceita checkout CARD mensal com credenciais exclusivas do ambiente de teste', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      JWT_SECRET: 'x'.repeat(32),
+      ...abacatePayDevConfig,
+    });
+
+    expect(config).toMatchObject({
+      ABACATEPAY_ENABLED: true,
+      ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod_monthly',
+      ABACATEPAY_MONTHLY_AMOUNT_CENTS: 2990,
+      ABACATEPAY_RETRY_MAX: 3,
+      ABACATEPAY_RETRY_EVERY_DAYS: 2,
+    });
+  });
+
+  it('rejeita valor mensal que não cabe no inteiro persistido pelo PostgreSQL', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ...abacatePayDevConfig,
+        ABACATEPAY_MONTHLY_AMOUNT_CENTS: '2147483648',
+      }),
+    ).toThrow();
+  });
+
+  it('aceita somente as credenciais e o produto mensais de produção no ambiente produtivo', () => {
+    const config = validateConfig({
+      ...requiredConfig,
+      NODE_ENV: 'production',
+      COOKIE_SECURE: 'true',
+      JWT_SECRET: 'x'.repeat(32),
+      WEB_ORIGIN: 'https://app.example.com',
+      ABACATEPAY_ENABLED: 'true',
+      ABACATEPAY_PROD_API_KEY: 'prod-key',
+      ABACATEPAY_PROD_MONTHLY_PRODUCT_ID: 'prod_monthly_live',
+      ABACATEPAY_MONTHLY_AMOUNT_CENTS: '2990',
+    });
+
+    expect(config).toMatchObject({
+      ABACATEPAY_ENABLED: true,
+      ABACATEPAY_PROD_MONTHLY_PRODUCT_ID: 'prod_monthly_live',
+      ABACATEPAY_MONTHLY_AMOUNT_CENTS: 2990,
+    });
+    expect(config.ABACATEPAY_DEV_API_KEY).toBeUndefined();
+  });
+
+  it('rejeita identificador de produto que não segue o contrato prod_', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ...abacatePayDevConfig,
+        ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'monthly-plan',
+      }),
+    ).toThrow();
+  });
+
+  it('rejeita lease que possa expirar durante consulta e criação do checkout', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ABACATEPAY_TIMEOUT_MS: '30000',
+        ABACATEPAY_CHECKOUT_LOCK_SECONDS: '60',
+      }),
+    ).toThrow();
+  });
+
+  it('rejeita credenciais de produção fora de produção e URL de API não oficial', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ABACATEPAY_PROD_API_KEY: 'prod-secret',
+      }),
+    ).toThrow();
+
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        JWT_SECRET: 'x'.repeat(32),
+        ABACATEPAY_DEV_API_URL: 'https://evil.example/v2',
+      }),
+    ).toThrow();
+  });
+
+  it('rejeita credenciais de desenvolvimento no ambiente de produção', () => {
+    expect(() =>
+      validateConfig({
+        ...requiredConfig,
+        NODE_ENV: 'production',
+        COOKIE_SECURE: 'true',
+        JWT_SECRET: 'x'.repeat(32),
+        WEB_ORIGIN: 'https://app.example.com',
+        ABACATEPAY_DEV_API_KEY: 'dev-key',
+        ABACATEPAY_DEV_MONTHLY_PRODUCT_ID: 'prod_monthly',
+      }),
+    ).toThrow();
   });
 
   it('falha cedo quando cadastro público é ativado sem e-mail e suporte', () => {
@@ -199,12 +318,14 @@ describe('validateConfig', () => {
       EMAIL_FROM: 'Finanças <hello@example.com>',
       SUPPORT_EMAIL: 'support@example.com',
       PUBLIC_API_ORIGIN: 'http://127.0.0.1:8180',
+      ...abacatePayDevConfig,
     });
 
     expect(config).toMatchObject({
       OWNER_SIGNUP_ENABLED: true,
       EMAIL_PROVIDER: 'resend',
       LEGAL_BUNDLE_VERSION: '2026-08-01',
+      ABACATEPAY_ENABLED: true,
     });
   });
 

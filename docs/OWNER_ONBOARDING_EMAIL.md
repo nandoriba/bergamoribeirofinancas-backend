@@ -2,7 +2,7 @@
 
 ## Estado de rollout
 
-`OWNER_SIGNUP_ENABLED` deve permanecer `false` até o checkout e a confirmação de pagamento da próxima fatia estarem publicados. A implementação atual já é fail-closed: famílias criadas pelo onboarding recebem `pendingPaymentExpiresAt`, a sessão deriva `requiredAction=payment` e o guard global nega módulos financeiros. Apenas `/auth/me` e `/auth/logout` aceitam essa sessão nesta fatia.
+`OWNER_SIGNUP_ENABLED` deve permanecer `false` até o webhook autoritativo, o paywall derivado e o contrato mensal do sandbox estarem publicados e validados. A implementação atual já é fail-closed: famílias criadas pelo onboarding recebem `pendingPaymentExpiresAt`, a sessão deriva `requiredAction=payment` e o guard global nega módulos financeiros. Além de `/auth/me` e `/auth/logout`, somente a consulta de assinatura e a criação de checkout possuem allowlist explícita para essa sessão.
 
 O fluxo por e-mail também exige `EMAIL_PROVIDER=resend`, canal de suporte e segredos independentes. A aplicação falha na inicialização se a combinação estiver incompleta.
 
@@ -64,7 +64,7 @@ Os segredos de token, outbox, OAuth e JWT devem ser diferentes. Em produção, `
 
 ## Checklist antes de habilitar
 
-- Publicar e validar a fatia de AbacatePay/checkout e o webhook autoritativo.
+- Validar o checkout AbacatePay e publicar o webhook autoritativo, o paywall derivado e o contrato mensal do sandbox.
 - Revisar Termos e Política de Privacidade com responsável jurídico.
 - Preencher controlador, endereço, encarregado/canal de privacidade e operadores reais.
 - Confirmar domínio remetente no Resend e testar entrega, bounce e rate limits.
