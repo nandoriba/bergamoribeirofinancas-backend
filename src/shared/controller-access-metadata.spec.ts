@@ -1,3 +1,4 @@
+import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Reflector } from '@nestjs/core';
 import { describe, expect, it } from 'vitest';
 
@@ -10,6 +11,7 @@ import { TelegramAuthCodesController } from '../modules/telegram/telegram-auth-c
 import { TelegramWebhookController } from '../modules/telegram/telegram-webhook.controller';
 import { UsersController } from '../modules/users/users.controller';
 import { IS_PUBLIC_KEY, Public } from './public.decorator';
+import { TenantOwnerGuard } from './tenant-owner.guard';
 
 const THROTTLER_LIMIT_DEFAULT = 'THROTTLER:LIMITdefault';
 const THROTTLER_TTL_DEFAULT = 'THROTTLER:TTLdefault';
@@ -26,6 +28,12 @@ function isPublic(controller: ControllerType, handler: (...args: never[]) => unk
 function expectThrottle(handler: (...args: never[]) => unknown, limit: number) {
   expect(Reflect.getMetadata(THROTTLER_LIMIT_DEFAULT, handler)).toBe(limit);
   expect(Reflect.getMetadata(THROTTLER_TTL_DEFAULT, handler)).toBe(ONE_MINUTE_MS);
+}
+
+function guardsFor(controller: ControllerType, handler: (...args: never[]) => unknown) {
+  const controllerGuards = (Reflect.getMetadata(GUARDS_METADATA, controller) as unknown[] | undefined) ?? [];
+  const handlerGuards = (Reflect.getMetadata(GUARDS_METADATA, handler) as unknown[] | undefined) ?? [];
+  return [...controllerGuards, ...handlerGuards];
 }
 
 describe('metadados de acesso dos controllers', () => {
@@ -76,5 +84,28 @@ describe('metadados de acesso dos controllers', () => {
 
   it('limita requisições do webhook Telegram a 60 por minuto', () => {
     expectThrottle(TelegramWebhookController.prototype.receiveWebhook, 60);
+  });
+
+  it.each([
+    ['criação de convite', MemberInvitesController, MemberInvitesController.prototype.create],
+    ['listagem de convites', MemberInvitesController, MemberInvitesController.prototype.list],
+    ['listagem de aprovações', MemberApprovalsController, MemberApprovalsController.prototype.list],
+    ['aprovação de membro', MemberApprovalsController, MemberApprovalsController.prototype.approve],
+    ['rejeição de membro', MemberApprovalsController, MemberApprovalsController.prototype.reject],
+    ['código do grupo Telegram', TelegramAuthCodesController, TelegramAuthCodesController.prototype.createGroupCode],
+  ] as const)('protege %s com TenantOwnerGuard', (_label, controller, handler) => {
+    expect(guardsFor(controller, handler)).toContain(TenantOwnerGuard);
+  });
+
+  it.each([
+    ['consulta pública de convite', MemberInvitesController, MemberInvitesController.prototype.getPublic],
+    ['cadastro público por convite', MemberInvitesController, MemberInvitesController.prototype.register],
+    [
+      'código Telegram do próprio membro',
+      TelegramAuthCodesController,
+      TelegramAuthCodesController.prototype.createMemberCode,
+    ],
+  ] as const)('não exige owner para %s', (_label, controller, handler) => {
+    expect(guardsFor(controller, handler)).not.toContain(TenantOwnerGuard);
   });
 });

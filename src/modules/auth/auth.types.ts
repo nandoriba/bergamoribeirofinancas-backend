@@ -1,9 +1,12 @@
-import { UserRole } from '@prisma/client';
+import { PlatformRole } from '@prisma/client';
+
+export type TenantRole = 'owner' | 'member';
 
 export interface AuthenticatedUser {
   id: string;
   email: string;
-  role: UserRole;
+  platformRole: PlatformRole;
+  tenantRole: TenantRole;
   familyId: string;
   profileId: string;
 }
@@ -11,8 +14,8 @@ export interface AuthenticatedUser {
 export interface JwtPayload {
   sub: string;
   email: string;
-  role: UserRole;
+  platformRole: PlatformRole;
+  tenantRole: TenantRole;
   familyId: string;
   profileId: string;
 }
-

@@ -16,10 +16,9 @@ export class UsersService {
         id: true,
         email: true,
         name: true,
-        role: true,
+        platformRole: true,
         themePreference: true,
       },
     });
   }
 }
-

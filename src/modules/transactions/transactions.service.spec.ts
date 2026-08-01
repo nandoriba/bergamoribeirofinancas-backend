@@ -7,7 +7,8 @@ describe('TransactionsService', () => {
   const user: AuthenticatedUser = {
     id: 'user-1',
     email: 'fernando@example.com',
-    role: 'member',
+    platformRole: 'user',
+    tenantRole: 'member',
     familyId: 'family-1',
     profileId: 'profile-1',
   };

@@ -20,7 +20,7 @@ export class ProfilesService {
         user: {
           select: {
             email: true,
-            role: true,
+            platformRole: true,
           },
         },
       },
@@ -28,4 +28,3 @@ export class ProfilesService {
     });
   }
 }
-

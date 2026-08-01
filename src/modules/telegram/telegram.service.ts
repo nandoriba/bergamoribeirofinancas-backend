@@ -1,7 +1,7 @@
 import { BadRequestException, Inject, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron } from '@nestjs/schedule';
-import { Prisma, UserRole } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 
 import { PrismaService } from '../../prisma/prisma.service';
@@ -257,7 +257,11 @@ export class TelegramService {
     const result = await this.prisma.$transaction(async (tx) => {
       const authCode = await tx.telegramAuthCode.findUnique({
         where: { code },
-        include: { user: true },
+        include: {
+          user: {
+            include: { family: { select: { ownerUserId: true } } },
+          },
+        },
       });
 
       if (
@@ -266,7 +270,8 @@ export class TelegramService {
         authCode.consumedAt ||
         authCode.expiresAt <= now ||
         !authCode.user ||
-        authCode.user.role !== UserRole.admin
+        !authCode.user.isActive ||
+        authCode.user.family.ownerUserId !== authCode.user.id
       ) {
         await tx.telegramUpdate.update({
           where: { updateId },
@@ -915,7 +920,10 @@ export class TelegramService {
   }
 
   private async resolveLinkedContextFromIds(chatId: string, tgUserId: string): Promise<LinkedTelegramContext | null> {
-    const group = await this.prisma.telegramAuthorizedGroup.findUnique({ where: { chatId } });
+    const group = await this.prisma.telegramAuthorizedGroup.findUnique({
+      where: { chatId },
+      include: { family: { select: { ownerUserId: true } } },
+    });
     if (!group || group.revokedAt) return null;
 
     const link = await this.prisma.telegramUserLink.findUnique({
@@ -926,7 +934,13 @@ export class TelegramService {
         },
       },
     });
-    if (!link || link.revokedAt || link.memberProfile.familyId !== group.familyId || link.memberProfile.status !== 'active') {
+    if (
+      !link ||
+      link.revokedAt ||
+      !link.memberProfile.user.isActive ||
+      link.memberProfile.familyId !== group.familyId ||
+      link.memberProfile.status !== 'active'
+    ) {
       return null;
     }
 
@@ -938,7 +952,8 @@ export class TelegramService {
       user: {
         id: link.memberProfile.user.id,
         email: link.memberProfile.user.email,
-        role: link.memberProfile.user.role,
+        platformRole: link.memberProfile.user.platformRole,
+        tenantRole: group.family.ownerUserId === link.memberProfile.user.id ? 'owner' : 'member',
         familyId: group.familyId,
         profileId: link.memberProfileId,
       },

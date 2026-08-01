@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { UserRole } from '@prisma/client';
+import { PlatformRole } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { randomBytes } from 'node:crypto';
 
@@ -98,14 +98,14 @@ export class MemberInvitesService {
           email: dto.email.toLowerCase(),
           passwordHash,
           name: dto.name,
-          role: UserRole.member,
+          platformRole: PlatformRole.user,
           isActive: false,
           familyId: invite.familyId,
           profile: {
             create: {
               displayName: dto.name,
               status: 'pending',
-              familyId: invite.familyId,
+              family: { connect: { id: invite.familyId } },
             },
           },
         },
@@ -137,4 +137,3 @@ export class MemberInvitesService {
     };
   }
 }
-

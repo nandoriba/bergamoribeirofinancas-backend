@@ -7,6 +7,8 @@ import type { Response } from 'express';
 import { PrismaService } from '../../prisma/prisma.service';
 import type { AuthenticatedUser, JwtPayload } from './auth.types';
 
+const DUMMY_PASSWORD_HASH = '$2a$12$if2i1aU0zMN0sCeQf1OH2uyr2PwSJfsiaiVxNoRMV.v8KuvXLmjbC';
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -18,10 +20,14 @@ export class AuthService {
   async login(email: string, password: string) {
     const user = await this.prisma.user.findUnique({
       where: { email: email.toLowerCase() },
-      include: { profile: true },
+      include: {
+        profile: true,
+        family: { select: { ownerUserId: true } },
+      },
     });
 
-    if (!user || !user.profile || !(await bcrypt.compare(password, user.passwordHash))) {
+    const passwordMatches = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_PASSWORD_HASH);
+    if (!user || !user.profile || !user.passwordHash || !passwordMatches) {
       throw new UnauthorizedException('Email ou senha inválidos');
     }
 
@@ -32,7 +38,8 @@ export class AuthService {
     const authUser: AuthenticatedUser = {
       id: user.id,
       email: user.email,
-      role: user.role,
+      platformRole: user.platformRole,
+      tenantRole: user.family.ownerUserId === user.id ? 'owner' : 'member',
       familyId: user.familyId,
       profileId: user.profile.id,
     };
@@ -70,7 +77,8 @@ export class AuthService {
     const payload: JwtPayload = {
       sub: user.id,
       email: user.email,
-      role: user.role,
+      platformRole: user.platformRole,
+      tenantRole: user.tenantRole,
       familyId: user.familyId,
       profileId: user.profileId,
     };
@@ -88,7 +96,8 @@ export class AuthService {
       id: user.id,
       email: user.email,
       name,
-      role: user.role,
+      platformRole: user.platformRole,
+      tenantRole: user.tenantRole,
       familyId: user.familyId,
       familyName,
       profileId: user.profileId,
@@ -96,4 +105,3 @@ export class AuthService {
     };
   }
 }
-

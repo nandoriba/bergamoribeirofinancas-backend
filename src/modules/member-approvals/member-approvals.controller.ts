@@ -1,15 +1,12 @@
 import { Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
-import { UserRole } from '@prisma/client';
 
 import { CurrentUser } from '../../shared/current-user.decorator';
-import { Roles } from '../../shared/role.decorator';
-import { RolesGuard } from '../../shared/roles.guard';
+import { TenantOwnerGuard } from '../../shared/tenant-owner.guard';
 import type { AuthenticatedUser } from '../auth/auth.types';
 import { MemberApprovalsService } from './member-approvals.service';
 
 @Controller('member-approvals')
-@UseGuards(RolesGuard)
-@Roles(UserRole.admin)
+@UseGuards(TenantOwnerGuard)
 export class MemberApprovalsController {
   constructor(private readonly memberApprovalsService: MemberApprovalsService) {}
 
