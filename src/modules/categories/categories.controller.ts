@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { CategoriesService } from './categories.service';
 import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
@@ -11,22 +11,22 @@ export class CategoriesController {
   constructor(private readonly categoriesService: CategoriesService) {}
 
   @Get()
-  list(@CurrentUser() user: AuthenticatedUser) {
-    return this.categoriesService.list(user);
+  list(@CurrentTenant() context: TenantContext) {
+    return this.categoriesService.list(context);
   }
 
   @Post()
-  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateCategoryDto) {
-    return this.categoriesService.create(user, dto);
+  create(@CurrentTenant() context: TenantContext, @Body() dto: CreateCategoryDto) {
+    return this.categoriesService.create(context, dto);
   }
 
   @Patch(':id')
-  update(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string, @Body() dto: UpdateCategoryDto) {
-    return this.categoriesService.update(user, id, dto);
+  update(@CurrentTenant() context: TenantContext, @Param('id') id: string, @Body() dto: UpdateCategoryDto) {
+    return this.categoriesService.update(context, id, dto);
   }
 
   @Delete(':id')
-  remove(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {
-    return this.categoriesService.remove(user, id);
+  remove(@CurrentTenant() context: TenantContext, @Param('id') id: string) {
+    return this.categoriesService.remove(context, id);
   }
 }

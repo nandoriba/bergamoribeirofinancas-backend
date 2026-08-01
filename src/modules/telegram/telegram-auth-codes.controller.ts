@@ -1,9 +1,9 @@
 import { Controller, Post, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { TenantOwnerGuard } from '../../shared/tenant-owner.guard';
-import type { AuthenticatedUser } from '../auth/auth.types';
 import { TelegramService } from './telegram.service';
 
 @Controller('telegram/auth-codes')
@@ -13,13 +13,13 @@ export class TelegramAuthCodesController {
   @Post('group')
   @UseGuards(TenantOwnerGuard)
   @Throttle({ default: { ttl: 60_000, limit: 5 } })
-  createGroupCode(@CurrentUser() user: AuthenticatedUser) {
-    return this.telegramService.createGroupAuthCode(user);
+  createGroupCode(@CurrentTenant() context: TenantContext) {
+    return this.telegramService.createGroupAuthCode(context);
   }
 
   @Post('member')
   @Throttle({ default: { ttl: 60_000, limit: 5 } })
-  createMemberCode(@CurrentUser() user: AuthenticatedUser) {
-    return this.telegramService.createMemberAuthCode(user);
+  createMemberCode(@CurrentTenant() context: TenantContext) {
+    return this.telegramService.createMemberAuthCode(context);
   }
 }

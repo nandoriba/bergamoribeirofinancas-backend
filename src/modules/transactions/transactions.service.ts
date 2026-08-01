@@ -2,9 +2,10 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
+import { TenantScopeService } from '../../prisma/tenant-scope.service';
 import { dateFromAccountDay, resolveCreditCardReferenceMonth } from '../../shared/credit-card-invoice';
 import { endOfDay, endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import type { TenantContext } from '../../shared/tenant-context';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
 
@@ -21,35 +22,61 @@ type PrismaExecutor = PrismaService | Prisma.TransactionClient;
 
 @Injectable()
 export class TransactionsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
+  ) {}
 
-  async list(user: AuthenticatedUser, query: { referenceMonth?: string; profileId?: string }) {
+  async list(
+    context: TenantContext,
+    query: { referenceMonth?: string; profileId?: string; cursor?: string; limit?: number },
+  ) {
     const reference = parseMonth(query.referenceMonth);
+    const limit = query.limit ?? 50;
+    const profileIds = await this.tenantScope.resolveProfileIds(
+      context,
+      query.profileId ? { profileId: query.profileId } : { family: true },
+    );
     const where: Prisma.TransactionWhereInput = {
-      memberProfile: { familyId: user.familyId },
+      memberProfileId: { in: profileIds },
       referenceMonth: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
+      ...this.tenantScope.consistentTransactionRelations(context),
     };
 
-    if (query.profileId) {
-      where.memberProfileId = query.profileId;
+    if (query.cursor) {
+      const cursor = await this.prisma.transaction.findFirst({
+        where: { ...where, id: query.cursor },
+        select: { id: true },
+      });
+      if (!cursor) throw new BadRequestException('Cursor inválido');
     }
 
     const transactions = await this.prisma.transaction.findMany({
       where,
       include: transactionInclude,
-      orderBy: [{ applicationDate: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ applicationDate: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+      ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
     });
-    return transactions.map(mapTransactionResponse);
+    const hasNextPage = transactions.length > limit;
+    const page = hasNextPage ? transactions.slice(0, limit) : transactions;
+    return {
+      items: page.map(mapTransactionResponse),
+      pageInfo: {
+        nextCursor: hasNextPage ? (page.at(-1)?.id ?? null) : null,
+        hasNextPage,
+      },
+    };
   }
 
-  async create(user: AuthenticatedUser, dto: CreateTransactionDto) {
-    return this.createInTransaction(this.prisma, user, dto);
+  async create(context: TenantContext, dto: CreateTransactionDto) {
+    return this.createInTransaction(this.prisma, context, dto);
   }
 
-  async createInTransaction(client: PrismaExecutor, user: AuthenticatedUser, dto: CreateTransactionDto) {
-    const account = await this.validateRelations(client, user, dto.accountId, dto.categoryId, dto.invoiceId);
+  async createInTransaction(client: PrismaExecutor, context: TenantContext, dto: CreateTransactionDto) {
+    const account = await this.validateRelations(client, context, dto.accountId, dto.categoryId, dto.invoiceId);
     const applicationDate = new Date(dto.applicationDate);
-    await this.validateDuplicate(client, user, dto, applicationDate);
+    await this.validateDuplicate(client, context, dto, applicationDate);
     const fallbackReferenceMonth = startOfMonth(new Date(dto.referenceMonth ?? dto.applicationDate));
     const referenceMonth =
       account?.type === 'credit_card' && !dto.referenceMonth
@@ -57,7 +84,7 @@ export class TransactionsService {
         : fallbackReferenceMonth;
     const invoiceId =
       account?.type === 'credit_card'
-        ? await this.findOrCreateInvoice(client, user, account, referenceMonth, dto.invoiceId)
+        ? await this.findOrCreateInvoice(client, context, account, referenceMonth, dto.invoiceId)
         : dto.invoiceId;
 
     const transaction = await client.transaction.create({
@@ -77,55 +104,100 @@ export class TransactionsService {
         categoryId: dto.categoryId,
         invoiceId,
         installmentNumber: dto.installmentNumber,
-        memberProfileId: user.profileId,
+        memberProfileId: context.authorProfileId,
       },
       include: transactionInclude,
     });
     return mapTransactionResponse(transaction);
   }
 
-  async update(user: AuthenticatedUser, id: string, dto: UpdateTransactionDto) {
-    const current = await this.ensureTransaction(user, id);
+  async update(context: TenantContext, id: string, dto: UpdateTransactionDto) {
+    const current = await this.ensureTransaction(this.prisma, context, id);
+    if (current.installmentPlanId && changesInstallmentStructure(dto)) {
+      throw new ConflictException('Altere os dados estruturais pelo parcelamento vinculado.');
+    }
     const updateData = { ...dto };
     delete updateData.allowDuplicate;
+    const nextAccountId = hasOwn(dto, 'accountId') ? (dto.accountId ?? null) : current.accountId;
+    const nextCategoryId = hasOwn(dto, 'categoryId') ? (dto.categoryId ?? null) : current.categoryId;
+    const nextInvoiceId = hasOwn(dto, 'invoiceId') ? (dto.invoiceId ?? null) : current.invoiceId;
     await this.validateRelations(
       this.prisma,
-      user,
-      dto.accountId ?? current.accountId ?? undefined,
-      dto.categoryId,
-      dto.invoiceId ?? current.invoiceId ?? undefined,
+      context,
+      nextAccountId,
+      nextCategoryId,
+      nextInvoiceId,
     );
     const applicationDate = dto.applicationDate ? new Date(dto.applicationDate) : current.applicationDate;
-    const transaction = await this.prisma.transaction.update({
-      where: { id },
-      data: {
-        ...updateData,
-        date: undefined,
-        description: dto.description?.trim(),
-        amountCents: dto.amountCents !== undefined ? Math.abs(dto.amountCents) : undefined,
-        applicationDate: dto.applicationDate ? applicationDate : undefined,
-        referenceMonth: dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined,
-        status: dto.status || dto.applicationDate ? this.resolveManualStatus(applicationDate, dto.status) : undefined,
-      },
-      include: transactionInclude,
-    });
-    return mapTransactionResponse(transaction);
-  }
-
-  async remove(user: AuthenticatedUser, id: string) {
-    const transaction = await this.ensureTransaction(user, id);
-    return this.prisma.$transaction(async (tx) => {
-      await tx.telegramFinancialOperation.updateMany({
-        where: { transactionId: transaction.id, status: 'CREATED' },
-        data: { status: 'UNDONE', undoneAt: new Date() },
+    try {
+      const transaction = await this.prisma.transaction.update({
+        where: {
+          id,
+          memberProfileId: context.authorProfileId,
+          updatedAt: current.updatedAt,
+          installmentPlanId: current.installmentPlanId,
+          AND: [this.tenantScope.consistentTransactionRelations(context)],
+        },
+        data: {
+          ...updateData,
+          date: undefined,
+          description: dto.description?.trim(),
+          amountCents: dto.amountCents !== undefined ? Math.abs(dto.amountCents) : undefined,
+          applicationDate: dto.applicationDate ? applicationDate : undefined,
+          referenceMonth: dto.referenceMonth ? startOfMonth(new Date(dto.referenceMonth)) : undefined,
+          status: dto.status || dto.applicationDate ? this.resolveManualStatus(applicationDate, dto.status) : undefined,
+        },
+        include: transactionInclude,
       });
-      return tx.transaction.delete({ where: { id } });
-    });
+      return mapTransactionResponse(transaction);
+    } catch (error) {
+      if (hasPrismaCode(error, 'P2025')) {
+        throw new ConflictException('O lançamento foi alterado; atualize os dados e tente novamente.');
+      }
+      throw error;
+    }
   }
 
-  private async ensureTransaction(user: AuthenticatedUser, id: string) {
-    const transaction = await this.prisma.transaction.findFirst({
-      where: { id, memberProfileId: user.profileId },
+  async remove(context: TenantContext, id: string) {
+    const transaction = await this.ensureTransaction(this.prisma, context, id);
+    if (transaction.installmentPlanId) {
+      throw new ConflictException('Remova o parcelamento vinculado em vez deste lançamento.');
+    }
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.telegramFinancialOperation.updateMany({
+          where: {
+            transactionId: transaction.id,
+            memberProfileId: context.authorProfileId,
+            status: 'CREATED',
+          },
+          data: { status: 'UNDONE', undoneAt: new Date() },
+        });
+        return tx.transaction.delete({
+          where: {
+            id,
+            memberProfileId: context.authorProfileId,
+            updatedAt: transaction.updatedAt,
+            installmentPlanId: null,
+            AND: [this.tenantScope.consistentTransactionRelations(context)],
+          },
+        });
+      });
+    } catch (error) {
+      if (hasPrismaCode(error, 'P2025')) {
+        throw new ConflictException('O lançamento foi alterado; atualize os dados e tente novamente.');
+      }
+      throw error;
+    }
+  }
+
+  private async ensureTransaction(client: PrismaExecutor, context: TenantContext, id: string) {
+    const transaction = await client.transaction.findFirst({
+      where: {
+        id,
+        memberProfileId: context.authorProfileId,
+        ...this.tenantScope.consistentTransactionRelations(context),
+      },
     });
     if (!transaction) {
       throw new NotFoundException('Lançamento não encontrado');
@@ -135,14 +207,14 @@ export class TransactionsService {
 
   private async validateRelations(
     client: PrismaExecutor,
-    user: AuthenticatedUser,
-    accountId?: string,
-    categoryId?: string,
-    invoiceId?: string,
+    context: TenantContext,
+    accountId?: string | null,
+    categoryId?: string | null,
+    invoiceId?: string | null,
   ) {
     const account = accountId
       ? await client.account.findFirst({
-          where: { id: accountId, memberProfileId: user.profileId },
+          where: { id: accountId, memberProfileId: context.authorProfileId },
         })
       : null;
 
@@ -152,14 +224,14 @@ export class TransactionsService {
 
     if (categoryId) {
       const category = await client.category.findFirst({
-        where: { id: categoryId, familyId: user.familyId },
+        where: { id: categoryId, familyId: context.familyId },
       });
       if (!category) throw new BadRequestException('Categoria inválida');
     }
 
     if (invoiceId) {
       const invoice = await client.invoice.findFirst({
-        where: { id: invoiceId, memberProfileId: user.profileId },
+        where: { id: invoiceId, memberProfileId: context.authorProfileId },
       });
       if (!invoice) throw new BadRequestException('Fatura inválida');
       if (!accountId) {
@@ -183,13 +255,13 @@ export class TransactionsService {
 
   private async validateDuplicate(
     client: PrismaExecutor,
-    user: AuthenticatedUser,
+    context: TenantContext,
     dto: CreateTransactionDto,
     applicationDate: Date,
   ) {
     const sameValueAndDate = await client.transaction.findMany({
       where: {
-        memberProfileId: user.profileId,
+        memberProfileId: context.authorProfileId,
         applicationDate,
         amountCents: Math.abs(dto.amountCents),
         type: dto.type,
@@ -238,7 +310,7 @@ export class TransactionsService {
 
   private async findOrCreateInvoice(
     client: PrismaExecutor,
-    user: AuthenticatedUser,
+    context: TenantContext,
     account: { id: string; closingDay: number | null; dueDay: number | null },
     referenceMonth: Date,
     preferredInvoiceId?: string,
@@ -255,7 +327,7 @@ export class TransactionsService {
       update: {},
       create: {
         accountId: account.id,
-        memberProfileId: user.profileId,
+        memberProfileId: context.authorProfileId,
         referenceMonth,
         status: 'open',
         closingDate: dateFromAccountDay(referenceMonth, account.closingDay),
@@ -263,8 +335,34 @@ export class TransactionsService {
       },
     });
 
+    if (invoice.memberProfileId !== context.authorProfileId) {
+      throw new BadRequestException('Fatura inconsistente para a conta selecionada');
+    }
+
     return invoice.id;
   }
+
+}
+
+function hasOwn(value: object, key: string) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function hasPrismaCode(error: unknown, code: string): error is { code: string } {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
+}
+
+function changesInstallmentStructure(dto: UpdateTransactionDto) {
+  return [
+    'applicationDate',
+    'referenceMonth',
+    'amountCents',
+    'type',
+    'accountId',
+    'categoryId',
+    'invoiceId',
+    'installmentNumber',
+  ].some((field) => hasOwn(dto, field));
 }
 
 function normalizeDescription(value: string) {

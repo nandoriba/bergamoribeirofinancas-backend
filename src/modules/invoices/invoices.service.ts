@@ -1,52 +1,96 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { clampDayForMonth, startOfMonth } from '../../shared/date-range';
+import { TenantScopeService } from '../../prisma/tenant-scope.service';
+import { clampDayForMonth, endOfMonth, parseMonth, startOfMonth } from '../../shared/date-range';
 import { normalizeAmountCents } from '../../shared/finance-calculator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import type { TenantContext } from '../../shared/tenant-context';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
+import { ListInvoicesQueryDto } from './dto/list-invoices-query.dto';
 import { UpdateInvoiceDto } from './dto/update-invoice.dto';
 
 @Injectable()
 export class InvoicesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
+  ) {}
 
-  private readonly invoiceInclude = {
-    account: { include: { memberProfile: { select: { id: true, displayName: true } } } },
-    transactions: {
-      include: {
-        category: true,
-        memberProfile: { select: { id: true, displayName: true } },
-        installmentPlan: {
-          include: {
-            transactions: {
-              include: {
-                invoice: {
-                  include: {
-                    account: true,
+  private invoiceInclude(context: TenantContext) {
+    const familyTransactions = {
+      ...this.tenantScope.byFamilyProfiles(context),
+      ...this.tenantScope.consistentTransactionRelations(context),
+    };
+    return {
+      account: { include: { memberProfile: { select: { id: true, displayName: true } } } },
+      transactions: {
+        where: familyTransactions,
+        include: {
+          category: true,
+          memberProfile: { select: { id: true, displayName: true } },
+          installmentPlan: {
+            include: {
+              transactions: {
+                where: familyTransactions,
+                include: {
+                  invoice: {
+                    include: {
+                      account: true,
+                    },
                   },
                 },
+                orderBy: [{ referenceMonth: 'asc' as const }, { installmentNumber: 'asc' as const }],
               },
-              orderBy: [{ referenceMonth: 'asc' as const }, { installmentNumber: 'asc' as const }],
             },
           },
         },
+        orderBy: [{ referenceMonth: 'asc' as const }, { applicationDate: 'asc' as const }],
       },
-      orderBy: [{ referenceMonth: 'asc' as const }, { applicationDate: 'asc' as const }],
-    },
-  };
-
-  list(user: AuthenticatedUser) {
-    return this.prisma.invoice.findMany({
-      where: { memberProfile: { familyId: user.familyId } },
-      include: this.invoiceInclude,
-      orderBy: { referenceMonth: 'desc' },
-    });
+    } satisfies Prisma.InvoiceInclude;
   }
 
-  async create(user: AuthenticatedUser, dto: CreateInvoiceDto) {
+  async list(context: TenantContext, query: ListInvoicesQueryDto = new ListInvoicesQueryDto()) {
+    const referenceMonth = query.referenceMonth ? parseMonth(query.referenceMonth) : undefined;
+    const where = {
+      ...this.tenantScope.byFamilyProfiles(context),
+      ...this.tenantScope.consistentInvoiceRelations(context),
+      ...(referenceMonth
+        ? { referenceMonth: { gte: startOfMonth(referenceMonth), lte: endOfMonth(referenceMonth) } }
+        : {}),
+    } satisfies Prisma.InvoiceWhereInput;
+
+    if (query.cursor) {
+      const cursor = await this.prisma.invoice.findFirst({
+        where: { id: query.cursor, ...where },
+        select: { id: true },
+      });
+      if (!cursor) throw new BadRequestException('Cursor inválido');
+    }
+
+    const rows = await this.prisma.invoice.findMany({
+      where,
+      include: this.invoiceInclude(context),
+      orderBy: [{ referenceMonth: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+      take: query.limit + 1,
+      ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
+    });
+
+    const hasNextPage = rows.length > query.limit;
+    const items = hasNextPage ? rows.slice(0, query.limit) : rows;
+
+    return {
+      items,
+      pageInfo: {
+        hasNextPage,
+        nextCursor: hasNextPage ? (items.at(-1)?.id ?? null) : null,
+      },
+    };
+  }
+
+  async create(context: TenantContext, dto: CreateInvoiceDto) {
     const account = await this.prisma.account.findFirst({
-      where: { id: dto.accountId, memberProfileId: user.profileId, type: 'credit_card' },
+      where: { id: dto.accountId, ...this.tenantScope.byAuthor(context), type: 'credit_card' },
     });
     if (!account) throw new BadRequestException('Cartão inválido');
 
@@ -64,17 +108,17 @@ export class InvoicesService {
         totalCents: 0,
         status: 'open',
         accountId: dto.accountId,
-        memberProfileId: user.profileId,
+        memberProfileId: context.authorProfileId,
       },
-      include: this.invoiceInclude,
+      include: this.invoiceInclude(context),
     });
   }
 
-  async update(user: AuthenticatedUser, id: string, dto: UpdateInvoiceDto) {
-    const invoice = await this.ensureInvoice(user, id);
+  async update(context: TenantContext, id: string, dto: UpdateInvoiceDto) {
+    const invoice = await this.ensureInvoice(context, id);
     const nextAccountId = dto.accountId ?? invoice.accountId;
     const account = await this.prisma.account.findFirst({
-      where: { id: nextAccountId, memberProfileId: user.profileId, type: 'credit_card' },
+      where: { id: nextAccountId, ...this.tenantScope.byAuthor(context), type: 'credit_card' },
     });
     if (!account) throw new BadRequestException('Cartão inválido');
 
@@ -89,14 +133,15 @@ export class InvoicesService {
           accountId: nextAccountId,
           referenceMonth: nextReferenceMonth ?? invoice.referenceMonth,
           id: { not: id },
+          ...this.tenantScope.byAuthor(context),
         },
       });
       if (existing) throw new BadRequestException('Fatura já existe para este cartão e mês');
     }
-    const totalCents = dto.status === 'closed' ? await this.calculateInvoiceTotalCents(id) : undefined;
+    const totalCents = dto.status === 'closed' ? await this.calculateInvoiceTotalCents(context, id) : undefined;
 
     return this.prisma.invoice.update({
-      where: { id },
+      where: { id, ...this.tenantScope.byAuthor(context) },
       data: {
         accountId: dto.accountId,
         referenceMonth: nextReferenceMonth,
@@ -105,26 +150,35 @@ export class InvoicesService {
         status: dto.status,
         totalCents,
       },
-      include: this.invoiceInclude,
+      include: this.invoiceInclude(context),
     });
   }
 
-  async remove(user: AuthenticatedUser, id: string) {
-    await this.ensureInvoice(user, id);
-    return this.prisma.invoice.delete({ where: { id } });
+  async remove(context: TenantContext, id: string) {
+    await this.ensureInvoice(context, id);
+    return this.prisma.invoice.delete({ where: { id, ...this.tenantScope.byAuthor(context) } });
   }
 
-  private async ensureInvoice(user: AuthenticatedUser, id: string) {
+  private async ensureInvoice(context: TenantContext, id: string) {
     const invoice = await this.prisma.invoice.findFirst({
-      where: { id, memberProfileId: user.profileId },
+      where: {
+        id,
+        ...this.tenantScope.byAuthor(context),
+        ...this.tenantScope.consistentInvoiceRelations(context),
+      },
     });
     if (!invoice) throw new NotFoundException('Fatura não encontrada');
     return invoice;
   }
 
-  private async calculateInvoiceTotalCents(invoiceId: string) {
+  private async calculateInvoiceTotalCents(context: TenantContext, invoiceId: string) {
     const transactions = await this.prisma.transaction.findMany({
-      where: { invoiceId, isInvoicePayment: false },
+      where: {
+        invoiceId,
+        memberProfileId: context.authorProfileId,
+        isInvoicePayment: false,
+        ...this.tenantScope.consistentTransactionRelations(context),
+      },
       select: { amountCents: true, invoiceAmountCents: true, isInvoiceAdjustment: true },
     });
     return transactions.reduce(

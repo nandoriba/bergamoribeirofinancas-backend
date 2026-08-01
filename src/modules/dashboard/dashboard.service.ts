@@ -1,8 +1,9 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { ImportRowStatus, Prisma } from '@prisma/client';
 import type { ImportType, TransactionType } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
+import { TenantScopeService } from '../../prisma/tenant-scope.service';
 import {
   addMonths,
   daysInMonth,
@@ -22,7 +23,7 @@ import {
   incomeCents,
   normalizeAmountCents,
 } from '../../shared/finance-calculator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import type { TenantContext } from '../../shared/tenant-context';
 import { RecurringService } from '../recurring/recurring.service';
 
 const SHORT_MONTHS = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
@@ -59,7 +60,7 @@ export interface ImportDuplicateCandidate {
 interface DashboardQuery {
   referenceMonth?: string;
   profileId?: string;
-  family: boolean;
+  family?: boolean;
 }
 
 @Injectable()
@@ -67,21 +68,30 @@ export class DashboardService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly recurringService: RecurringService,
+    private readonly tenantScope: TenantScopeService,
   ) {}
 
-  async getDashboard(user: AuthenticatedUser, query: DashboardQuery) {
+  async getDashboard(context: TenantContext, query: DashboardQuery) {
     const reference = parseMonth(query.referenceMonth);
     const monthStart = startOfMonth(reference);
     const monthEnd = endOfMonth(reference);
-    const profileIds = await this.resolveProfileIds(user, query);
+    const profileIds = await this.tenantScope.resolveProfileIds(context, {
+      family: query.family ?? true,
+      profileId: query.profileId,
+    });
 
-    await this.recurringService.materializeForProfiles(profileIds, reference);
+    await this.recurringService.materializeOwnProfile(context, reference);
 
     const [monthTransactions, previousMonthTransactions, importRows, installments, invoices, recurring] =
       await Promise.all([
-        this.getTransactions(profileIds, monthStart, monthEnd),
-        this.getTransactions(profileIds, startOfMonth(addMonths(reference, -1)), endOfMonth(addMonths(reference, -1))),
-        this.getImportPreviewRows(profileIds),
+        this.getTransactions(context, profileIds, monthStart, monthEnd),
+        this.getTransactions(
+          context,
+          profileIds,
+          startOfMonth(addMonths(reference, -1)),
+          endOfMonth(addMonths(reference, -1)),
+        ),
+        this.getImportPreviewRows([context.authorProfileId]),
         this.prisma.installmentPlan.findMany({
           where: { memberProfileId: { in: profileIds } },
           orderBy: { createdAt: 'desc' },
@@ -91,21 +101,13 @@ export class DashboardService {
             memberProfileId: { in: profileIds },
             referenceMonth: monthStart,
             status: { in: ['open', 'closed'] },
+            ...this.tenantScope.consistentInvoiceRelations(context),
           },
           include: { account: true },
           orderBy: [{ dueDate: 'asc' }],
           take: 4,
         }),
-        this.prisma.recurringTemplate.findMany({
-          where: {
-            memberProfileId: { in: profileIds },
-            status: 'active',
-            startsAt: { lte: monthEnd },
-            OR: [{ endsAt: null }, { endsAt: { gte: monthStart } }],
-          },
-          orderBy: [{ dayOfMonth: 'asc' }],
-          take: 4,
-        }),
+        this.getRecurringTemplates(context, profileIds, monthStart, monthEnd),
       ]);
 
     const today = new Date();
@@ -159,7 +161,7 @@ export class DashboardService {
       expenseCents: Math.max(despesaFuturo - cartaoFuturo, 0),
       cardCents: cartaoFuturo,
     });
-    const importPreview = await this.mapImportPreviewRows(importRows);
+    const importPreview = await this.mapImportPreviewRows(importRows, context);
 
     return {
       monthRef: monthKey(reference),
@@ -193,7 +195,7 @@ export class DashboardService {
         mensal: plan.monthlyAmountCents,
         restante: Math.max(plan.totalInstallments - plan.paidInstallments, 0) * plan.monthlyAmountCents,
       })),
-      saldoMensal: await this.buildMonthlyBalances(profileIds, reference),
+      saldoMensal: await this.buildMonthlyBalances(profileIds, reference, context),
       saldoDiario: saldoDiarioProjetado,
       saldoDiarioAtual,
       saldoDiarioProjetado,
@@ -212,39 +214,50 @@ export class DashboardService {
     };
   }
 
-  private async resolveProfileIds(user: AuthenticatedUser, query: DashboardQuery): Promise<string[]> {
-    if (query.profileId) {
-      const profile = await this.prisma.memberProfile.findFirst({
-        where: { id: query.profileId, familyId: user.familyId, status: 'active' },
-        select: { id: true },
-      });
-      if (!profile) throw new BadRequestException('Perfil inválido');
-      return [profile.id];
-    }
-
-    if (!query.family) return [user.profileId];
-
-    const profiles = await this.prisma.memberProfile.findMany({
-      where: { familyId: user.familyId, status: 'active' },
-      select: { id: true },
-      orderBy: { displayName: 'asc' },
-    });
-
-    return profiles.map((profile) => profile.id);
-  }
-
-  private getTransactions(profileIds: string[], start: Date, end: Date) {
+  private getTransactions(context: TenantContext, profileIds: string[], start: Date, end: Date) {
     return this.prisma.transaction.findMany({
       where: {
         memberProfileId: { in: profileIds },
         referenceMonth: { gte: start, lte: end },
+        ...this.tenantScope.consistentTransactionRelations(context),
       },
       include: transactionInclude,
       orderBy: [{ referenceMonth: 'desc' }, { applicationDate: 'desc' }, { createdAt: 'desc' }],
     });
   }
 
-  private async getOpeningBalanceCents(profileIds: string[], monthStart: Date): Promise<number> {
+  private async getRecurringTemplates(
+    context: TenantContext,
+    profileIds: string[],
+    monthStart: Date,
+    monthEnd: Date,
+  ) {
+    const accounts = await this.prisma.account.findMany({
+      where: { memberProfileId: { in: profileIds } },
+      select: { id: true },
+    });
+
+    return this.prisma.recurringTemplate.findMany({
+      where: {
+        memberProfileId: { in: profileIds },
+        status: 'active',
+        startsAt: { lte: monthEnd },
+        OR: [{ endsAt: null }, { endsAt: { gte: monthStart } }],
+        ...this.tenantScope.consistentRecurringRelations(
+          context,
+          accounts.map((account) => account.id),
+        ),
+      },
+      orderBy: [{ dayOfMonth: 'asc' }],
+      take: 4,
+    });
+  }
+
+  private async getOpeningBalanceCents(
+    profileIds: string[],
+    monthStart: Date,
+    context?: TenantContext,
+  ): Promise<number> {
     const [openings, accounts, priorTransactions] = await Promise.all([
       this.prisma.monthlyOpening.findMany({
         where: { memberProfileId: { in: profileIds }, referenceMonth: monthStart },
@@ -258,6 +271,7 @@ export class DashboardService {
           memberProfileId: { in: profileIds },
           referenceMonth: { lt: monthStart },
           status: 'confirmed',
+          ...(context ? this.tenantScope.consistentTransactionRelations(context) : {}),
         },
         include: { account: true },
       }),
@@ -315,16 +329,20 @@ export class DashboardService {
     return { top5, others, donutSlices };
   }
 
-  private async buildMonthlyBalances(profileIds: string[], reference: Date) {
+  private async buildMonthlyBalances(profileIds: string[], reference: Date, context?: TenantContext) {
     const firstMonth = addMonths(reference, -11);
     const start = startOfMonth(firstMonth);
     const end = endOfMonth(reference);
     const transactions = await this.prisma.transaction.findMany({
-      where: { memberProfileId: { in: profileIds }, referenceMonth: { gte: start, lte: end } },
+      where: {
+        memberProfileId: { in: profileIds },
+        referenceMonth: { gte: start, lte: end },
+        ...(context ? this.tenantScope.consistentTransactionRelations(context) : {}),
+      },
       orderBy: { referenceMonth: 'asc' },
     });
 
-    let runningBalance = await this.getOpeningBalanceCents(profileIds, start);
+    let runningBalance = await this.getOpeningBalanceCents(profileIds, start, context);
     const points = [];
     for (let index = 0; index < 12; index += 1) {
       const month = addMonths(firstMonth, index);
@@ -387,19 +405,25 @@ export class DashboardService {
     };
   }
 
-  private getImportPreviewRows(profileIds: string[]) {
+  private async getImportPreviewRows(profileIds: string[]) {
+    const latestBatch = await this.prisma.importBatch.findFirst({
+      where: { memberProfileId: { in: profileIds }, status: 'preview' },
+      select: { id: true },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    if (!latestBatch) return [];
+
     return this.prisma.importRow.findMany({
       where: {
         status: { in: [ImportRowStatus.new, ImportRowStatus.duplicate, ImportRowStatus.review] },
-        importBatch: { memberProfileId: { in: profileIds }, status: 'preview' },
+        importBatchId: latestBatch.id,
       },
       include: { importBatch: true },
-      orderBy: [{ createdAt: 'desc' }],
-      take: 12,
+      orderBy: [{ rowIndex: 'asc' }, { id: 'asc' }],
     });
   }
 
-  private async mapImportPreviewRows(rows: DashboardImportRow[]) {
+  private async mapImportPreviewRows(rows: DashboardImportRow[], context?: TenantContext) {
     return Promise.all(
       rows.map(async (row) => {
         const invoiceAdjustmentCandidate = isInvoiceAdjustmentPreviewCandidate(row.importBatch.type, row);
@@ -421,7 +445,7 @@ export class DashboardService {
           value: row.amountCents ?? 0,
           status: legacyReviewAdjustment ? 'new' : mapImportPreviewStatus(row.status, row.falseDuplicate),
           reviewReason: legacyReviewAdjustment ? null : resolveImportReviewReason(row.status),
-          duplicateCandidates: await this.resolveImportDuplicateCandidates(row),
+          duplicateCandidates: await this.resolveImportDuplicateCandidates(row, context),
           invoiceAdjustmentCandidate,
           invoiceAdjustmentDefault,
         };
@@ -429,7 +453,10 @@ export class DashboardService {
     );
   }
 
-  private async resolveImportDuplicateCandidates(row: DashboardImportRow): Promise<ImportDuplicateCandidate[]> {
+  private async resolveImportDuplicateCandidates(
+    row: DashboardImportRow,
+    context?: TenantContext,
+  ): Promise<ImportDuplicateCandidate[]> {
     if (row.status !== ImportRowStatus.duplicate || !row.date || row.amountCents === null) {
       return [];
     }
@@ -451,6 +478,7 @@ export class DashboardService {
           applicationDate: row.date,
           amountCents: normalizeAmountCents(signedAmountCents),
           type: signedAmountCents >= 0 ? 'income' : 'expense',
+          ...(context ? this.tenantScope.consistentTransactionRelations(context) : {}),
         },
         select: {
           id: true,

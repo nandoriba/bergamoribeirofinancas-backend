@@ -2,23 +2,27 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import type { AccountType } from '@prisma/client';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { TenantScopeService } from '../../prisma/tenant-scope.service';
+import type { TenantContext } from '../../shared/tenant-context';
 import { CreateAccountDto } from './dto/create-account.dto';
 import { UpdateAccountDto } from './dto/update-account.dto';
 
 @Injectable()
 export class AccountsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
+  ) {}
 
-  list(user: AuthenticatedUser) {
+  list(context: TenantContext) {
     return this.prisma.account.findMany({
-      where: { memberProfile: { familyId: user.familyId } },
+      where: this.tenantScope.byFamilyProfiles(context),
       include: { memberProfile: { select: { id: true, displayName: true } } },
       orderBy: [{ type: 'asc' }, { name: 'asc' }],
     });
   }
 
-  create(user: AuthenticatedUser, dto: CreateAccountDto) {
+  create(context: TenantContext, dto: CreateAccountDto) {
     return this.prisma.account.create({
       data: {
         name: dto.name.trim(),
@@ -26,16 +30,16 @@ export class AccountsService {
         institution: normalizeOptionalString(dto.institution),
         ...this.normalizeCardFields(dto, dto.type),
         initialBalanceCents: dto.initialBalanceCents ?? 0,
-        memberProfileId: user.profileId,
+        memberProfileId: context.authorProfileId,
       },
     });
   }
 
-  async update(user: AuthenticatedUser, id: string, dto: UpdateAccountDto) {
-    const account = await this.ensureOwnAccount(user, id);
+  async update(context: TenantContext, id: string, dto: UpdateAccountDto) {
+    const account = await this.ensureOwnAccount(context, id);
     const nextType = dto.type ?? account.type;
     return this.prisma.account.update({
-      where: { id },
+      where: { id, ...this.tenantScope.byAuthor(context) },
       data: {
         name: dto.name?.trim(),
         type: dto.type,
@@ -46,14 +50,14 @@ export class AccountsService {
     });
   }
 
-  async remove(user: AuthenticatedUser, id: string) {
-    await this.ensureOwnAccount(user, id);
-    return this.prisma.account.delete({ where: { id } });
+  async remove(context: TenantContext, id: string) {
+    await this.ensureOwnAccount(context, id);
+    return this.prisma.account.delete({ where: { id, ...this.tenantScope.byAuthor(context) } });
   }
 
-  private async ensureOwnAccount(user: AuthenticatedUser, id: string) {
+  private async ensureOwnAccount(context: TenantContext, id: string) {
     const account = await this.prisma.account.findFirst({
-      where: { id, memberProfileId: user.profileId },
+      where: { id, ...this.tenantScope.byAuthor(context) },
     });
     if (!account) {
       throw new NotFoundException('Conta não encontrada');

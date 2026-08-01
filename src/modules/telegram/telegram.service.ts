@@ -5,11 +5,12 @@ import { Prisma } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 
 import { PrismaService } from '../../prisma/prisma.service';
+import { TenantScopeService } from '../../prisma/tenant-scope.service';
 import type { AppConfig } from '../../shared/configuration';
 import { endOfDay, endOfMonth, startOfMonth } from '../../shared/date-range';
 import { accountBalanceCents, expenseCents } from '../../shared/finance-calculator';
+import { TenantContext } from '../../shared/tenant-context';
 import { timingSafeStringEqual } from '../../shared/timing-safe-string-equal';
-import type { AuthenticatedUser } from '../auth/auth.types';
 import { InstallmentsService } from '../installments/installments.service';
 import { TransactionsService } from '../transactions/transactions.service';
 import { AI_PROVIDER, type AiProvider } from './ai-provider';
@@ -28,8 +29,10 @@ interface LinkedTelegramContext {
   tgUserId: string;
   memberProfileId: string;
   familyId: string;
-  user: AuthenticatedUser;
+  tenant: TenantContext;
 }
+
+type TelegramPrismaExecutor = PrismaService | Prisma.TransactionClient;
 
 interface AccountCandidate {
   id: string;
@@ -60,6 +63,7 @@ export class TelegramService {
     @Inject(AI_PROVIDER) private readonly aiProvider: AiProvider,
     private readonly transactionsService: TransactionsService,
     private readonly installmentsService: InstallmentsService,
+    private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
   ) {}
 
   async receiveWebhook(payload: TelegramUpdatePayload, secretToken?: string) {
@@ -74,10 +78,10 @@ export class TelegramService {
     return { ok: true };
   }
 
-  async createGroupAuthCode(user: AuthenticatedUser) {
+  async createGroupAuthCode(context: TenantContext) {
     const code = await this.createAuthCode({
       kind: 'GROUP',
-      userId: user.id,
+      userId: context.userId,
     });
 
     return {
@@ -87,9 +91,14 @@ export class TelegramService {
     };
   }
 
-  async createMemberAuthCode(user: AuthenticatedUser) {
+  async createMemberAuthCode(context: TenantContext) {
     const profile = await this.prisma.memberProfile.findFirst({
-      where: { id: user.profileId, userId: user.id, status: 'active' },
+      where: {
+        id: context.authorProfileId,
+        userId: context.userId,
+        familyId: context.familyId,
+        status: 'active',
+      },
       select: { id: true },
     });
     if (!profile) {
@@ -98,7 +107,7 @@ export class TelegramService {
 
     const code = await this.createAuthCode({
       kind: 'MEMBER',
-      userId: user.id,
+      userId: context.userId,
       memberProfileId: profile.id,
     });
 
@@ -253,57 +262,104 @@ export class TelegramService {
       return;
     }
 
-    const now = new Date();
-    const result = await this.prisma.$transaction(async (tx) => {
-      const authCode = await tx.telegramAuthCode.findUnique({
-        where: { code },
-        include: {
-          user: {
-            include: { family: { select: { ownerUserId: true } } },
-          },
-        },
-      });
+    if (message.chat.type !== 'group' && message.chat.type !== 'supergroup') {
+      await this.telegram.sendMessage(chatId, 'A autorização só pode ser feita em um grupo ou supergrupo.');
+      await this.markUpdateSucceeded(updateId);
+      return;
+    }
 
-      if (
-        !authCode ||
-        authCode.kind !== 'GROUP' ||
-        authCode.consumedAt ||
-        authCode.expiresAt <= now ||
-        !authCode.user ||
-        !authCode.user.isActive ||
-        authCode.user.family.ownerUserId !== authCode.user.id
-      ) {
+    const now = new Date();
+    const result = await this.prisma.$transaction(
+      async (tx) => {
+        const authCode = await tx.telegramAuthCode.findUnique({
+          where: { code },
+          include: {
+            user: {
+              include: { family: { select: { ownerUserId: true } } },
+            },
+          },
+        });
+
+        if (
+          !authCode ||
+          authCode.kind !== 'GROUP' ||
+          authCode.consumedAt ||
+          authCode.expiresAt <= now ||
+          !authCode.user ||
+          !authCode.user.isActive ||
+          authCode.user.family.ownerUserId !== authCode.user.id
+        ) {
+          await tx.telegramUpdate.update({
+            where: { updateId },
+            data: { status: 'succeeded', processedAt: now, lastError: null },
+          });
+          return { ok: false as const, message: 'Código inválido ou expirado.' };
+        }
+
+        const chatOwner = await tx.telegramAuthorizedGroup.findUnique({
+          where: { chatId },
+          select: { familyId: true },
+        });
+        if (chatOwner && chatOwner.familyId !== authCode.user.familyId) {
+          await tx.telegramUpdate.update({
+            where: { updateId },
+            data: { status: 'succeeded', processedAt: now, lastError: null },
+          });
+          return { ok: false as const, message: 'Este grupo já pertence a outra família.' };
+        }
+
+        const previousGroups = await tx.telegramAuthorizedGroup.findMany({
+          where: {
+            familyId: authCode.user.familyId,
+            chatId: { not: chatId },
+            revokedAt: null,
+          },
+          select: { chatId: true },
+        });
+        const previousChatIds = previousGroups.map((group) => group.chatId);
+        if (previousChatIds.length > 0) {
+          await tx.telegramAuthorizedGroup.updateMany({
+            where: {
+              familyId: authCode.user.familyId,
+              chatId: { in: previousChatIds },
+              revokedAt: null,
+            },
+            data: { revokedAt: now },
+          });
+          await tx.telegramUserLink.updateMany({
+            where: { chatId: { in: previousChatIds }, revokedAt: null },
+            data: { revokedAt: now },
+          });
+        }
+
+        await tx.telegramAuthorizedGroup.upsert({
+          where: { chatId },
+          update: {
+            authorizedByUserId: authCode.user.id,
+            revokedAt: null,
+          },
+          create: {
+            chatId,
+            familyId: authCode.user.familyId,
+            authorizedByUserId: authCode.user.id,
+          },
+        });
+        const claimedCode = await tx.telegramAuthCode.updateMany({
+          where: { id: authCode.id, consumedAt: null, expiresAt: { gt: now } },
+          data: { consumedAt: now },
+        });
+        if (claimedCode.count !== 1) {
+          throw new BadRequestException('Código inválido ou expirado');
+        }
         await tx.telegramUpdate.update({
           where: { updateId },
           data: { status: 'succeeded', processedAt: now, lastError: null },
         });
-        return { ok: false as const, message: 'Código inválido ou expirado.' };
-      }
 
-      await tx.telegramAuthorizedGroup.upsert({
-        where: { chatId },
-        update: {
-          familyId: authCode.user.familyId,
-          authorizedByUserId: authCode.user.id,
-          revokedAt: null,
-        },
-        create: {
-          chatId,
-          familyId: authCode.user.familyId,
-          authorizedByUserId: authCode.user.id,
-        },
-      });
-      await tx.telegramAuthCode.update({
-        where: { id: authCode.id },
-        data: { consumedAt: now },
-      });
-      await tx.telegramUpdate.update({
-        where: { updateId },
-        data: { status: 'succeeded', processedAt: now, lastError: null },
-      });
-
-      return { ok: true as const, message: 'Grupo autorizado para lançamentos financeiros.' };
-    });
+        return { ok: true as const, message: 'Grupo autorizado para lançamentos financeiros.' };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
 
     await this.telegram.sendMessage(chatId, result.message);
   }
@@ -322,61 +378,80 @@ export class TelegramService {
       return;
     }
 
+    if (message.chat.type !== 'group' && message.chat.type !== 'supergroup') {
+      await this.telegram.sendMessage(chatId, 'O vínculo só pode ser feito no grupo autorizado.');
+      await this.markUpdateSucceeded(updateId);
+      return;
+    }
+
     const now = new Date();
-    const result = await this.prisma.$transaction(async (tx) => {
-      const group = await tx.telegramAuthorizedGroup.findUnique({ where: { chatId } });
-      const authCode = await tx.telegramAuthCode.findUnique({
-        where: { code },
-        include: { memberProfile: true },
-      });
+    const result = await this.prisma.$transaction(
+      async (tx) => {
+        const group = await tx.telegramAuthorizedGroup.findUnique({ where: { chatId } });
+        const authCode = await tx.telegramAuthCode.findUnique({
+          where: { code },
+          include: { memberProfile: { include: { user: true } } },
+        });
 
-      if (!group || group.revokedAt) {
+        if (!group || group.revokedAt) {
+          await tx.telegramUpdate.update({
+            where: { updateId },
+            data: { status: 'succeeded', processedAt: now, lastError: null },
+          });
+          return { ok: false as const, message: 'Este grupo ainda não está autorizado.' };
+        }
+
+        if (
+          !authCode ||
+          authCode.kind !== 'MEMBER' ||
+          authCode.consumedAt ||
+          authCode.expiresAt <= now ||
+          !authCode.memberProfile ||
+          authCode.memberProfile.status !== 'active' ||
+          !authCode.memberProfile.user.isActive ||
+          authCode.memberProfile.userId !== authCode.userId ||
+          authCode.memberProfile.user.familyId !== group.familyId ||
+          authCode.memberProfile.familyId !== group.familyId
+        ) {
+          await tx.telegramUpdate.update({
+            where: { updateId },
+            data: { status: 'succeeded', processedAt: now, lastError: null },
+          });
+          return { ok: false as const, message: 'Código inválido ou expirado.' };
+        }
+
+        await tx.telegramUserLink.upsert({
+          where: { tgUserId_chatId: { tgUserId, chatId } },
+          update: {
+            memberProfileId: authCode.memberProfile.id,
+            revokedAt: null,
+          },
+          create: {
+            tgUserId,
+            chatId,
+            memberProfileId: authCode.memberProfile.id,
+          },
+        });
+        const claimedCode = await tx.telegramAuthCode.updateMany({
+          where: { id: authCode.id, consumedAt: null, expiresAt: { gt: now } },
+          data: { consumedAt: now },
+        });
+        if (claimedCode.count !== 1) {
+          throw new BadRequestException('Código inválido ou expirado');
+        }
         await tx.telegramUpdate.update({
           where: { updateId },
           data: { status: 'succeeded', processedAt: now, lastError: null },
         });
-        return { ok: false as const, message: 'Este grupo ainda não está autorizado.' };
-      }
 
-      if (
-        !authCode ||
-        authCode.kind !== 'MEMBER' ||
-        authCode.consumedAt ||
-        authCode.expiresAt <= now ||
-        !authCode.memberProfile ||
-        authCode.memberProfile.familyId !== group.familyId
-      ) {
-        await tx.telegramUpdate.update({
-          where: { updateId },
-          data: { status: 'succeeded', processedAt: now, lastError: null },
-        });
-        return { ok: false as const, message: 'Código inválido ou expirado.' };
-      }
-
-      await tx.telegramUserLink.upsert({
-        where: { tgUserId_chatId: { tgUserId, chatId } },
-        update: {
-          memberProfileId: authCode.memberProfile.id,
-          revokedAt: null,
-        },
-        create: {
-          tgUserId,
-          chatId,
-          memberProfileId: authCode.memberProfile.id,
-        },
-      });
-      await tx.telegramAuthCode.update({ where: { id: authCode.id }, data: { consumedAt: now } });
-      await tx.telegramUpdate.update({
-        where: { updateId },
-        data: { status: 'succeeded', processedAt: now, lastError: null },
-      });
-
-      return {
-        ok: true as const,
-        message:
-          'Vínculo criado. Mensagens financeiras deste grupo serão enviadas à OpenAI para interpretação e ficarão armazenadas por 30 dias para depuração.',
-      };
-    });
+        return {
+          ok: true as const,
+          message:
+            'Vínculo criado. Mensagens financeiras deste grupo serão enviadas à OpenAI para interpretação e ficarão armazenadas por 30 dias para depuração.',
+        };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
 
     await this.telegram.sendMessage(chatId, result.message);
     if (result.ok) {
@@ -400,6 +475,7 @@ export class TelegramService {
         memberProfileId: context.memberProfileId,
         status: 'confirmed',
         applicationDate: { lte: endOfDay(now) },
+        ...this.tenantScope.consistentTransactionRelations(context.tenant),
       },
       include: { account: true },
     });
@@ -450,14 +526,19 @@ export class TelegramService {
         operationId: operation.id,
       },
       `Desfazer o último lançamento criado pelo Telegram?`,
+      new Date(operation.createdAt.getTime() + minutes * 60_000),
     );
   }
 
   private async handleFinancialMessage(updateId: string, message: TelegramMessagePayload, text: string) {
-    const context = await this.resolveLinkedContext(message);
+    let context = await this.resolveLinkedContext(message);
     if (!context) return false;
 
     const aiContext = await this.buildAiContext(context);
+    const contextBeforeAi = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+    if (!contextBeforeAi || contextBeforeAi.memberProfileId !== context.memberProfileId) return false;
+    context = contextBeforeAi;
+
     const aiResult = await this.aiProvider.parseFinancialMessage({
       text,
       today: todayKey(),
@@ -476,6 +557,10 @@ export class TelegramService {
         aliases: category.aliases,
       })),
     });
+
+    const contextAfterAi = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId);
+    if (!contextAfterAi || contextAfterAi.memberProfileId !== context.memberProfileId) return false;
+    context = contextAfterAi;
 
     await this.prisma.telegramMessageLog.create({
       data: {
@@ -652,57 +737,129 @@ export class TelegramService {
       return;
     }
 
-    await this.prisma.$transaction(async (tx) => {
-      const operation = await tx.telegramFinancialOperation.findFirst({
-        where: {
-          id: payload.operationId,
-          memberProfileId: context.memberProfileId,
-          tgUserId: context.tgUserId,
-          status: 'CREATED',
-          undoneAt: null,
-        },
-      });
-      if (!operation) {
+    const undoWindowMinutes = this.config.get<number>('TELEGRAM_UNDO_WINDOW_MINUTES') ?? 10;
+    const undoCutoff = new Date(Date.now() - undoWindowMinutes * 60_000);
+    const undoResult = await this.prisma.$transaction(
+      async (tx) => {
+        const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId, tx);
+        if (!currentContext || currentContext.memberProfileId !== context.memberProfileId) {
+          throw new UnauthorizedException('Vínculo Telegram não está mais ativo');
+        }
+
+        const operation = await tx.telegramFinancialOperation.findFirst({
+          where: {
+            id: payload.operationId,
+            memberProfileId: currentContext.memberProfileId,
+            tgUserId: currentContext.tgUserId,
+            chatId: currentContext.chatId,
+            status: 'CREATED',
+            undoneAt: null,
+            createdAt: { gte: undoCutoff },
+          },
+        });
+        if (!operation) {
+          await tx.telegramPendingConfirmation.update({
+            where: {
+              id: pendingId,
+              memberProfileId: currentContext.memberProfileId,
+              tgUserId: currentContext.tgUserId,
+              chatId: currentContext.chatId,
+              status: 'PENDING',
+            },
+            data: { status: 'CANCELLED', resolvedAt: new Date() },
+          });
+          await tx.telegramUpdate.update({
+            where: { updateId },
+            data: { status: 'succeeded', processedAt: new Date(), lastError: null },
+          });
+          return 'expired' as const;
+        }
+
+        if (operation.transactionId) {
+          const removed = await tx.transaction.deleteMany({
+            where: {
+              id: operation.transactionId,
+              memberProfileId: currentContext.memberProfileId,
+              installmentPlanId: null,
+              ...this.tenantScope.consistentTransactionRelations(currentContext.tenant),
+            },
+          });
+          if (removed.count !== 1) {
+            await tx.telegramPendingConfirmation.update({
+              where: {
+                id: pendingId,
+                memberProfileId: currentContext.memberProfileId,
+                tgUserId: currentContext.tgUserId,
+                chatId: currentContext.chatId,
+                status: 'PENDING',
+              },
+              data: { status: 'CANCELLED', resolvedAt: new Date() },
+            });
+            await tx.telegramUpdate.update({
+              where: { updateId },
+              data: { status: 'succeeded', processedAt: new Date(), lastError: null },
+            });
+            return 'linked' as const;
+          }
+        }
+        if (operation.installmentPlanId) {
+          await this.installmentsService.removeTelegramCreatedPlanInTransaction(
+            tx,
+            currentContext.tenant,
+            operation.installmentPlanId,
+          );
+        }
+
+        await tx.telegramFinancialOperation.update({
+          where: {
+            id: operation.id,
+            memberProfileId: currentContext.memberProfileId,
+            tgUserId: currentContext.tgUserId,
+            chatId: currentContext.chatId,
+            status: 'CREATED',
+          },
+          data: {
+            status: 'UNDONE',
+            undoneAt: new Date(),
+            undoPendingConfirmationId: pendingId,
+          },
+        });
+
         await tx.telegramPendingConfirmation.update({
-          where: { id: pendingId },
-          data: { status: 'CANCELLED', resolvedAt: new Date() },
+          where: {
+            id: pendingId,
+            memberProfileId: currentContext.memberProfileId,
+            tgUserId: currentContext.tgUserId,
+            chatId: currentContext.chatId,
+            status: 'PENDING',
+          },
+          data: { status: 'CONFIRMED', resolvedAt: new Date() },
         });
         await tx.telegramUpdate.update({
           where: { updateId },
           data: { status: 'succeeded', processedAt: new Date(), lastError: null },
         });
-        return;
-      }
+        return 'undone' as const;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
 
-      await tx.telegramFinancialOperation.update({
-        where: { id: operation.id },
-        data: {
-          status: 'UNDONE',
-          undoneAt: new Date(),
-          undoPendingConfirmationId: pendingId,
-        },
-      });
-
-      if (operation.transactionId) {
-        await tx.transaction.delete({ where: { id: operation.transactionId } });
+    if (undoResult === 'expired') {
+      await this.safeAnswerCallbackQuery(callback.id, 'A janela para desfazer expirou.');
+      if (callback.message) {
+        await this.safeReplaceMessage(chatId, callback.message.message_id, 'A janela para desfazer expirou.');
       }
-      if (operation.installmentPlanId) {
-        await this.installmentsService.removeTelegramCreatedPlanInTransaction(
-          tx,
-          context.user,
-          operation.installmentPlanId,
-        );
-      }
+      return;
+    }
 
-      await tx.telegramPendingConfirmation.update({
-        where: { id: pendingId },
-        data: { status: 'CONFIRMED', resolvedAt: new Date() },
-      });
-      await tx.telegramUpdate.update({
-        where: { updateId },
-        data: { status: 'succeeded', processedAt: new Date(), lastError: null },
-      });
-    });
+    if (undoResult === 'linked') {
+      const message = 'O lançamento agora pertence a um parcelamento e não pode ser desfeito isoladamente.';
+      await this.safeAnswerCallbackQuery(callback.id, message, true);
+      if (callback.message) {
+        await this.safeReplaceMessage(chatId, callback.message.message_id, message);
+      }
+      return;
+    }
 
     await this.safeAnswerCallbackQuery(callback.id, 'Desfeito.');
     if (callback.message) {
@@ -718,20 +875,41 @@ export class TelegramService {
     pendingConfirmationId?: string,
   ) {
     try {
-      return await this.prisma.$transaction(async (tx) => {
-        const created = await this.createFinancialOperation(tx, context, draft, idempotencyKey, updateId, pendingConfirmationId);
-        if (pendingConfirmationId) {
-          await tx.telegramPendingConfirmation.update({
-            where: { id: pendingConfirmationId },
-            data: { status: 'CONFIRMED', resolvedAt: new Date() },
+      return await this.prisma.$transaction(
+        async (tx) => {
+          const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId, tx);
+          if (!currentContext || currentContext.memberProfileId !== context.memberProfileId) {
+            throw new UnauthorizedException('Vínculo Telegram não está mais ativo');
+          }
+
+          const created = await this.createFinancialOperation(
+            tx,
+            currentContext,
+            draft,
+            idempotencyKey,
+            updateId,
+            pendingConfirmationId,
+          );
+          if (pendingConfirmationId) {
+            await tx.telegramPendingConfirmation.update({
+              where: {
+                id: pendingConfirmationId,
+                memberProfileId: currentContext.memberProfileId,
+                tgUserId: currentContext.tgUserId,
+                chatId: currentContext.chatId,
+                status: 'PENDING',
+              },
+              data: { status: 'CONFIRMED', resolvedAt: new Date() },
+            });
+          }
+          await tx.telegramUpdate.update({
+            where: { updateId },
+            data: { status: 'succeeded', processedAt: new Date(), lastError: null },
           });
-        }
-        await tx.telegramUpdate.update({
-          where: { updateId },
-          data: { status: 'succeeded', processedAt: new Date(), lastError: null },
-        });
-        return { ...created, duplicate: false as const };
-      });
+          return { ...created, duplicate: false as const };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
     } catch (error) {
       if (!isStrongDuplicateError(error)) throw error;
       await this.markUpdateSucceeded(updateId);
@@ -758,7 +936,7 @@ export class TelegramService {
         ? Math.round(draft.amountCents / installments)
         : draft.amountCents;
       const totalAmountCents = monthlyAmountCents * installments;
-      const plan = await this.installmentsService.createInTransaction(tx, context.user, {
+      const plan = await this.installmentsService.createInTransaction(tx, context.tenant, {
         description: draft.description,
         totalInstallments: installments,
         firstInstallmentNumber: 1,
@@ -788,7 +966,7 @@ export class TelegramService {
       return { alreadyExisted: false, operation };
     }
 
-    const transaction = await this.transactionsService.createInTransaction(tx, context.user, {
+    const transaction = await this.transactionsService.createInTransaction(tx, context.tenant, {
       applicationDate: draft.applicationDate,
       referenceMonth: draft.referenceMonth,
       description: draft.description,
@@ -865,8 +1043,11 @@ export class TelegramService {
     context: LinkedTelegramContext,
     payload: TelegramPendingPayload,
     text: string,
+    expiresAt?: Date,
   ) {
     const ttlHours = this.config.get<number>('TELEGRAM_PENDING_TTL_HOURS') ?? 24;
+    const defaultExpiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
+    const effectiveExpiresAt = expiresAt && expiresAt < defaultExpiresAt ? expiresAt : defaultExpiresAt;
     const id = randomShortId();
     const pending = await this.prisma.telegramPendingConfirmation.create({
       data: {
@@ -875,7 +1056,7 @@ export class TelegramService {
         memberProfileId: context.memberProfileId,
         tgUserId: context.tgUserId,
         payload: toJsonInput(payload),
-        expiresAt: new Date(Date.now() + ttlHours * 60 * 60 * 1000),
+        expiresAt: effectiveExpiresAt,
       },
     });
 
@@ -919,14 +1100,18 @@ export class TelegramService {
     return this.resolveLinkedContextFromIds(String(message.chat.id), tgUserId);
   }
 
-  private async resolveLinkedContextFromIds(chatId: string, tgUserId: string): Promise<LinkedTelegramContext | null> {
-    const group = await this.prisma.telegramAuthorizedGroup.findUnique({
+  private async resolveLinkedContextFromIds(
+    chatId: string,
+    tgUserId: string,
+    client: TelegramPrismaExecutor = this.prisma,
+  ): Promise<LinkedTelegramContext | null> {
+    const group = await client.telegramAuthorizedGroup.findUnique({
       where: { chatId },
       include: { family: { select: { ownerUserId: true } } },
     });
     if (!group || group.revokedAt) return null;
 
-    const link = await this.prisma.telegramUserLink.findUnique({
+    const link = await client.telegramUserLink.findUnique({
       where: { tgUserId_chatId: { tgUserId, chatId } },
       include: {
         memberProfile: {
@@ -938,6 +1123,7 @@ export class TelegramService {
       !link ||
       link.revokedAt ||
       !link.memberProfile.user.isActive ||
+      link.memberProfile.user.familyId !== group.familyId ||
       link.memberProfile.familyId !== group.familyId ||
       link.memberProfile.status !== 'active'
     ) {
@@ -949,14 +1135,14 @@ export class TelegramService {
       tgUserId,
       memberProfileId: link.memberProfileId,
       familyId: group.familyId,
-      user: {
+      tenant: TenantContext.fromAuthenticatedUser({
         id: link.memberProfile.user.id,
         email: link.memberProfile.user.email,
         platformRole: link.memberProfile.user.platformRole,
         tenantRole: group.family.ownerUserId === link.memberProfile.user.id ? 'owner' : 'member',
         familyId: group.familyId,
         profileId: link.memberProfileId,
-      },
+      }),
     };
   }
 

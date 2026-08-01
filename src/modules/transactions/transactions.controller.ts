@@ -1,8 +1,9 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
+import { ListTransactionsQueryDto } from './dto/list-transactions-query.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
 import { TransactionsService } from './transactions.service';
 
@@ -11,27 +12,27 @@ export class TransactionsController {
   constructor(private readonly transactionsService: TransactionsService) {}
 
   @Get()
-  list(
-    @CurrentUser() user: AuthenticatedUser,
-    @Query('referenceMonth') referenceMonth?: string,
-    @Query('month') month?: string,
-    @Query('profileId') profileId?: string,
-  ) {
-    return this.transactionsService.list(user, { referenceMonth: referenceMonth || month, profileId });
+  list(@CurrentTenant() context: TenantContext, @Query() query: ListTransactionsQueryDto) {
+    return this.transactionsService.list(context, {
+      referenceMonth: query.referenceMonth ?? query.month,
+      profileId: query.profileId,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
   }
 
   @Post()
-  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateTransactionDto) {
-    return this.transactionsService.create(user, dto);
+  create(@CurrentTenant() context: TenantContext, @Body() dto: CreateTransactionDto) {
+    return this.transactionsService.create(context, dto);
   }
 
   @Patch(':id')
-  update(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string, @Body() dto: UpdateTransactionDto) {
-    return this.transactionsService.update(user, id, dto);
+  update(@CurrentTenant() context: TenantContext, @Param('id') id: string, @Body() dto: UpdateTransactionDto) {
+    return this.transactionsService.update(context, id, dto);
   }
 
   @Delete(':id')
-  remove(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {
-    return this.transactionsService.remove(user, id);
+  remove(@CurrentTenant() context: TenantContext, @Param('id') id: string) {
+    return this.transactionsService.remove(context, id);
   }
 }

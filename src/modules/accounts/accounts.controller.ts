@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { AccountsService } from './accounts.service';
 import { CreateAccountDto } from './dto/create-account.dto';
 import { UpdateAccountDto } from './dto/update-account.dto';
@@ -11,22 +11,22 @@ export class AccountsController {
   constructor(private readonly accountsService: AccountsService) {}
 
   @Get()
-  list(@CurrentUser() user: AuthenticatedUser) {
-    return this.accountsService.list(user);
+  list(@CurrentTenant() context: TenantContext) {
+    return this.accountsService.list(context);
   }
 
   @Post()
-  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateAccountDto) {
-    return this.accountsService.create(user, dto);
+  create(@CurrentTenant() context: TenantContext, @Body() dto: CreateAccountDto) {
+    return this.accountsService.create(context, dto);
   }
 
   @Patch(':id')
-  update(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string, @Body() dto: UpdateAccountDto) {
-    return this.accountsService.update(user, id, dto);
+  update(@CurrentTenant() context: TenantContext, @Param('id') id: string, @Body() dto: UpdateAccountDto) {
+    return this.accountsService.update(context, id, dto);
   }
 
   @Delete(':id')
-  remove(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {
-    return this.accountsService.remove(user, id);
+  remove(@CurrentTenant() context: TenantContext, @Param('id') id: string) {
+    return this.accountsService.remove(context, id);
   }
 }

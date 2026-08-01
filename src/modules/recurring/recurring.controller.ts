@@ -1,8 +1,9 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { CreateRecurringDto } from './dto/create-recurring.dto';
+import { GenerateRecurringQueryDto } from './dto/generate-recurring-query.dto';
 import { UpdateRecurringDto } from './dto/update-recurring.dto';
 import { RecurringService } from './recurring.service';
 
@@ -11,27 +12,27 @@ export class RecurringController {
   constructor(private readonly recurringService: RecurringService) {}
 
   @Get()
-  list(@CurrentUser() user: AuthenticatedUser) {
-    return this.recurringService.list(user);
+  list(@CurrentTenant() context: TenantContext) {
+    return this.recurringService.list(context);
   }
 
   @Post()
-  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateRecurringDto) {
-    return this.recurringService.create(user, dto);
+  create(@CurrentTenant() context: TenantContext, @Body() dto: CreateRecurringDto) {
+    return this.recurringService.create(context, dto);
   }
 
   @Post('generate')
-  generate(@CurrentUser() user: AuthenticatedUser, @Query('month') month?: string) {
-    return this.recurringService.generateForMonth(user, month);
+  generate(@CurrentTenant() context: TenantContext, @Query() query: GenerateRecurringQueryDto) {
+    return this.recurringService.generateForMonth(context, query.month);
   }
 
   @Patch(':id')
-  update(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string, @Body() dto: UpdateRecurringDto) {
-    return this.recurringService.update(user, id, dto);
+  update(@CurrentTenant() context: TenantContext, @Param('id') id: string, @Body() dto: UpdateRecurringDto) {
+    return this.recurringService.update(context, id, dto);
   }
 
   @Delete(':id')
-  remove(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {
-    return this.recurringService.remove(user, id);
+  remove(@CurrentTenant() context: TenantContext, @Param('id') id: string) {
+    return this.recurringService.remove(context, id);
   }
 }

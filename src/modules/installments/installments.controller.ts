@@ -1,8 +1,9 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { CreateInstallmentDto } from './dto/create-installment.dto';
+import { ListInstallmentsQueryDto } from './dto/list-installments-query.dto';
 import { UpdateInstallmentDto } from './dto/update-installment.dto';
 import { InstallmentsService } from './installments.service';
 
@@ -11,22 +12,22 @@ export class InstallmentsController {
   constructor(private readonly installmentsService: InstallmentsService) {}
 
   @Get()
-  list(@CurrentUser() user: AuthenticatedUser) {
-    return this.installmentsService.list(user);
+  list(@CurrentTenant() context: TenantContext, @Query() query: ListInstallmentsQueryDto) {
+    return this.installmentsService.list(context, query);
   }
 
   @Post()
-  create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateInstallmentDto) {
-    return this.installmentsService.create(user, dto);
+  create(@CurrentTenant() context: TenantContext, @Body() dto: CreateInstallmentDto) {
+    return this.installmentsService.create(context, dto);
   }
 
   @Patch(':id')
-  update(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string, @Body() dto: UpdateInstallmentDto) {
-    return this.installmentsService.update(user, id, dto);
+  update(@CurrentTenant() context: TenantContext, @Param('id') id: string, @Body() dto: UpdateInstallmentDto) {
+    return this.installmentsService.update(context, id, dto);
   }
 
   @Delete(':id')
-  remove(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {
-    return this.installmentsService.remove(user, id);
+  remove(@CurrentTenant() context: TenantContext, @Param('id') id: string) {
+    return this.installmentsService.remove(context, id);
   }
 }

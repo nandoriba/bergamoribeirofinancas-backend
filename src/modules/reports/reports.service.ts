@@ -1,22 +1,45 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import { addMonths, endOfMonth, monthKey, parseMonth, startOfMonth } from '../../shared/date-range';
+import { TenantScopeService } from '../../prisma/tenant-scope.service';
+import { addMonths, endOfMonth, monthKey, startOfMonth } from '../../shared/date-range';
 import { expenseCents, incomeCents, netCents, normalizeAmountCents } from '../../shared/finance-calculator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import type { TenantContext } from '../../shared/tenant-context';
+
+const MAX_REPORT_MONTHS = 24;
+
+interface MonthlyReportQuery {
+  month?: string;
+  from?: string;
+  to?: string;
+  profileId?: string;
+  family?: boolean;
+}
 
 @Injectable()
 export class ReportsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly tenantScope: TenantScopeService,
+  ) {}
 
-  async monthly(user: AuthenticatedUser, query: { month?: string; from?: string; to?: string; family: boolean }) {
-    const profileIds = await this.getProfileIds(user, query.family);
+  async monthly(context: TenantContext, query: MonthlyReportQuery) {
+    if (query.month && (query.from || query.to)) {
+      throw new BadRequestException('Use month ou o intervalo from/to, não ambos');
+    }
+
+    const profileIds = await this.tenantScope.resolveProfileIds(context, {
+      family: query.family ?? true,
+      profileId: query.profileId,
+    });
+
     if (query.from || query.to) {
-      const from = parseMonth(query.from ?? query.month);
-      const to = parseMonth(query.to ?? query.from ?? query.month);
+      const from = parseReportMonth(query.from ?? query.to);
+      const to = parseReportMonth(query.to ?? query.from);
+      assertValidRange(from, to);
       const months = [];
       for (let cursor = from; cursor <= to; cursor = addMonths(cursor, 1)) {
-        months.push(await this.buildMonthlyReport(cursor, profileIds));
+        months.push(await this.buildMonthlyReport(context, cursor, profileIds));
       }
       return {
         from: monthKey(from),
@@ -25,15 +48,16 @@ export class ReportsService {
       };
     }
 
-    const reference = parseMonth(query.month);
-    return this.buildMonthlyReport(reference, profileIds);
+    const reference = query.month ? parseReportMonth(query.month) : startOfMonth(new Date());
+    return this.buildMonthlyReport(context, reference, profileIds);
   }
 
-  private async buildMonthlyReport(reference: Date, profileIds: string[]) {
+  private async buildMonthlyReport(context: TenantContext, reference: Date, profileIds: string[]) {
     const transactions = await this.prisma.transaction.findMany({
       where: {
         memberProfileId: { in: profileIds },
         referenceMonth: { gte: startOfMonth(reference), lte: endOfMonth(reference) },
+        ...this.tenantScope.consistentTransactionRelations(context),
       },
       include: {
         account: true,
@@ -95,12 +119,28 @@ export class ReportsService {
     };
   }
 
-  private async getProfileIds(user: AuthenticatedUser, family: boolean) {
-    if (!family) return [user.profileId];
-    const profiles = await this.prisma.memberProfile.findMany({
-      where: { familyId: user.familyId, status: 'active' },
-      select: { id: true },
-    });
-    return profiles.map((profile) => profile.id);
+}
+
+function parseReportMonth(value?: string): Date {
+  const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(value ?? '');
+  const year = Number(match?.[1]);
+  const month = Number(match?.[2]);
+
+  if (!match || year < 1000) {
+    throw new BadRequestException('Mês inválido; use o formato YYYY-MM');
+  }
+
+  return new Date(Date.UTC(year, month - 1, 1));
+}
+
+function assertValidRange(from: Date, to: Date) {
+  const monthCount = (to.getUTCFullYear() - from.getUTCFullYear()) * 12 + to.getUTCMonth() - from.getUTCMonth() + 1;
+
+  if (monthCount < 1) {
+    throw new BadRequestException('O início do intervalo deve ser anterior ou igual ao fim');
+  }
+
+  if (monthCount > MAX_REPORT_MONTHS) {
+    throw new BadRequestException(`O intervalo máximo é de ${MAX_REPORT_MONTHS} meses`);
   }
 }

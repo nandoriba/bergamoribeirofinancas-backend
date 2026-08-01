@@ -3,15 +3,17 @@ import {
   Controller,
   Get,
   Post,
+  Query,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { ConfirmImportDto } from './dto/confirm-import.dto';
 import { DiscardImportDto } from './dto/discard-import.dto';
+import { ListImportBatchesQueryDto } from './dto/list-import-batches-query.dto';
 import { ImportsService, type UploadedCsvFile } from './imports.service';
 
 @Controller('imports')
@@ -19,23 +21,23 @@ export class ImportsController {
   constructor(private readonly importsService: ImportsService) {}
 
   @Get('batches')
-  listBatches(@CurrentUser() user: AuthenticatedUser) {
-    return this.importsService.listBatches(user);
+  listBatches(@CurrentTenant() context: TenantContext, @Query() query: ListImportBatchesQueryDto) {
+    return this.importsService.listBatches(context, query);
   }
 
   @Post('preview')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 5 * 1024 * 1024 } }))
-  preview(@CurrentUser() user: AuthenticatedUser, @UploadedFile() file?: UploadedCsvFile) {
-    return this.importsService.preview(user, file);
+  preview(@CurrentTenant() context: TenantContext, @UploadedFile() file?: UploadedCsvFile) {
+    return this.importsService.preview(context, file);
   }
 
   @Post('confirm')
-  confirm(@CurrentUser() user: AuthenticatedUser, @Body() dto: ConfirmImportDto) {
-    return this.importsService.confirm(user, dto);
+  confirm(@CurrentTenant() context: TenantContext, @Body() dto: ConfirmImportDto) {
+    return this.importsService.confirm(context, dto);
   }
 
   @Post('discard')
-  discard(@CurrentUser() user: AuthenticatedUser, @Body() dto: DiscardImportDto) {
-    return this.importsService.discard(user, dto);
+  discard(@CurrentTenant() context: TenantContext, @Body() dto: DiscardImportDto) {
+    return this.importsService.discard(context, dto);
   }
 }

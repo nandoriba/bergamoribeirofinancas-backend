@@ -1,6 +1,14 @@
-import { PartialType } from '@nestjs/mapped-types';
+import { IsInt, IsNotEmpty, IsOptional, IsString, MaxLength, Min } from 'class-validator';
 
-import { CreateInstallmentDto } from './create-installment.dto';
+export class UpdateInstallmentDto {
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(200)
+  description?: string;
 
-export class UpdateInstallmentDto extends PartialType(CreateInstallmentDto) {}
-
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  paidInstallments?: number;
+}

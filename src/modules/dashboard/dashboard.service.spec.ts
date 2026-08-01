@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { AuthenticatedUser } from '../auth/auth.types';
+import { TenantContext } from '../../shared/tenant-context';
 import { DashboardService } from './dashboard.service';
 
 describe('DashboardService', () => {
@@ -130,8 +131,11 @@ describe('DashboardService', () => {
 
     const prisma = {
       account: {
-        findMany: vi.fn().mockResolvedValue([{ memberProfileId: 'profile-1', initialBalanceCents: 1_000_00 }]),
+        findMany: vi.fn().mockResolvedValue([
+          { id: 'account-1', memberProfileId: 'profile-1', initialBalanceCents: 1_000_00 },
+        ]),
       },
+      importBatch: { findFirst: vi.fn().mockResolvedValue({ id: 'batch-1' }) },
       importRow: { findMany: vi.fn().mockResolvedValue([]) },
       installmentPlan: {
         findMany: vi.fn().mockResolvedValue([
@@ -151,8 +155,14 @@ describe('DashboardService', () => {
       recurringTemplate: { findMany: vi.fn().mockResolvedValue([]) },
       transaction: { findMany: transactionFindMany },
     };
-    const recurringService = { materializeForProfiles: vi.fn().mockResolvedValue([]) };
-    const service = new DashboardService(prisma as never, recurringService as never);
+    const recurringService = { materializeOwnProfile: vi.fn().mockResolvedValue([]) };
+    const tenantScope = {
+      resolveProfileIds: vi.fn().mockResolvedValue(['profile-1', 'profile-2']),
+      consistentInvoiceRelations: vi.fn().mockReturnValue({}),
+      consistentRecurringRelations: vi.fn().mockReturnValue({}),
+      consistentTransactionRelations: vi.fn().mockReturnValue({}),
+    };
+    const service = new DashboardService(prisma as never, recurringService as never, tenantScope as never);
 
     const user: AuthenticatedUser = {
       id: 'user-1',
@@ -163,7 +173,8 @@ describe('DashboardService', () => {
       profileId: 'profile-1',
     };
 
-    const data = await service.getDashboard(user, { referenceMonth: '2026-06', family: true });
+    const context = TenantContext.fromAuthenticatedUser(user);
+    const data = await service.getDashboard(context, { referenceMonth: '2026-06', family: true });
 
     expect(data.saldoAtual).toBe(330_00);
     expect(data.saldoFuturo).toBe(240_00);
@@ -228,6 +239,41 @@ describe('DashboardService', () => {
         }),
       }),
     );
+    expect(tenantScope.resolveProfileIds).toHaveBeenCalledWith(context, { family: true, profileId: undefined });
+    expect(recurringService.materializeOwnProfile).toHaveBeenCalledWith(context, referenceMonth);
+    expect(prisma.importRow.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ importBatchId: 'batch-1' }),
+      }),
+    );
+  });
+
+  it('rejects a cross-tenant profile before materializing or reading dashboard data', async () => {
+    const tenantScope = {
+      resolveProfileIds: vi.fn().mockRejectedValue(new Error('Perfil inválido')),
+    };
+    const recurringService = { materializeOwnProfile: vi.fn() };
+    const prisma = { transaction: { findMany: vi.fn() } };
+    const service = new DashboardService(prisma as never, recurringService as never, tenantScope as never);
+    const context = TenantContext.fromAuthenticatedUser({
+      id: 'user-1',
+      email: 'membro@example.com',
+      platformRole: 'user',
+      tenantRole: 'member',
+      familyId: 'family-1',
+      profileId: 'profile-1',
+    });
+
+    await expect(
+      service.getDashboard(context, { referenceMonth: '2026-06', profileId: 'foreign-profile', family: true }),
+    ).rejects.toThrow('Perfil inválido');
+
+    expect(tenantScope.resolveProfileIds).toHaveBeenCalledWith(context, {
+      family: true,
+      profileId: 'foreign-profile',
+    });
+    expect(recurringService.materializeOwnProfile).not.toHaveBeenCalled();
+    expect(prisma.transaction.findMany).not.toHaveBeenCalled();
   });
 
   it('rebuilds possible duplicate candidates when preview rows have no stored evidence', async () => {
@@ -255,7 +301,7 @@ describe('DashboardService', () => {
         ]),
       },
     };
-    const service = new DashboardService(prisma as never, {} as never);
+    const service = new DashboardService(prisma as never, {} as never, {} as never);
     const candidates = await (
       service as unknown as {
         resolveImportDuplicateCandidates(row: unknown): Promise<unknown[]>;
@@ -303,7 +349,7 @@ describe('DashboardService', () => {
       },
       transaction: { findMany: vi.fn().mockResolvedValue([]) },
     };
-    const service = new DashboardService(prisma as never, {} as never);
+    const service = new DashboardService(prisma as never, {} as never, {} as never);
     const candidates = await (
       service as unknown as {
         resolveImportDuplicateCandidates(row: unknown): Promise<unknown[]>;
@@ -336,7 +382,7 @@ describe('DashboardService', () => {
       importRow: { findMany: vi.fn().mockResolvedValue([]) },
       transaction: { findMany: transactionFindMany },
     };
-    const service = new DashboardService(prisma as never, {} as never);
+    const service = new DashboardService(prisma as never, {} as never, {} as never);
     const candidates = await (
       service as unknown as {
         resolveImportDuplicateCandidates(row: unknown): Promise<unknown[]>;

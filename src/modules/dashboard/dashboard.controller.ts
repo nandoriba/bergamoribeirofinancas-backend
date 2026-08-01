@@ -1,8 +1,9 @@
 import { Controller, Get, Query } from '@nestjs/common';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { DashboardService } from './dashboard.service';
+import { DashboardQueryDto } from './dto/dashboard-query.dto';
 
 @Controller('dashboard')
 export class DashboardController {
@@ -10,16 +11,13 @@ export class DashboardController {
 
   @Get()
   getDashboard(
-    @CurrentUser() user: AuthenticatedUser,
-    @Query('referenceMonth') referenceMonth?: string,
-    @Query('month') month?: string,
-    @Query('profileId') profileId?: string,
-    @Query('family') family?: string,
+    @CurrentTenant() context: TenantContext,
+    @Query() query: DashboardQueryDto,
   ) {
-    return this.dashboardService.getDashboard(user, {
-      referenceMonth: referenceMonth || month,
-      profileId,
-      family: family !== 'false',
+    return this.dashboardService.getDashboard(context, {
+      referenceMonth: query.referenceMonth ?? query.month,
+      profileId: query.profileId,
+      family: query.family ?? true,
     });
   }
 }

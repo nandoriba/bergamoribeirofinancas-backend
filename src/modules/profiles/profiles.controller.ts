@@ -1,7 +1,7 @@
 import { Controller, Get } from '@nestjs/common';
 
-import { CurrentUser } from '../../shared/current-user.decorator';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { CurrentTenant } from '../../shared/current-tenant.decorator';
+import type { TenantContext } from '../../shared/tenant-context';
 import { ProfilesService } from './profiles.service';
 
 @Controller('profiles')
@@ -9,7 +9,7 @@ export class ProfilesController {
   constructor(private readonly profilesService: ProfilesService) {}
 
   @Get()
-  list(@CurrentUser() user: AuthenticatedUser) {
-    return this.profilesService.listFamilyProfiles(user);
+  list(@CurrentTenant() context: TenantContext) {
+    return this.profilesService.listFamilyProfiles(context);
   }
 }

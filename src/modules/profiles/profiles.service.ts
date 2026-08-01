@@ -1,16 +1,21 @@
 import { Injectable } from '@nestjs/common';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import type { AuthenticatedUser } from '../auth/auth.types';
+import { TenantScopeService } from '../../prisma/tenant-scope.service';
+import type { TenantContext } from '../../shared/tenant-context';
 
 @Injectable()
 export class ProfilesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly tenantScope: TenantScopeService,
+  ) {}
 
-  listFamilyProfiles(user: AuthenticatedUser) {
+  listFamilyProfiles(context: TenantContext) {
     return this.prisma.memberProfile.findMany({
       where: {
-        familyId: user.familyId,
+        ...this.tenantScope.byFamily(context),
+        // Este endpoint alimenta o seletor de perfis disponíveis, não o histórico financeiro.
         status: 'active',
       },
       select: {
