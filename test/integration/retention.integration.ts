@@ -488,6 +488,7 @@ async function seedAggregate(prisma: PrismaClient, ids: TenantIds) {
       data: {
         tgUserId: `tg-${randomUUID()}`,
         chatId: group.chatId,
+        familyId: ids.familyId,
         memberProfileId: ids.profileId,
       },
     });

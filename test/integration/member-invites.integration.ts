@@ -775,6 +775,7 @@ describe('convites e gestão de membros com PostgreSQL real', () => {
     const link = await prisma.telegramUserLink.create({
       data: {
         chatId,
+        familyId: tenantA.familyId,
         tgUserId,
         memberProfileId: tenantA.memberProfileId,
       },

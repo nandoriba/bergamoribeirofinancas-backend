@@ -152,6 +152,7 @@ describe('metadados de acesso dos controllers', () => {
     ['inativação de membro', MembersController, MembersController.prototype.deactivate],
     ['listagem de perfis', ProfilesController, ProfilesController.prototype.list],
     ['atualização de tema', UsersController, UsersController.prototype.updateTheme],
+    ['status do Telegram', TelegramAuthCodesController, TelegramAuthCodesController.prototype.status],
     ['código do grupo Telegram', TelegramAuthCodesController, TelegramAuthCodesController.prototype.createGroupCode],
     [
       'código de membro Telegram',
@@ -251,6 +252,11 @@ describe('metadados de acesso dos controllers', () => {
       'status público de email do convite',
       MemberInvitesController,
       MemberInvitesController.prototype.emailVerificationStatus,
+    ],
+    [
+      'status Telegram do próprio membro',
+      TelegramAuthCodesController,
+      TelegramAuthCodesController.prototype.status,
     ],
     [
       'código Telegram do próprio membro',

@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { JwtAuthGuard } from '../modules/auth/jwt-auth.guard';
 import { SubscriptionAccessGuard } from '../modules/payments/subscription-access.guard';
+import { SubscriptionAccessPolicy } from '../modules/payments/subscription-access.policy';
 import { AllowBlockedTenantAccess } from './allow-blocked-tenant-access.decorator';
 import { nestApplicationOptions } from './nest-application-options';
 import { Public } from './public.decorator';
@@ -76,6 +77,7 @@ class SecurityFixtureController {
   controllers: [SecurityFixtureController],
   providers: [
     FixtureJwtStrategy,
+    SubscriptionAccessPolicy,
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: SubscriptionAccessGuard },

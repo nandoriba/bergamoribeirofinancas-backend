@@ -10,10 +10,15 @@ import { Reflector } from "@nestjs/core";
 import { ALLOW_BLOCKED_TENANT_ACCESS_KEY } from "../../shared/allow-blocked-tenant-access.decorator";
 import { IS_PUBLIC_KEY } from "../../shared/public.decorator";
 import type { AuthenticatedUser } from "../auth/auth.types";
+import { SubscriptionAccessPolicy } from "./subscription-access.policy";
 
 @Injectable()
 export class SubscriptionAccessGuard implements CanActivate {
-  constructor(@Inject(Reflector) private readonly reflector: Reflector) {}
+  constructor(
+    @Inject(Reflector) private readonly reflector: Reflector,
+    @Inject(SubscriptionAccessPolicy)
+    private readonly subscriptionAccessPolicy: SubscriptionAccessPolicy,
+  ) {}
 
   canActivate(context: ExecutionContext): boolean {
     const targets = [context.getHandler(), context.getClass()];
@@ -32,7 +37,7 @@ export class SubscriptionAccessGuard implements CanActivate {
       .switchToHttp()
       .getRequest<{ user?: AuthenticatedUser }>();
     const decision = request.user?.subscriptionAccess;
-    if (decision?.accessAllowed === true) return true;
+    if (this.subscriptionAccessPolicy.allows(decision)) return true;
 
     const code =
       decision?.effectiveStatus === "cancelled"

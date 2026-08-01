@@ -4,6 +4,7 @@ import { PlatformRole } from '@prisma/client';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { PrismaService } from '../../prisma/prisma.service';
+import { SubscriptionAccessPolicy } from '../payments/subscription-access.policy';
 import type { JwtPayload } from './auth.types';
 import { JwtStrategy } from './jwt.strategy';
 
@@ -15,7 +16,7 @@ function setup() {
     getOrThrow: vi.fn().mockReturnValue('a-secure-test-secret-with-32-chars'),
   } as unknown as ConfigService;
 
-  return { prisma, strategy: new JwtStrategy(config, prisma) };
+  return { prisma, strategy: new JwtStrategy(config, prisma, new SubscriptionAccessPolicy()) };
 }
 
 describe('JwtStrategy', () => {

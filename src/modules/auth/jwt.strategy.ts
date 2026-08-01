@@ -5,10 +5,8 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import type { Request } from 'express';
 
 import { PrismaService } from '../../prisma/prisma.service';
-import {
-  evaluateSubscriptionProjection,
-  SUBSCRIPTION_ACCESS_SELECT,
-} from '../payments/subscription-access.projection';
+import { SUBSCRIPTION_ACCESS_SELECT } from '../payments/subscription-access.projection';
+import { SubscriptionAccessPolicy } from '../payments/subscription-access.policy';
 import {
   requiredActionFromSubscriptionAccess,
   type AuthenticatedUser,
@@ -24,6 +22,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
     config: ConfigService,
     private readonly prisma: PrismaService,
+    private readonly subscriptionAccessPolicy: SubscriptionAccessPolicy,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([extractJwtFromCookie, ExtractJwt.fromAuthHeaderAsBearerToken()]),
@@ -57,7 +56,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException('Sessão inválida');
     }
 
-    const subscriptionAccess = evaluateSubscriptionProjection(
+    const subscriptionAccess = this.subscriptionAccessPolicy.evaluate(
       user.family.currentSubscription,
     );
 

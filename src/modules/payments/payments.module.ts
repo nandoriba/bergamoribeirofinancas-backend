@@ -7,6 +7,7 @@ import {
 import { PAYMENT_PROVIDER } from './payment-provider';
 import { PaymentsController } from './payments.controller';
 import { PaymentsService } from './payments.service';
+import { SubscriptionAccessPolicy } from './subscription-access.policy';
 import { SubscriptionCancellationService } from './subscription-cancellation.service';
 import { AbacatePayWebhookApplicationService } from './webhooks/abacatepay-webhook-application.service';
 import { AbacatePayWebhookController } from './webhooks/abacatepay-webhook.controller';
@@ -15,6 +16,7 @@ import { AbacatePayWebhookController } from './webhooks/abacatepay-webhook.contr
   controllers: [PaymentsController, AbacatePayWebhookController],
   providers: [
     PaymentsService,
+    SubscriptionAccessPolicy,
     SubscriptionCancellationService,
     AbacatePayWebhookApplicationService,
     AbacatePayClient,
@@ -27,6 +29,6 @@ import { AbacatePayWebhookController } from './webhooks/abacatepay-webhook.contr
       useExisting: AbacatePayClient,
     },
   ],
-  exports: [PaymentsService],
+  exports: [PaymentsService, SubscriptionAccessPolicy],
 })
 export class PaymentsModule {}

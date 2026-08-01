@@ -1,5 +1,6 @@
 services:
   backend:
+    # Telegram usa fila serial em memória no MVP: mantenha exatamente uma réplica.
     image: ghcr.io/${GHCR_OWNER}/bergamoribeirofinancas-backend:${BACKEND_TAG:-latest}
     container_name: financeiro-api
     restart: unless-stopped

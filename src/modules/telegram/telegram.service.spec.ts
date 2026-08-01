@@ -2,6 +2,7 @@ import { UnauthorizedException } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
 
 import { TenantContext } from '../../shared/tenant-context';
+import { SubscriptionAccessPolicy } from '../payments/subscription-access.policy';
 import { TelegramService } from './telegram.service';
 
 function createService(dependencies: {
@@ -10,6 +11,7 @@ function createService(dependencies: {
   telegram?: unknown;
   transactionsService?: unknown;
   installmentsService?: unknown;
+  subscriptionAccessPolicy?: unknown;
   tenantScope?: unknown;
 } = {}) {
   return new TelegramService(
@@ -19,6 +21,7 @@ function createService(dependencies: {
     {} as never,
     (dependencies.transactionsService ?? {}) as never,
     (dependencies.installmentsService ?? {}) as never,
+    (dependencies.subscriptionAccessPolicy ?? new SubscriptionAccessPolicy()) as never,
     dependencies.tenantScope as never,
   );
 }
@@ -32,6 +35,7 @@ describe('autenticação do webhook no TelegramService', () => {
       {} as never,
       {} as never,
       {} as never,
+      new SubscriptionAccessPolicy(),
     );
 
     return (service as unknown as { assertWebhookSecret(secretToken?: string): void }).assertWebhookSecret.bind(
@@ -98,6 +102,7 @@ describe('isolamento de tenant no TelegramService', () => {
     const claimCode = vi.fn();
     const update = vi.fn().mockResolvedValue({});
     const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-b' }]),
       telegramAuthCode: {
         findUnique: vi.fn().mockResolvedValue({
           id: 'code-id',
@@ -149,6 +154,7 @@ describe('isolamento de tenant no TelegramService', () => {
 
   it('revalida vínculo revogado dentro da transação antes de criar operação financeira', async () => {
     const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-1' }]),
       telegramAuthorizedGroup: {
         findUnique: vi.fn().mockResolvedValue({
           chatId: 'chat-1',
@@ -227,7 +233,14 @@ describe('isolamento de tenant no TelegramService', () => {
 
     expect(tx.telegramAuthorizedGroup.findUnique).toHaveBeenCalledWith({
       where: { chatId: 'chat-1' },
-      include: { family: { select: { ownerUserId: true } } },
+      include: {
+        family: {
+          select: expect.objectContaining({
+            ownerUserId: true,
+            currentSubscription: expect.any(Object),
+          }),
+        },
+      },
     });
     expect(tx.telegramUserLink.findUnique).toHaveBeenCalledWith(
       expect.objectContaining({ where: { tgUserId_chatId: { tgUserId: 'telegram-user-1', chatId: 'chat-1' } } }),
@@ -286,6 +299,7 @@ describe('isolamento de tenant no TelegramService', () => {
     const operationFindFirst = vi.fn().mockResolvedValue(null);
     const pendingUpdate = vi.fn().mockResolvedValue({});
     const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-1' }]),
       telegramFinancialOperation: { findFirst: operationFindFirst },
       telegramPendingConfirmation: { update: pendingUpdate },
       telegramUpdate: { update: vi.fn().mockResolvedValue({}) },
@@ -349,6 +363,7 @@ describe('isolamento de tenant no TelegramService', () => {
     const pendingUpdate = vi.fn().mockResolvedValue({});
     const transactionDeleteMany = vi.fn().mockResolvedValue({ count: 0 });
     const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: 'family-1' }]),
       telegramFinancialOperation: {
         findFirst: vi.fn().mockResolvedValue({
           id: 'operation-1',

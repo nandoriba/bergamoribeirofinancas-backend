@@ -272,6 +272,7 @@ model MemberProfile {
   createdAt                    DateTime                      @default(now())
   updatedAt                    DateTime                      @updatedAt
 
+  @@unique([id, familyId])
   @@unique([userId, familyId])
   @@index([familyId])
 }
@@ -779,9 +780,11 @@ model TelegramAuthorizedGroup {
   family             Family    @relation(fields: [familyId], references: [id])
   authorizedByUserId String
   authorizedByUser   User      @relation("TelegramGroupAuthorizer", fields: [authorizedByUserId, familyId], references: [id, familyId], onUpdate: Restrict)
+  telegramUserLinks  TelegramUserLink[]
   createdAt          DateTime  @default(now())
   revokedAt          DateTime?
 
+  @@unique([chatId, familyId])
   @@index([familyId])
 }
 
@@ -789,12 +792,15 @@ model TelegramUserLink {
   id              String        @id @default(uuid())
   tgUserId        String
   chatId          String
+  familyId        String
+  authorizedGroup TelegramAuthorizedGroup @relation(fields: [chatId, familyId], references: [chatId, familyId], onUpdate: Restrict)
   memberProfileId String
-  memberProfile   MemberProfile @relation(fields: [memberProfileId], references: [id])
+  memberProfile   MemberProfile @relation(fields: [memberProfileId, familyId], references: [id, familyId], onUpdate: Restrict)
   createdAt       DateTime      @default(now())
   revokedAt       DateTime?
 
   @@unique([tgUserId, chatId])
+  @@index([familyId])
   @@index([memberProfileId])
 }
 

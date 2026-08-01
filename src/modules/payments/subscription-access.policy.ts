@@ -1,3 +1,5 @@
+import { Injectable } from "@nestjs/common";
+
 export type EffectiveSubscriptionStatus =
   | "pending_payment"
   | "active"
@@ -52,6 +54,29 @@ export interface SubscriptionAccessFacts {
 }
 
 export type SubscriptionAccessClock = () => Date;
+
+/**
+ * Injectable facade over the pure entitlement decision table. HTTP sessions and
+ * non-HTTP workers must depend on this same policy so they cannot drift into
+ * separate authorization rules.
+ */
+@Injectable()
+export class SubscriptionAccessPolicy {
+  evaluate(
+    facts: SubscriptionAccessFacts | null | undefined,
+    clock: SubscriptionAccessClock = () => new Date(),
+  ): SubscriptionAccessDecision {
+    return evaluateSubscriptionAccess(facts, clock);
+  }
+
+  allows(decision: SubscriptionAccessDecision | null | undefined): boolean {
+    return (
+      decision?.accessAllowed === true &&
+      (decision.effectiveStatus === "active" ||
+        decision.effectiveStatus === "past_due")
+    );
+  }
+}
 
 const SUCCESS_EVENTS = new Set([
   "subscription.completed",

@@ -12,6 +12,11 @@ import { accountBalanceCents, expenseCents } from '../../shared/finance-calculat
 import { TenantContext } from '../../shared/tenant-context';
 import { timingSafeStringEqual } from '../../shared/timing-safe-string-equal';
 import { InstallmentsService } from '../installments/installments.service';
+import { SUBSCRIPTION_ACCESS_SELECT } from '../payments/subscription-access.projection';
+import {
+  SubscriptionAccessPolicy,
+  type SubscriptionAccessDecision,
+} from '../payments/subscription-access.policy';
 import { TransactionsService } from '../transactions/transactions.service';
 import { AI_PROVIDER, type AiProvider } from './ai-provider';
 import {
@@ -33,6 +38,8 @@ interface LinkedTelegramContext {
 }
 
 type TelegramPrismaExecutor = PrismaService | Prisma.TransactionClient;
+
+const TELEGRAM_TRANSACTION_RETRIES = 3;
 
 interface AccountCandidate {
   id: string;
@@ -63,6 +70,7 @@ export class TelegramService {
     @Inject(AI_PROVIDER) private readonly aiProvider: AiProvider,
     private readonly transactionsService: TransactionsService,
     private readonly installmentsService: InstallmentsService,
+    private readonly subscriptionAccessPolicy: SubscriptionAccessPolicy,
     private readonly tenantScope: TenantScopeService = new TenantScopeService(prisma),
   ) {}
 
@@ -92,17 +100,26 @@ export class TelegramService {
   }
 
   async createMemberAuthCode(context: TenantContext) {
-    const profile = await this.prisma.memberProfile.findFirst({
-      where: {
-        id: context.authorProfileId,
-        userId: context.userId,
-        familyId: context.familyId,
-        status: 'active',
-      },
-      select: { id: true },
-    });
+    const [profile, group] = await Promise.all([
+      this.prisma.memberProfile.findFirst({
+        where: {
+          id: context.authorProfileId,
+          userId: context.userId,
+          familyId: context.familyId,
+          status: 'active',
+        },
+        select: { id: true },
+      }),
+      this.prisma.telegramAuthorizedGroup.findFirst({
+        where: { familyId: context.familyId, revokedAt: null },
+        select: { id: true },
+      }),
+    ]);
     if (!profile) {
       throw new BadRequestException('Perfil ativo não encontrado');
+    }
+    if (!group) {
+      throw new BadRequestException('O owner precisa autorizar o grupo da família antes do vínculo.');
     }
 
     const code = await this.createAuthCode({
@@ -115,6 +132,34 @@ export class TelegramService {
       code: code.code,
       expiresAt: code.expiresAt,
       instruction: `/vincular ${code.code}`,
+    };
+  }
+
+  async getStatus(context: TenantContext) {
+    const group = await this.prisma.telegramAuthorizedGroup.findFirst({
+      where: { familyId: context.familyId, revokedAt: null },
+      select: { chatId: true },
+    });
+    if (!group) {
+      return {
+        group: { authorized: false },
+        member: { linked: false },
+      };
+    }
+
+    const link = await this.prisma.telegramUserLink.findFirst({
+      where: {
+        chatId: group.chatId,
+        familyId: context.familyId,
+        memberProfileId: context.authorProfileId,
+        revokedAt: null,
+      },
+      select: { id: true },
+    });
+
+    return {
+      group: { authorized: true },
+      member: { linked: Boolean(link) },
     };
   }
 
@@ -208,6 +253,16 @@ export class TelegramService {
   }
 
   private async processPayload(updateId: string, payload: TelegramUpdatePayload): Promise<boolean> {
+    try {
+      return await this.dispatchPayload(updateId, payload);
+    } catch (error) {
+      if (!(error instanceof TelegramSubscriptionBlockedError)) throw error;
+      await this.notifyBlockedTenant(payload, error.decision);
+      return false;
+    }
+  }
+
+  private async dispatchPayload(updateId: string, payload: TelegramUpdatePayload): Promise<boolean> {
     if (payload.edited_message) return false;
     if (payload.callback_query) {
       return this.handleCallbackQuery(updateId, payload.callback_query);
@@ -268,14 +323,29 @@ export class TelegramService {
       return;
     }
 
-    const now = new Date();
-    const result = await this.prisma.$transaction(
+    const result = await this.withTelegramTransactionRetry(
       async (tx) => {
+        const codeTarget = await tx.telegramAuthCode.findUnique({
+          where: { code },
+          select: { user: { select: { familyId: true } } },
+        });
+        if (codeTarget?.user) {
+          await this.lockFamily(tx, codeTarget.user.familyId);
+        }
+        const now = new Date();
+
         const authCode = await tx.telegramAuthCode.findUnique({
           where: { code },
           include: {
             user: {
-              include: { family: { select: { ownerUserId: true } } },
+              include: {
+                family: {
+                  select: {
+                    ownerUserId: true,
+                    currentSubscription: { select: SUBSCRIPTION_ACCESS_SELECT },
+                  },
+                },
+              },
             },
           },
         });
@@ -308,6 +378,20 @@ export class TelegramService {
           return { ok: false as const, message: 'Este grupo já pertence a outra família.' };
         }
 
+        const subscriptionAccess = this.subscriptionAccessPolicy.evaluate(
+          authCode.user.family.currentSubscription,
+        );
+        if (!this.subscriptionAccessPolicy.allows(subscriptionAccess)) {
+          await tx.telegramUpdate.update({
+            where: { updateId },
+            data: { status: 'succeeded', processedAt: now, lastError: null },
+          });
+          return {
+            ok: false as const,
+            message: blockedTenantGuidance(subscriptionAccess),
+          };
+        }
+
         const previousGroups = await tx.telegramAuthorizedGroup.findMany({
           where: {
             familyId: authCode.user.familyId,
@@ -327,8 +411,20 @@ export class TelegramService {
             data: { revokedAt: now },
           });
           await tx.telegramUserLink.updateMany({
-            where: { chatId: { in: previousChatIds }, revokedAt: null },
+            where: {
+              familyId: authCode.user.familyId,
+              chatId: { in: previousChatIds },
+              revokedAt: null,
+            },
             data: { revokedAt: now },
+          });
+          await tx.telegramPendingConfirmation.updateMany({
+            where: {
+              chatId: { in: previousChatIds },
+              status: 'PENDING',
+              memberProfile: { familyId: authCode.user.familyId },
+            },
+            data: { status: 'CANCELLED', resolvedAt: now },
           });
         }
 
@@ -358,7 +454,6 @@ export class TelegramService {
 
         return { ok: true as const, message: 'Grupo autorizado para lançamentos financeiros.' };
       },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
 
     await this.telegram.sendMessage(chatId, result.message);
@@ -384,10 +479,25 @@ export class TelegramService {
       return;
     }
 
-    const now = new Date();
-    const result = await this.prisma.$transaction(
+    const result = await this.withTelegramTransactionRetry(
       async (tx) => {
-        const group = await tx.telegramAuthorizedGroup.findUnique({ where: { chatId } });
+        const groupTarget = await tx.telegramAuthorizedGroup.findUnique({
+          where: { chatId },
+          select: { familyId: true },
+        });
+        if (groupTarget) {
+          await this.lockFamily(tx, groupTarget.familyId);
+        }
+        const now = new Date();
+
+        const group = await tx.telegramAuthorizedGroup.findUnique({
+          where: { chatId },
+          include: {
+            family: {
+              select: { currentSubscription: { select: SUBSCRIPTION_ACCESS_SELECT } },
+            },
+          },
+        });
         const authCode = await tx.telegramAuthCode.findUnique({
           where: { code },
           include: { memberProfile: { include: { user: true } } },
@@ -420,15 +530,50 @@ export class TelegramService {
           return { ok: false as const, message: 'Código inválido ou expirado.' };
         }
 
+        const subscriptionAccess = this.subscriptionAccessPolicy.evaluate(
+          group.family.currentSubscription,
+        );
+        if (!this.subscriptionAccessPolicy.allows(subscriptionAccess)) {
+          await tx.telegramUpdate.update({
+            where: { updateId },
+            data: { status: 'succeeded', processedAt: now, lastError: null },
+          });
+          return {
+            ok: false as const,
+            message: blockedTenantGuidance(subscriptionAccess),
+          };
+        }
+
+        await tx.telegramUserLink.updateMany({
+          where: {
+            chatId,
+            familyId: group.familyId,
+            memberProfileId: authCode.memberProfile.id,
+            revokedAt: null,
+            NOT: { tgUserId },
+          },
+          data: { revokedAt: now },
+        });
+        await tx.telegramPendingConfirmation.updateMany({
+          where: {
+            chatId,
+            memberProfileId: authCode.memberProfile.id,
+            status: 'PENDING',
+            NOT: { tgUserId },
+          },
+          data: { status: 'CANCELLED', resolvedAt: now },
+        });
         await tx.telegramUserLink.upsert({
           where: { tgUserId_chatId: { tgUserId, chatId } },
           update: {
+            familyId: group.familyId,
             memberProfileId: authCode.memberProfile.id,
             revokedAt: null,
           },
           create: {
             tgUserId,
             chatId,
+            familyId: group.familyId,
             memberProfileId: authCode.memberProfile.id,
           },
         });
@@ -450,7 +595,6 @@ export class TelegramService {
             'Vínculo criado. Mensagens financeiras deste grupo serão enviadas à OpenAI para interpretação e ficarão armazenadas por 30 dias para depuração.',
         };
       },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
 
     await this.telegram.sendMessage(chatId, result.message);
@@ -738,9 +882,10 @@ export class TelegramService {
     }
 
     const undoWindowMinutes = this.config.get<number>('TELEGRAM_UNDO_WINDOW_MINUTES') ?? 10;
-    const undoCutoff = new Date(Date.now() - undoWindowMinutes * 60_000);
-    const undoResult = await this.prisma.$transaction(
+    const undoResult = await this.withLockedFamilyTransaction(
+      context.familyId,
       async (tx) => {
+        const undoCutoff = new Date(Date.now() - undoWindowMinutes * 60_000);
         const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId, tx);
         if (!currentContext || currentContext.memberProfileId !== context.memberProfileId) {
           throw new UnauthorizedException('Vínculo Telegram não está mais ativo');
@@ -841,7 +986,6 @@ export class TelegramService {
         });
         return 'undone' as const;
       },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
 
     if (undoResult === 'expired') {
@@ -875,7 +1019,8 @@ export class TelegramService {
     pendingConfirmationId?: string,
   ) {
     try {
-      return await this.prisma.$transaction(
+      return await this.withLockedFamilyTransaction(
+        context.familyId,
         async (tx) => {
           const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId, tx);
           if (!currentContext || currentContext.memberProfileId !== context.memberProfileId) {
@@ -908,7 +1053,6 @@ export class TelegramService {
           });
           return { ...created, duplicate: false as const };
         },
-        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
     } catch (error) {
       if (!isStrongDuplicateError(error)) throw error;
@@ -1049,16 +1193,27 @@ export class TelegramService {
     const defaultExpiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
     const effectiveExpiresAt = expiresAt && expiresAt < defaultExpiresAt ? expiresAt : defaultExpiresAt;
     const id = randomShortId();
-    const pending = await this.prisma.telegramPendingConfirmation.create({
-      data: {
-        id,
-        chatId: context.chatId,
-        memberProfileId: context.memberProfileId,
-        tgUserId: context.tgUserId,
-        payload: toJsonInput(payload),
-        expiresAt: effectiveExpiresAt,
-      },
+    const pending = await this.withLockedFamilyTransaction(context.familyId, async (tx) => {
+      const currentContext = await this.resolveLinkedContextFromIds(context.chatId, context.tgUserId, tx);
+      if (!currentContext || currentContext.memberProfileId !== context.memberProfileId) {
+        return null;
+      }
+      if (effectiveExpiresAt <= new Date()) {
+        return null;
+      }
+
+      return tx.telegramPendingConfirmation.create({
+        data: {
+          id,
+          chatId: currentContext.chatId,
+          memberProfileId: currentContext.memberProfileId,
+          tgUserId: currentContext.tgUserId,
+          payload: toJsonInput(payload),
+          expiresAt: effectiveExpiresAt,
+        },
+      });
     });
+    if (!pending) return false;
 
     const sent = await this.telegram.sendMessage(context.chatId, text, {
       inline_keyboard: [
@@ -1075,6 +1230,7 @@ export class TelegramService {
         data: { messageId },
       });
     }
+    return true;
   }
 
   private async buildAiContext(context: LinkedTelegramContext) {
@@ -1107,7 +1263,14 @@ export class TelegramService {
   ): Promise<LinkedTelegramContext | null> {
     const group = await client.telegramAuthorizedGroup.findUnique({
       where: { chatId },
-      include: { family: { select: { ownerUserId: true } } },
+      include: {
+        family: {
+          select: {
+            ownerUserId: true,
+            currentSubscription: { select: SUBSCRIPTION_ACCESS_SELECT },
+          },
+        },
+      },
     });
     if (!group || group.revokedAt) return null;
 
@@ -1122,12 +1285,20 @@ export class TelegramService {
     if (
       !link ||
       link.revokedAt ||
+      link.familyId !== group.familyId ||
       !link.memberProfile.user.isActive ||
       link.memberProfile.user.familyId !== group.familyId ||
       link.memberProfile.familyId !== group.familyId ||
       link.memberProfile.status !== 'active'
     ) {
       return null;
+    }
+
+    const subscriptionAccess = this.subscriptionAccessPolicy.evaluate(
+      group.family.currentSubscription,
+    );
+    if (!this.subscriptionAccessPolicy.allows(subscriptionAccess)) {
+      throw new TelegramSubscriptionBlockedError(subscriptionAccess);
     }
 
     return {
@@ -1215,6 +1386,22 @@ export class TelegramService {
     });
   }
 
+  private async notifyBlockedTenant(
+    payload: TelegramUpdatePayload,
+    decision: SubscriptionAccessDecision,
+  ) {
+    const message = blockedTenantGuidance(decision);
+    if (payload.callback_query) {
+      await this.safeAnswerCallbackQuery(payload.callback_query.id, message, true);
+      return;
+    }
+
+    const chatId = payload.message?.chat.id ?? null;
+    if (chatId !== null) {
+      await this.safeSendMessage(String(chatId), message);
+    }
+  }
+
   private async notifyFailure(payload: TelegramUpdatePayload) {
     const chatId =
       payload.message?.chat.id ?? payload.callback_query?.message?.chat.id ?? payload.edited_message?.chat.id ?? null;
@@ -1274,6 +1461,46 @@ export class TelegramService {
     return description.includes('pagamento') && description.includes('fatura');
   }
 
+  private async lockFamily(tx: Prisma.TransactionClient, familyId: string) {
+    const locked = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "Family" WHERE "id" = ${familyId} FOR UPDATE
+    `;
+    if (locked.length !== 1) {
+      throw new UnauthorizedException('Família do vínculo Telegram não está mais ativa');
+    }
+  }
+
+  private async withLockedFamilyTransaction<T>(
+    familyId: string,
+    operation: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    return this.withTelegramTransactionRetry(async (tx) => {
+      await this.lockFamily(tx, familyId);
+      return operation(tx);
+    });
+  }
+
+  private async withTelegramTransactionRetry<T>(
+    operation: (tx: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= TELEGRAM_TRANSACTION_RETRIES; attempt += 1) {
+      try {
+        // READ COMMITTED is intentional: the Family row is the tenant-wide
+        // authorization lock. After waiting for a concurrent revocation, every
+        // following statement must observe the newly committed access state.
+        return await this.prisma.$transaction(operation, {
+          isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+        });
+      } catch (error) {
+        if (isTelegramTransactionConflict(error) && attempt < TELEGRAM_TRANSACTION_RETRIES) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error('Telegram transaction retry budget exhausted.');
+  }
+
   private async createAuthCode(input: { kind: 'GROUP' | 'MEMBER'; userId: string; memberProfileId?: string }) {
     const expiresAt = new Date(Date.now() + 10 * 60_000);
 
@@ -1297,6 +1524,17 @@ export class TelegramService {
 
     throw new Error('Não foi possível gerar código Telegram único');
   }
+}
+
+class TelegramSubscriptionBlockedError extends Error {
+  constructor(readonly decision: SubscriptionAccessDecision) {
+    super('Assinatura sem acesso ao Telegram');
+    this.name = 'TelegramSubscriptionBlockedError';
+  }
+}
+
+function blockedTenantGuidance(_decision: SubscriptionAccessDecision) {
+  return 'A assinatura desta família não permite usar o bot agora. O owner deve abrir Configurações > Assinatura no app para pagar, iniciar um novo checkout ou restabelecer o acesso.';
 }
 
 function randomCode() {
@@ -1361,6 +1599,10 @@ function isStrongDuplicateError(error: unknown) {
   const response = error.getResponse();
   if (!response || typeof response !== 'object' || Array.isArray(response)) return false;
   return 'code' in response && response.code === 'STRONG_DUPLICATE';
+}
+
+function isTelegramTransactionConflict(error: unknown) {
+  return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'P2034');
 }
 
 function formatError(error: unknown) {

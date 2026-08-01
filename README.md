@@ -34,6 +34,10 @@ Configure `EMAIL_PROVIDER=resend`, `RESEND_API_KEY`, `EMAIL_FROM`, `PUBLIC_API_O
 
 Owners novos ficam com `requiredAction=payment`; o guard global libera somente sessão, logout e as rotas de cobrança explicitamente autorizadas. O checkout mensal hospedado da AbacatePay usa somente cartão e não altera entitlement pelo retorno do navegador nem por reconciliação `PAID`. Webhook, paywall derivado, cancelamento e retenção estão implementados em modo fail-closed; eventos positivos ficam em quarentena até o HMAC e a fronteira mensal serem comprovados no sandbox. Como a documentação do provider não fixa quando um checkout pendente expira, o sandbox também precisa provar que ele deixa de aceitar pagamento dentro do TTL local (ou fornecer invalidação segura). `OWNER_SIGNUP_ENABLED` permanece `false` até esses gates. Consulte [docs/ABACATEPAY_CHECKOUT.md](docs/ABACATEPAY_CHECKOUT.md) e [docs/ABACATEPAY_WEBHOOK_PAYWALL_RETENTION.md](docs/ABACATEPAY_WEBHOOK_PAYWALL_RETENTION.md). Termos e privacidade incluídos no frontend são uma versão operacional preliminar e exigem revisão jurídica antes da ativação.
 
+## Telegram
+
+Cada família autoriza exatamente um grupo e cada membro vincula o próprio Telegram ao próprio perfil. O worker reavalia o mesmo entitlement fail-closed do HTTP antes da IA e das mutações. O MVP exige **uma única réplica da API** porque a fila é serial e mantida em memória; não escale o serviço `backend` horizontalmente. Consulte [docs/TELEGRAM_TENANT_ACCESS.md](docs/TELEGRAM_TENANT_ACCESS.md).
+
 ## Banco Local
 
 Use o database lógico local do projeto: `bergamoribeirofinancas_db`. Em produção, na VPS compartilhada, use `db_financeiro` com o usuário dedicado `financeiro_user`. Não use o database do Psicocomportamento para tabelas do financeiro.
@@ -62,6 +66,9 @@ O seed cria apenas estrutura inicial: família, admin local, perfil, contas e ca
 - `POST /payments/subscription/reconcile`
 - `POST /payments/subscription/cancel`
 - `POST /payments/webhooks/abacatepay`
+- `GET /telegram/status`
+- `POST /telegram/auth-codes/group`
+- `POST /telegram/auth-codes/member`
 - `POST /member-invites`
 - `POST /member-approvals/:id/approve`
 - `GET /dashboard?family=true`

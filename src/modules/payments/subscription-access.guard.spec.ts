@@ -7,6 +7,9 @@ import { ALLOW_BLOCKED_TENANT_ACCESS_KEY } from "../../shared/allow-blocked-tena
 import { IS_PUBLIC_KEY } from "../../shared/public.decorator";
 import type { AuthenticatedUser } from "../auth/auth.types";
 import { SubscriptionAccessGuard } from "./subscription-access.guard";
+import { SubscriptionAccessPolicy } from "./subscription-access.policy";
+
+const subscriptionAccessPolicy = new SubscriptionAccessPolicy();
 
 function fixtureUser(
   subscriptionAccess?: AuthenticatedUser["subscriptionAccess"],
@@ -40,6 +43,7 @@ describe("SubscriptionAccessGuard", () => {
       };
       const guard = new SubscriptionAccessGuard(
         reflector as unknown as Reflector,
+        subscriptionAccessPolicy,
       );
 
       expect(guard.canActivate(context())).toBe(true);
@@ -50,6 +54,7 @@ describe("SubscriptionAccessGuard", () => {
     const reflector = { getAllAndOverride: vi.fn(() => undefined) };
     const guard = new SubscriptionAccessGuard(
       reflector as unknown as Reflector,
+      subscriptionAccessPolicy,
     );
 
     for (const effectiveStatus of ["active", "past_due"] as const) {
@@ -75,6 +80,7 @@ describe("SubscriptionAccessGuard", () => {
     const reflector = { getAllAndOverride: vi.fn(() => undefined) };
     const guard = new SubscriptionAccessGuard(
       reflector as unknown as Reflector,
+      subscriptionAccessPolicy,
     );
 
     expect(() =>
@@ -99,6 +105,7 @@ describe("SubscriptionAccessGuard", () => {
     const reflector = { getAllAndOverride: vi.fn(() => undefined) };
     const guard = new SubscriptionAccessGuard(
       reflector as unknown as Reflector,
+      subscriptionAccessPolicy,
     );
 
     expect(() => guard.canActivate(context(fixtureUser()))).toThrowError(
