@@ -7,9 +7,40 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum UserRole {
+enum PlatformRole {
   admin
-  member
+  user
+}
+
+enum IdentityProvider {
+  google
+}
+
+enum OAuthIntent {
+  login
+  signup_owner
+  accept_invite
+  link_account
+}
+
+enum WebhookProcessingStatus {
+  received
+  processed
+  ignored
+  failed
+}
+
+enum SubscriptionCycle {
+  MONTHLY
+}
+
+enum SubscriptionPaymentMethod {
+  CARD
+}
+
+enum UserActionTokenPurpose {
+  email_verification
+  password_reset
 }
 
 enum ThemePreference {
@@ -126,162 +157,367 @@ enum TelegramFinancialOperationStatus {
 }
 
 model User {
-  id              String          @id @default(uuid())
-  email           String          @unique
-  passwordHash    String
-  name            String
-  role            UserRole        @default(member)
-  themePreference ThemePreference @default(dark)
-  isActive        Boolean         @default(true)
-  familyId        String
-  family          Family          @relation(fields: [familyId], references: [id])
-  profile         MemberProfile?
-  invitesCreated  MemberInvite[]  @relation("InviteCreator")
-  approvalsMade   MemberApproval[] @relation("ApprovalReviewer")
+  id                       String                    @id @default(uuid())
+  email                    String                    @unique
+  passwordHash             String?
+  name                     String
+  platformRole             PlatformRole              @default(user)
+  themePreference          ThemePreference           @default(dark)
+  isActive                 Boolean                   @default(true)
+  emailVerifiedAt          DateTime?
+  familyId                 String
+  family                   Family                    @relation("FamilyMembers", fields: [familyId], references: [id])
+  ownedFamily              Family?                   @relation("FamilyOwner")
+  profile                  MemberProfile?
+  identities               UserIdentity[]
+  oauthAttempts            OAuthAttempt[]            @relation("OAuthAuthenticatedUser")
+  actionTokens             UserActionToken[]
+  approvalsReceived        MemberApproval[]          @relation("ApprovalUser")
+  invitesCreated           MemberInvite[]            @relation("InviteCreator")
+  approvalsMade            MemberApproval[]          @relation("ApprovalReviewer")
   telegramAuthorizedGroups TelegramAuthorizedGroup[] @relation("TelegramGroupAuthorizer")
-  telegramAuthCodes TelegramAuthCode[]
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  telegramAuthCodes        TelegramAuthCode[]
+  createdAt                DateTime                  @default(now())
+  updatedAt                DateTime                  @updatedAt
+
+  @@unique([id, familyId])
+  @@index([familyId])
 }
 
 model Family {
-  id          String          @id @default(uuid())
-  name        String
-  users       User[]
-  profiles    MemberProfile[]
-  invites     MemberInvite[]
-  approvals   MemberApproval[]
-  categories  Category[]
+  id                       String                    @id @default(uuid())
+  name                     String
+  ownerUserId              String?                   @unique
+  owner                    User?                     @relation("FamilyOwner", fields: [ownerUserId, id], references: [id, familyId], onDelete: Restrict, onUpdate: Restrict)
+  users                    User[]                    @relation("FamilyMembers")
+  profiles                 MemberProfile[]
+  invites                  MemberInvite[]
+  approvals                MemberApproval[]
+  categories               Category[]
+  subscriptions            Subscription[]
+  subscriptionPayments     SubscriptionPayment[]
+  paymentWebhookEvents     PaymentWebhookEvent[]
   telegramAuthorizedGroups TelegramAuthorizedGroup[]
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
+  pendingPaymentExpiresAt  DateTime?
+  cancelledAt              DateTime?
+  purgeAfter               DateTime?
+  createdAt                DateTime                  @default(now())
+  updatedAt                DateTime                  @updatedAt
+
+  @@unique([ownerUserId, id])
+  @@index([pendingPaymentExpiresAt])
+  @@index([purgeAfter])
 }
 
 model MemberProfile {
-  id                String              @id @default(uuid())
-  displayName       String
-  status            ProfileStatus       @default(active)
-  userId            String              @unique
-  user              User                @relation(fields: [userId], references: [id])
-  familyId          String
-  family            Family              @relation(fields: [familyId], references: [id])
-  accounts          Account[]
-  transactions      Transaction[]
-  invoices          Invoice[]
-  recurringTemplates RecurringTemplate[]
-  installmentPlans  InstallmentPlan[]
-  monthlyOpenings   MonthlyOpening[]
-  importBatches     ImportBatch[]
-  telegramUserLinks  TelegramUserLink[]
-  telegramAuthCodes  TelegramAuthCode[]
+  id                           String                        @id @default(uuid())
+  displayName                  String
+  status                       ProfileStatus                 @default(active)
+  userId                       String                        @unique
+  familyId                     String
+  user                         User                          @relation(fields: [userId, familyId], references: [id, familyId], onUpdate: Restrict)
+  family                       Family                        @relation(fields: [familyId], references: [id])
+  accounts                     Account[]
+  transactions                 Transaction[]
+  invoices                     Invoice[]
+  recurringTemplates           RecurringTemplate[]
+  installmentPlans             InstallmentPlan[]
+  monthlyOpenings              MonthlyOpening[]
+  importBatches                ImportBatch[]
+  telegramUserLinks            TelegramUserLink[]
+  telegramAuthCodes            TelegramAuthCode[]
   telegramPendingConfirmations TelegramPendingConfirmation[]
-  telegramFinancialOperations TelegramFinancialOperation[]
-  telegramMessageLogs TelegramMessageLog[]
-  createdAt         DateTime            @default(now())
-  updatedAt         DateTime            @updatedAt
+  telegramFinancialOperations  TelegramFinancialOperation[]
+  telegramMessageLogs          TelegramMessageLog[]
+  createdAt                    DateTime                      @default(now())
+  updatedAt                    DateTime                      @updatedAt
+
+  @@unique([userId, familyId])
+  @@index([familyId])
+}
+
+model UserIdentity {
+  id              String           @id @default(uuid())
+  provider        IdentityProvider
+  providerSubject String
+  observedEmail   String
+  userId          String
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt       DateTime         @default(now())
+  lastUsedAt      DateTime         @default(now())
+
+  @@unique([provider, providerSubject])
+  @@unique([userId, provider])
+  @@index([userId])
+}
+
+model OAuthAttempt {
+  id                     String        @id @default(uuid())
+  stateHash              String        @unique
+  nonceHash              String        @unique
+  browserBindingHash     String
+  pkceVerifierCiphertext String
+  pkceVerifierKeyVersion String
+  intent                 OAuthIntent
+  authenticatedUserId    String?
+  authenticatedUser      User?         @relation("OAuthAuthenticatedUser", fields: [authenticatedUserId], references: [id], onDelete: Cascade)
+  memberInviteId         String?
+  memberInvite           MemberInvite? @relation(fields: [memberInviteId], references: [id], onDelete: Cascade)
+  legalAcceptanceVersion String?
+  legalAcceptedAt        DateTime?
+  returnPath             String?
+  expiresAt              DateTime
+  consumedAt             DateTime?
+  createdAt              DateTime      @default(now())
+
+  @@index([browserBindingHash, expiresAt])
+  @@index([authenticatedUserId])
+  @@index([memberInviteId])
+  @@index([expiresAt, consumedAt])
+}
+
+model UserActionToken {
+  id            String                 @id @default(uuid())
+  purpose       UserActionTokenPurpose
+  secretHash    String                 @unique
+  deliveryEmail String
+  userId        String
+  user          User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  revokedAt     DateTime?
+  attempts      Int                    @default(0)
+  lastAttemptAt DateTime?
+  createdAt     DateTime               @default(now())
+
+  @@index([userId, purpose, expiresAt])
+  @@index([expiresAt, consumedAt, revokedAt])
 }
 
 model MemberInvite {
-  id             String          @id @default(uuid())
-  token          String          @unique
-  email          String?
-  status         InviteStatus    @default(active)
-  expiresAt      DateTime
-  creatorUserId  String
-  creator        User            @relation("InviteCreator", fields: [creatorUserId], references: [id])
-  familyId       String
-  family         Family          @relation(fields: [familyId], references: [id])
-  approvals      MemberApproval[]
-  createdAt      DateTime        @default(now())
-  updatedAt      DateTime        @updatedAt
+  id            String           @id @default(uuid())
+  token         String           @unique
+  email         String?
+  status        InviteStatus     @default(active)
+  expiresAt     DateTime
+  creatorUserId String
+  familyId      String
+  creator       User             @relation("InviteCreator", fields: [creatorUserId, familyId], references: [id, familyId], onUpdate: Restrict)
+  family        Family           @relation(fields: [familyId], references: [id])
+  approvals     MemberApproval[]
+  oauthAttempts OAuthAttempt[]
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@unique([id, familyId])
+  @@index([familyId])
 }
 
 model MemberApproval {
-  id              String          @id @default(uuid())
-  status          ApprovalStatus  @default(pending)
-  requestedName   String
-  requestedEmail  String
-  inviteId        String
-  invite          MemberInvite    @relation(fields: [inviteId], references: [id])
-  familyId        String
-  family          Family          @relation(fields: [familyId], references: [id])
-  userId          String?
-  reviewerUserId  String?
-  reviewer        User?           @relation("ApprovalReviewer", fields: [reviewerUserId], references: [id])
-  reviewedAt      DateTime?
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  id             String         @id @default(uuid())
+  status         ApprovalStatus @default(pending)
+  requestedName  String
+  requestedEmail String
+  inviteId       String
+  familyId       String
+  invite         MemberInvite   @relation(fields: [inviteId, familyId], references: [id, familyId], onUpdate: Restrict)
+  family         Family         @relation(fields: [familyId], references: [id])
+  userId         String?
+  approvedUser   User?          @relation("ApprovalUser", fields: [userId, familyId], references: [id, familyId], onDelete: Restrict, onUpdate: Restrict)
+  reviewerUserId String?
+  reviewer       User?          @relation("ApprovalReviewer", fields: [reviewerUserId, familyId], references: [id, familyId], onDelete: Restrict, onUpdate: Restrict)
+  reviewedAt     DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@index([familyId])
+}
+
+/// The SQL migration enforces at most one non-cancelled subscription per family.
+model Subscription {
+  id                      String                     @id @default(uuid())
+  familyId                String
+  family                  Family                     @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  provider                String                     @default("abacatepay")
+  externalId              String                     @unique
+  providerSubscriptionId  String?
+  providerCustomerId      String?
+  providerCheckoutId      String?
+  providerProductId       String
+  providerStatus          String?
+  lastProviderEvent       String?
+  providerUpdatedAt       DateTime?
+  lastSuccessfulPaymentAt DateTime?
+  accessPaidThrough       DateTime?
+  paymentFailedAt         DateTime?
+  graceUntil              DateTime?
+  cancelledAt             DateTime?
+  cancelledDueTo          String?
+  lastInstallmentNumber   Int?
+  amountCents             Int
+  currency                String                     @default("BRL")
+  paymentMethod           SubscriptionPaymentMethod?
+  providerPaymentMethod   String?
+  billingCycle            SubscriptionCycle          @default(MONTHLY)
+  devMode                 Boolean
+  payments                SubscriptionPayment[]
+  webhookEvents           PaymentWebhookEvent[]
+  createdAt               DateTime                   @default(now())
+  updatedAt               DateTime                   @updatedAt
+
+  @@unique([provider, providerSubscriptionId])
+  @@unique([provider, providerCheckoutId])
+  @@unique([id, familyId])
+  @@index([familyId])
+  @@index([familyId, providerStatus])
+  @@index([provider, providerCustomerId])
+  @@index([providerProductId])
+}
+
+model SubscriptionPayment {
+  id                       String                     @id @default(uuid())
+  subscriptionId           String
+  familyId                 String
+  family                   Family                     @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  subscription             Subscription               @relation(fields: [subscriptionId, familyId], references: [id, familyId], onDelete: Cascade, onUpdate: Restrict)
+  providerPaymentId        String?                    @unique
+  providerInstallmentId    String?
+  providerStatus           String
+  installmentNumber        Int?
+  retryNumber              Int?
+  maxRetry                 Int?
+  amountCents              Int
+  currency                 String                     @default("BRL")
+  paymentMethod            SubscriptionPaymentMethod?
+  providerPaymentMethod    String?
+  dueAt                    DateTime?
+  paidAt                   DateTime?
+  failedAt                 DateTime?
+  cycleStartedAt           DateTime?
+  cycleEndedAt             DateTime?
+  appliedAccessPaidThrough DateTime?
+  providerCreatedAt        DateTime?
+  providerUpdatedAt        DateTime?
+  webhookEvents            PaymentWebhookEvent[]
+  createdAt                DateTime                   @default(now())
+  updatedAt                DateTime                   @updatedAt
+
+  @@unique([subscriptionId, providerInstallmentId])
+  @@unique([id, familyId])
+  @@unique([id, subscriptionId, familyId])
+  @@index([subscriptionId, providerStatus])
+  @@index([familyId])
+  @@index([subscriptionId, installmentNumber])
+  @@index([providerInstallmentId])
+  @@index([dueAt])
+}
+
+model PaymentWebhookEvent {
+  id                     String                  @id @default(uuid())
+  provider               String                  @default("abacatepay")
+  providerEventId        String
+  eventType              String
+  apiVersion             String?
+  devMode                Boolean?
+  payloadHash            String
+  sanitizedPayload       Json?
+  signatureValid         Boolean
+  processingStatus       WebhookProcessingStatus @default(received)
+  attempts               Int                     @default(0)
+  familyId               String?
+  family                 Family?                 @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  subscriptionId         String?
+  subscription           Subscription?           @relation(fields: [subscriptionId, familyId], references: [id, familyId], onDelete: Restrict, onUpdate: Restrict)
+  subscriptionPaymentId  String?
+  subscriptionPayment    SubscriptionPayment?    @relation(fields: [subscriptionPaymentId, subscriptionId, familyId], references: [id, subscriptionId, familyId], onDelete: Restrict, onUpdate: Restrict, map: "PaymentWebhookEvent_subscriptionPaymentId_familyId_fkey")
+  providerSubscriptionId String?
+  providerPaymentId      String?
+  occurredAt             DateTime?
+  receivedAt             DateTime                @default(now())
+  processedAt            DateTime?
+  lastAttemptAt          DateTime?
+  errorCode              String?
+
+  @@unique([provider, providerEventId])
+  @@index([familyId, receivedAt])
+  @@index([subscriptionId, eventType])
+  @@index([subscriptionPaymentId])
+  @@index([provider, providerSubscriptionId])
+  @@index([provider, providerPaymentId])
+  @@index([processingStatus, receivedAt])
 }
 
 model Account {
-  id              String          @id @default(uuid())
-  name            String
-  type            AccountType
-  institution     String?
-  lastFourDigits  String?
-  closingDay      Int?
-  dueDay          Int?
-  initialBalanceCents Int          @default(0)
-  memberProfileId String
-  memberProfile   MemberProfile   @relation(fields: [memberProfileId], references: [id])
-  transactions    Transaction[]
-  invoices        Invoice[]
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  id                  String        @id @default(uuid())
+  name                String
+  type                AccountType
+  institution         String?
+  lastFourDigits      String?
+  closingDay          Int?
+  dueDay              Int?
+  initialBalanceCents Int           @default(0)
+  memberProfileId     String
+  memberProfile       MemberProfile @relation(fields: [memberProfileId], references: [id])
+  transactions        Transaction[]
+  invoices            Invoice[]
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  @@index([memberProfileId])
 }
 
 model Category {
-  id          String      @id @default(uuid())
-  name        String
-  type        CategoryType
-  color       String
-  aliases     String[]    @default([])
-  familyId    String
-  family      Family      @relation(fields: [familyId], references: [id])
-  transactions Transaction[]
+  id                 String              @id @default(uuid())
+  name               String
+  type               CategoryType
+  color              String
+  aliases            String[]            @default([])
+  familyId           String
+  family             Family              @relation(fields: [familyId], references: [id])
+  transactions       Transaction[]
   recurringTemplates RecurringTemplate[]
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
 
   @@unique([familyId, name, type])
 }
 
 model Transaction {
-  id                  String            @id @default(uuid())
-  date                DateTime
-  applicationDate     DateTime
-  referenceMonth      DateTime
-  description         String
-  amountCents         Int
-  type                TransactionType
-  status              TransactionStatus @default(confirmed)
-  recurrenceType      RecurrenceType    @default(none)
-  source              String?
-  externalId          String?
-  notes               String?
-  isInvoicePayment    Boolean           @default(false)
-  isInvoiceAdjustment Boolean           @default(false)
-  invoiceAmountCents  Int?
-  memberProfileId     String
-  memberProfile       MemberProfile     @relation(fields: [memberProfileId], references: [id])
-  accountId           String?
-  account             Account?          @relation(fields: [accountId], references: [id])
-  categoryId          String?
-  category            Category?         @relation(fields: [categoryId], references: [id])
-  invoiceId           String?
-  invoice             Invoice?          @relation(fields: [invoiceId], references: [id])
-  recurringTemplateId String?
-  recurringTemplate   RecurringTemplate? @relation(fields: [recurringTemplateId], references: [id])
-  installmentPlanId   String?
-  installmentPlan     InstallmentPlan?  @relation(fields: [installmentPlanId], references: [id])
-  installmentNumber   Int?
-  linkedToPlanAt      DateTime?
-  linkedToPlanByUserId String?
-  importRowId         String?           @unique
-  importRow           ImportRow?        @relation(fields: [importRowId], references: [id])
+  id                         String                      @id @default(uuid())
+  date                       DateTime
+  applicationDate            DateTime
+  referenceMonth             DateTime
+  description                String
+  amountCents                Int
+  type                       TransactionType
+  status                     TransactionStatus           @default(confirmed)
+  recurrenceType             RecurrenceType              @default(none)
+  source                     String?
+  externalId                 String?
+  notes                      String?
+  isInvoicePayment           Boolean                     @default(false)
+  isInvoiceAdjustment        Boolean                     @default(false)
+  invoiceAmountCents         Int?
+  memberProfileId            String
+  memberProfile              MemberProfile               @relation(fields: [memberProfileId], references: [id])
+  accountId                  String?
+  account                    Account?                    @relation(fields: [accountId], references: [id])
+  categoryId                 String?
+  category                   Category?                   @relation(fields: [categoryId], references: [id])
+  invoiceId                  String?
+  invoice                    Invoice?                    @relation(fields: [invoiceId], references: [id])
+  recurringTemplateId        String?
+  recurringTemplate          RecurringTemplate?          @relation(fields: [recurringTemplateId], references: [id])
+  installmentPlanId          String?
+  installmentPlan            InstallmentPlan?            @relation(fields: [installmentPlanId], references: [id])
+  installmentNumber          Int?
+  linkedToPlanAt             DateTime?
+  linkedToPlanByUserId       String?
+  importRowId                String?                     @unique
+  importRow                  ImportRow?                  @relation(fields: [importRowId], references: [id])
   telegramFinancialOperation TelegramFinancialOperation?
-  createdAt           DateTime          @default(now())
-  updatedAt           DateTime          @updatedAt
+  createdAt                  DateTime                    @default(now())
+  updatedAt                  DateTime                    @updatedAt
 
   @@unique([memberProfileId, externalId])
   @@unique([installmentPlanId, installmentNumber])
@@ -291,21 +527,22 @@ model Transaction {
 }
 
 model Invoice {
-  id              String         @id @default(uuid())
+  id              String        @id @default(uuid())
   referenceMonth  DateTime
   dueDate         DateTime?
   closingDate     DateTime?
-  totalCents      Int            @default(0)
-  status          InvoiceStatus  @default(open)
+  totalCents      Int           @default(0)
+  status          InvoiceStatus @default(open)
   accountId       String
-  account         Account        @relation(fields: [accountId], references: [id])
+  account         Account       @relation(fields: [accountId], references: [id])
   memberProfileId String
-  memberProfile   MemberProfile  @relation(fields: [memberProfileId], references: [id])
+  memberProfile   MemberProfile @relation(fields: [memberProfileId], references: [id])
   transactions    Transaction[]
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
 
   @@unique([accountId, referenceMonth])
+  @@index([memberProfileId])
 }
 
 model RecurringTemplate {
@@ -327,24 +564,28 @@ model RecurringTemplate {
   deletedAt       DateTime?
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
+
+  @@index([memberProfileId])
 }
 
 model InstallmentPlan {
-  id              String         @id @default(uuid())
-  description     String
-  totalInstallments Int
-  paidInstallments  Int          @default(0)
-  firstInstallmentNumber Int      @default(1)
-  firstReferenceMonth DateTime
-  monthlyAmountCents Int
-  totalAmountCents Int
-  startsAt        DateTime
-  memberProfileId String
-  memberProfile   MemberProfile  @relation(fields: [memberProfileId], references: [id])
-  transactions    Transaction[]
+  id                         String                      @id @default(uuid())
+  description                String
+  totalInstallments          Int
+  paidInstallments           Int                         @default(0)
+  firstInstallmentNumber     Int                         @default(1)
+  firstReferenceMonth        DateTime
+  monthlyAmountCents         Int
+  totalAmountCents           Int
+  startsAt                   DateTime
+  memberProfileId            String
+  memberProfile              MemberProfile               @relation(fields: [memberProfileId], references: [id])
+  transactions               Transaction[]
   telegramFinancialOperation TelegramFinancialOperation?
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
+  createdAt                  DateTime                    @default(now())
+  updatedAt                  DateTime                    @updatedAt
+
+  @@index([memberProfileId])
 }
 
 model MonthlyOpening {
@@ -369,25 +610,27 @@ model ImportBatch {
   rows            ImportRow[]
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
+
+  @@index([memberProfileId])
 }
 
 model ImportRow {
-  id                String          @id @default(uuid())
-  rowIndex          Int
-  raw               Json
-  date              DateTime?
-  description       String?
-  amountCents       Int?
-  externalId        String?
-  suggestedCategory String?
-  status            ImportRowStatus @default(new)
-  falseDuplicate    Boolean         @default(false)
+  id                  String          @id @default(uuid())
+  rowIndex            Int
+  raw                 Json
+  date                DateTime?
+  description         String?
+  amountCents         Int?
+  externalId          String?
+  suggestedCategory   String?
+  status              ImportRowStatus @default(new)
+  falseDuplicate      Boolean         @default(false)
   duplicateCandidates Json?
-  importBatchId     String
-  importBatch       ImportBatch     @relation(fields: [importBatchId], references: [id])
-  transaction        Transaction?
-  createdAt         DateTime        @default(now())
-  updatedAt         DateTime        @updatedAt
+  importBatchId       String
+  importBatch         ImportBatch     @relation(fields: [importBatchId], references: [id])
+  transaction         Transaction?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
 
   @@index([externalId])
 }
@@ -398,7 +641,7 @@ model TelegramAuthorizedGroup {
   familyId           String
   family             Family    @relation(fields: [familyId], references: [id])
   authorizedByUserId String
-  authorizedByUser   User      @relation("TelegramGroupAuthorizer", fields: [authorizedByUserId], references: [id])
+  authorizedByUser   User      @relation("TelegramGroupAuthorizer", fields: [authorizedByUserId, familyId], references: [id, familyId], onUpdate: Restrict)
   createdAt          DateTime  @default(now())
   revokedAt          DateTime?
 
@@ -436,18 +679,18 @@ model TelegramAuthCode {
 }
 
 model TelegramPendingConfirmation {
-  id              String                  @id
-  chatId          String
-  messageId       Int?
-  memberProfileId String
-  memberProfile   MemberProfile           @relation(fields: [memberProfileId], references: [id])
-  tgUserId        String
-  payload         Json
-  status          TelegramPendingStatus    @default(PENDING)
-  expiresAt       DateTime
-  createdAt       DateTime                @default(now())
-  resolvedAt      DateTime?
-  financialOperations TelegramFinancialOperation[] @relation("OperationPendingConfirmation")
+  id                      String                       @id
+  chatId                  String
+  messageId               Int?
+  memberProfileId         String
+  memberProfile           MemberProfile                @relation(fields: [memberProfileId], references: [id])
+  tgUserId                String
+  payload                 Json
+  status                  TelegramPendingStatus        @default(PENDING)
+  expiresAt               DateTime
+  createdAt               DateTime                     @default(now())
+  resolvedAt              DateTime?
+  financialOperations     TelegramFinancialOperation[] @relation("OperationPendingConfirmation")
   undoFinancialOperations TelegramFinancialOperation[] @relation("UndoPendingConfirmation")
 
   @@index([chatId, tgUserId, status])
@@ -455,13 +698,13 @@ model TelegramPendingConfirmation {
 }
 
 model TelegramUpdate {
-  updateId    String               @id
-  status      TelegramUpdateStatus @default(received)
-  attempts    Int                  @default(0)
-  payload     Json
-  receivedAt  DateTime             @default(now())
-  processedAt DateTime?
-  lastError   String?
+  updateId            String                       @id
+  status              TelegramUpdateStatus         @default(received)
+  attempts            Int                          @default(0)
+  payload             Json
+  receivedAt          DateTime                     @default(now())
+  processedAt         DateTime?
+  lastError           String?
   financialOperations TelegramFinancialOperation[]
 }
 

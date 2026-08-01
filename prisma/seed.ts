@@ -45,40 +45,82 @@ async function main() {
   const adminEmail = process.env.INITIAL_ADMIN_EMAIL ?? 'admin@casaribeiro.local';
   const adminName = process.env.INITIAL_ADMIN_NAME ?? 'Administrador';
   const adminPassword = process.env.INITIAL_ADMIN_PASSWORD ?? 'admin12345';
-
-  const family =
-    (await prisma.family.findFirst({ where: { name: familyName } })) ??
-    (await prisma.family.create({ data: { name: familyName } }));
-
+  const normalizedAdminEmail = adminEmail.trim().toLowerCase();
   const passwordHash = await bcrypt.hash(adminPassword, 12);
-  const user = await prisma.user.upsert({
-    where: { email: adminEmail },
-    update: {
-      name: adminName,
-      role: 'admin',
-      isActive: true,
-      familyId: family.id,
-    },
-    create: {
-      email: adminEmail,
-      name: adminName,
-      passwordHash,
-      role: 'admin',
-      isActive: true,
-      familyId: family.id,
-    },
-  });
+  const { family, profile } = await prisma.$transaction(async (transaction) => {
+    const existingUser = await transaction.user.findUnique({
+      where: { email: normalizedAdminEmail },
+      include: { family: true, profile: true },
+    });
 
-  const profile =
-    (await prisma.memberProfile.findUnique({ where: { userId: user.id } })) ??
-    (await prisma.memberProfile.create({
+    if (!existingUser) {
+      const sameNameFamily = await transaction.family.findFirst({ where: { name: familyName } });
+      if (sameNameFamily) {
+        throw new Error('Seed recusado: família existente sem correspondência unívoca pelo e-mail do owner.');
+      }
+
+      const createdFamily = await transaction.family.create({ data: { name: familyName } });
+      const createdUser = await transaction.user.create({
+        data: {
+          email: normalizedAdminEmail,
+          name: adminName,
+          passwordHash,
+          platformRole: 'admin',
+          isActive: true,
+          familyId: createdFamily.id,
+        },
+      });
+      const createdProfile = await transaction.memberProfile.create({
+        data: {
+          displayName: adminName,
+          status: 'active',
+          userId: createdUser.id,
+          familyId: createdFamily.id,
+        },
+      });
+      const ownedFamily = await transaction.family.update({
+        where: { id: createdFamily.id },
+        data: { ownerUserId: createdUser.id },
+      });
+
+      return { family: ownedFamily, profile: createdProfile };
+    }
+
+    if (existingUser.profile && existingUser.profile.familyId !== existingUser.familyId) {
+      throw new Error('Seed recusado: perfil do owner pertence a outra família.');
+    }
+    if (existingUser.family.ownerUserId && existingUser.family.ownerUserId !== existingUser.id) {
+      throw new Error('Seed recusado: a família existente já possui outro owner.');
+    }
+
+    const updatedUser = await transaction.user.update({
+      where: { id: existingUser.id },
       data: {
-        displayName: adminName,
-        status: 'active',
-        userId: user.id,
-        familyId: family.id,
+        name: adminName,
+        platformRole: 'admin',
+        isActive: true,
       },
-    }));
+    });
+    const upsertedProfile = existingUser.profile
+      ? await transaction.memberProfile.update({
+          where: { id: existingUser.profile.id },
+          data: { displayName: adminName, status: 'active' },
+        })
+      : await transaction.memberProfile.create({
+          data: {
+            displayName: adminName,
+            status: 'active',
+            userId: updatedUser.id,
+            familyId: updatedUser.familyId,
+          },
+        });
+    const ownedFamily = await transaction.family.update({
+      where: { id: existingUser.familyId },
+      data: { name: familyName, ownerUserId: existingUser.id },
+    });
+
+    return { family: ownedFamily, profile: upsertedProfile };
+  });
 
   for (const category of categories) {
     await prisma.category.upsert({
@@ -108,7 +150,7 @@ async function main() {
     }
   }
 
-  console.log(`Seed concluído para ${familyName} (${adminEmail}).`);
+  console.log(`Seed concluído para ${familyName} (${normalizedAdminEmail}).`);
 }
 
 main()
