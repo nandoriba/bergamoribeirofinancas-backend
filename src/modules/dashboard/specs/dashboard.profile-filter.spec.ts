@@ -207,7 +207,6 @@ function createHarness(input: {
     importRow: { findMany: vi.fn() },
     installmentPlan: { findMany: vi.fn().mockResolvedValue([]) },
     invoice: { findMany: vi.fn().mockResolvedValue([]) },
-    monthlyOpening: { findMany: vi.fn().mockResolvedValue([]) },
     recurringTemplate: { findMany: vi.fn().mockResolvedValue(input.recurringTemplates) },
     transaction: {
       create: vi.fn(),

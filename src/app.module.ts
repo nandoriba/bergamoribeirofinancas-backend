@@ -13,7 +13,6 @@ import { HealthModule } from './modules/health/health.module';
 import { ImportsModule } from './modules/imports/imports.module';
 import { InstallmentsModule } from './modules/installments/installments.module';
 import { InvoicesModule } from './modules/invoices/invoices.module';
-import { JobsModule } from './modules/jobs/jobs.module';
 import { MemberApprovalsModule } from './modules/member-approvals/member-approvals.module';
 import { MemberInvitesModule } from './modules/member-invites/member-invites.module';
 import { MembersModule } from './modules/members/members.module';
@@ -61,7 +60,6 @@ import { configuration, validateConfig } from './shared/configuration';
     DashboardModule,
     ReportsModule,
     TelegramModule,
-    JobsModule,
   ],
   providers: [
     {

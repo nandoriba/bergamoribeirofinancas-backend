@@ -151,7 +151,6 @@ describe('DashboardService', () => {
       },
       invoice: { findMany: vi.fn().mockResolvedValue([]) },
       memberProfile: { findMany: vi.fn().mockResolvedValue([{ id: 'profile-1' }]) },
-      monthlyOpening: { findMany: vi.fn().mockResolvedValue([]) },
       recurringTemplate: { findMany: vi.fn().mockResolvedValue([]) },
       transaction: { findMany: transactionFindMany },
     };
@@ -274,6 +273,92 @@ describe('DashboardService', () => {
     });
     expect(recurringService.materializeOwnProfile).not.toHaveBeenCalled();
     expect(prisma.transaction.findMany).not.toHaveBeenCalled();
+  });
+
+  it('derives the opening balance from confirmed transactions before the twelve-month window', async () => {
+    const windowStart = new Date('2025-07-01T00:00:00.000Z');
+    const transactionFindMany = vi
+      .fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          memberProfileId: 'profile-1',
+          date: new Date('2025-06-10T00:00:00.000Z'),
+          applicationDate: new Date('2025-06-10T00:00:00.000Z'),
+          referenceMonth: new Date('2025-06-01T00:00:00.000Z'),
+          amountCents: 200_00,
+          type: 'expense',
+          status: 'confirmed',
+          account: { type: 'checking' },
+        },
+      ]);
+    const accountFindMany = vi
+      .fn()
+      .mockResolvedValue([{ memberProfileId: 'profile-1', initialBalanceCents: 1_000_00 }]);
+    const service = new DashboardService(
+      {
+        account: { findMany: accountFindMany },
+        transaction: { findMany: transactionFindMany },
+      } as never,
+      {} as never,
+      {} as never,
+    );
+
+    const points = await (
+      service as unknown as {
+        buildMonthlyBalances(profileIds: string[], reference: Date): Promise<Array<{ m: string; v: number }>>;
+      }
+    ).buildMonthlyBalances(['profile-1'], new Date('2026-06-01T00:00:00.000Z'));
+
+    expect(points.map((point) => point.v)).toEqual(new Array(12).fill(800_00));
+    expect(transactionFindMany).toHaveBeenNthCalledWith(2, {
+      where: {
+        memberProfileId: { in: ['profile-1'] },
+        referenceMonth: { lt: windowStart },
+        status: 'confirmed',
+      },
+      include: { account: true },
+    });
+  });
+
+  it('loads accounts when calculating credit-card impacts inside the twelve-month window', async () => {
+    const transactionFindMany = vi
+      .fn()
+      .mockResolvedValueOnce([
+        {
+          memberProfileId: 'profile-1',
+          date: new Date('2025-07-10T00:00:00.000Z'),
+          applicationDate: new Date('2025-07-10T00:00:00.000Z'),
+          referenceMonth: new Date('2025-07-01T00:00:00.000Z'),
+          amountCents: 200_00,
+          type: 'expense',
+          status: 'confirmed',
+          account: { type: 'credit_card' },
+        },
+      ])
+      .mockResolvedValueOnce([]);
+    const service = new DashboardService(
+      {
+        account: {
+          findMany: vi.fn().mockResolvedValue([{ memberProfileId: 'profile-1', initialBalanceCents: 1_000_00 }]),
+        },
+        transaction: { findMany: transactionFindMany },
+      } as never,
+      {} as never,
+      {} as never,
+    );
+
+    const points = await (
+      service as unknown as {
+        buildMonthlyBalances(profileIds: string[], reference: Date): Promise<Array<{ m: string; v: number }>>;
+      }
+    ).buildMonthlyBalances(['profile-1'], new Date('2026-06-01T00:00:00.000Z'));
+
+    expect(points.map((point) => point.v)).toEqual(new Array(12).fill(1_200_00));
+    expect(transactionFindMany).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ include: { account: true } }),
+    );
   });
 
   it('rebuilds possible duplicate candidates when preview rows have no stored evidence', async () => {

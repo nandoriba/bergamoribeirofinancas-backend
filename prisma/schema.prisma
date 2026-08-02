@@ -283,7 +283,6 @@ model MemberProfile {
   invoices                     Invoice[]
   recurringTemplates           RecurringTemplate[]
   installmentPlans             InstallmentPlan[]
-  monthlyOpenings              MonthlyOpening[]
   importBatches                ImportBatch[]
   telegramUserLinks            TelegramUserLink[]
   telegramAuthCodes            TelegramAuthCode[]
@@ -747,18 +746,6 @@ model InstallmentPlan {
   updatedAt                  DateTime                    @updatedAt
 
   @@index([memberProfileId])
-}
-
-model MonthlyOpening {
-  id              String        @id @default(uuid())
-  referenceMonth  DateTime
-  balanceCents    Int
-  memberProfileId String
-  memberProfile   MemberProfile @relation(fields: [memberProfileId], references: [id])
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
-
-  @@unique([memberProfileId, referenceMonth])
 }
 
 model ImportBatch {

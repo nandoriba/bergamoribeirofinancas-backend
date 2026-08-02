@@ -353,10 +353,7 @@ export class DashboardService {
     monthStart: Date,
     context?: TenantContext,
   ): Promise<number> {
-    const [openings, accounts, priorTransactions] = await Promise.all([
-      this.prisma.monthlyOpening.findMany({
-        where: { memberProfileId: { in: profileIds }, referenceMonth: monthStart },
-      }),
+    const [accounts, priorTransactions] = await Promise.all([
       this.prisma.account.findMany({
         where: { memberProfileId: { in: profileIds } },
         select: { memberProfileId: true, initialBalanceCents: true },
@@ -372,7 +369,6 @@ export class DashboardService {
       }),
     ]);
 
-    const openingByProfile = new Map(openings.map((opening) => [opening.memberProfileId, opening.balanceCents]));
     const initialByProfile = new Map<string, number>();
     for (const account of accounts) {
       initialByProfile.set(
@@ -390,8 +386,7 @@ export class DashboardService {
     }
 
     return profileIds.reduce((total, profileId) => {
-      const opening =
-        openingByProfile.get(profileId) ?? (initialByProfile.get(profileId) ?? 0) + (priorNetByProfile.get(profileId) ?? 0);
+      const opening = (initialByProfile.get(profileId) ?? 0) + (priorNetByProfile.get(profileId) ?? 0);
       return total + opening;
     }, 0);
   }
