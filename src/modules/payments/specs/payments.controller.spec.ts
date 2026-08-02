@@ -3,9 +3,7 @@ import { GUARDS_METADATA, HTTP_CODE_METADATA } from '@nestjs/common/constants';
 import { Reflector } from '@nestjs/core';
 import { describe, expect, it, vi } from 'vitest';
 
-import {
-  ALLOW_PENDING_PAYMENT_ACCESS_KEY,
-} from '../../../shared/allow-pending-payment-access.decorator';
+import { ALLOW_BLOCKED_TENANT_ACCESS_KEY } from '../../../shared/allow-blocked-tenant-access.decorator';
 import { TenantOwnerGuard } from '../../../shared/tenant-owner.guard';
 import { BrowserOriginGuard } from '../../auth/browser-origin.guard';
 import type { AuthenticatedUser } from '../../auth/auth.types';
@@ -81,7 +79,7 @@ describe('PaymentsController', () => {
 
     for (const handler of [getHandler, postHandler, reconcileHandler, cancelHandler]) {
       expect(
-        reflector.getAllAndOverride<boolean>(ALLOW_PENDING_PAYMENT_ACCESS_KEY, [
+        reflector.getAllAndOverride<boolean>(ALLOW_BLOCKED_TENANT_ACCESS_KEY, [
           handler,
           PaymentsController,
         ]),

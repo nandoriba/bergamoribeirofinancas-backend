@@ -1,24 +1,18 @@
-import { GUARDS_METADATA } from '@nestjs/common/constants';
+import {
+  GUARDS_METADATA,
+  METHOD_METADATA,
+  MODULE_METADATA,
+} from '@nestjs/common/constants';
 import { Reflector } from '@nestjs/core';
 import { describe, expect, it } from 'vitest';
 
-import { AuthController } from '../../modules/auth/auth.controller';
+import { AppModule } from '../../app.module';
 import { BrowserOriginGuard } from '../../modules/auth/browser-origin.guard';
 import { OptionalJwtAuthGuard } from '../../modules/auth/optional-jwt-auth.guard';
-import { HealthController } from '../../modules/health/health.controller';
-import { MemberApprovalsController } from '../../modules/member-approvals/member-approvals.controller';
-import { MemberInvitesController } from '../../modules/member-invites/member-invites.controller';
-import { MembersController } from '../../modules/members/members.controller';
-import { ProfilesController } from '../../modules/profiles/profiles.controller';
-import { PaymentsController } from '../../modules/payments/payments.controller';
-import { AbacatePayWebhookController } from '../../modules/payments/webhooks/abacatepay-webhook.controller';
-import { TelegramAuthCodesController } from '../../modules/telegram/telegram-auth-codes.controller';
-import { TelegramWebhookController } from '../../modules/telegram/telegram-webhook.controller';
-import { UsersController } from '../../modules/users/users.controller';
 import {
-  ALLOW_PENDING_PAYMENT_ACCESS_KEY,
-  AllowPendingPaymentAccess,
-} from '../allow-pending-payment-access.decorator';
+  ALLOW_BLOCKED_TENANT_ACCESS_KEY,
+  AllowBlockedTenantAccess,
+} from '../allow-blocked-tenant-access.decorator';
 import { IS_PUBLIC_KEY, Public } from '../public.decorator';
 import { TenantOwnerGuard } from '../tenant-owner.guard';
 
@@ -26,27 +20,314 @@ const THROTTLER_LIMIT_DEFAULT = 'THROTTLER:LIMITdefault';
 const THROTTLER_TTL_DEFAULT = 'THROTTLER:TTLdefault';
 const ONE_MINUTE_MS = 60_000;
 
-type ControllerType = abstract new (...args: never[]) => unknown;
+type Handler = (...args: never[]) => unknown;
+type ClassType = (abstract new (...args: never[]) => unknown) & {
+  readonly name: string;
+  readonly prototype: object;
+};
+type ExpectedAccess = {
+  access: 'public' | 'protected';
+  allowBlockedTenant?: true;
+  ownerOnly?: true;
+};
+type AppRoute = {
+  key: string;
+  controller: ClassType;
+  handler: Handler;
+};
+
+const EXPECTED_ACCESS = {
+  'AbacatePayWebhookController.receive': { access: 'public' },
+
+  'AccountsController.create': { access: 'protected' },
+  'AccountsController.list': { access: 'protected' },
+  'AccountsController.remove': { access: 'protected' },
+  'AccountsController.update': { access: 'protected' },
+
+  'AuthController.googleCallback': { access: 'public' },
+  'AuthController.login': { access: 'public' },
+  'AuthController.logout': {
+    access: 'protected',
+    allowBlockedTenant: true,
+  },
+  'AuthController.me': {
+    access: 'protected',
+    allowBlockedTenant: true,
+  },
+  'AuthController.methods': { access: 'protected' },
+  'AuthController.startGoogle': { access: 'public' },
+  'AuthController.unlinkGoogle': { access: 'protected' },
+
+  'CategoriesController.create': { access: 'protected' },
+  'CategoriesController.list': { access: 'protected' },
+  'CategoriesController.remove': { access: 'protected' },
+  'CategoriesController.update': { access: 'protected' },
+
+  'DashboardController.getDashboard': { access: 'protected' },
+
+  'HealthController.check': { access: 'public' },
+
+  'ImportsController.confirm': { access: 'protected' },
+  'ImportsController.discard': { access: 'protected' },
+  'ImportsController.listBatches': { access: 'protected' },
+  'ImportsController.preview': { access: 'protected' },
+
+  'InstallmentsController.create': { access: 'protected' },
+  'InstallmentsController.list': { access: 'protected' },
+  'InstallmentsController.remove': { access: 'protected' },
+  'InstallmentsController.update': { access: 'protected' },
+
+  'InvoicesController.create': { access: 'protected' },
+  'InvoicesController.list': { access: 'protected' },
+  'InvoicesController.remove': { access: 'protected' },
+  'InvoicesController.update': { access: 'protected' },
+
+  'MemberApprovalsController.approve': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+  'MemberApprovalsController.list': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+  'MemberApprovalsController.reject': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+
+  'MemberInvitesController.confirmEmail': { access: 'public' },
+  'MemberInvitesController.create': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+  'MemberInvitesController.emailVerificationStatus': { access: 'public' },
+  'MemberInvitesController.list': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+  'MemberInvitesController.register': { access: 'public' },
+  'MemberInvitesController.resendEmail': { access: 'public' },
+  'MemberInvitesController.resolve': { access: 'public' },
+  'MemberInvitesController.revoke': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+
+  'MembersController.deactivate': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+  'MembersController.list': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+
+  'OwnerOnboardingController.confirmEmail': { access: 'public' },
+  'OwnerOnboardingController.confirmPasswordReset': { access: 'public' },
+  'OwnerOnboardingController.continuePasswordReset': { access: 'public' },
+  'OwnerOnboardingController.onboardingConfig': { access: 'public' },
+  'OwnerOnboardingController.registerOwner': { access: 'public' },
+  'OwnerOnboardingController.requestPasswordReset': { access: 'public' },
+  'OwnerOnboardingController.resendEmail': { access: 'public' },
+
+  'PaymentsController.cancelSubscription': {
+    access: 'protected',
+    allowBlockedTenant: true,
+    ownerOnly: true,
+  },
+  'PaymentsController.createCheckout': {
+    access: 'protected',
+    allowBlockedTenant: true,
+    ownerOnly: true,
+  },
+  'PaymentsController.getSubscription': {
+    access: 'protected',
+    allowBlockedTenant: true,
+  },
+  'PaymentsController.reconcileSubscription': {
+    access: 'protected',
+    allowBlockedTenant: true,
+    ownerOnly: true,
+  },
+
+  'ProfilesController.list': { access: 'protected' },
+
+  'RecurringController.create': { access: 'protected' },
+  'RecurringController.generate': { access: 'protected' },
+  'RecurringController.list': { access: 'protected' },
+  'RecurringController.remove': { access: 'protected' },
+  'RecurringController.update': { access: 'protected' },
+
+  'ReportsController.monthly': { access: 'protected' },
+
+  'TelegramAuthCodesController.createGroupCode': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+  'TelegramAuthCodesController.createMemberCode': { access: 'protected' },
+  'TelegramAuthCodesController.memberUsage': {
+    access: 'protected',
+    ownerOnly: true,
+  },
+  'TelegramAuthCodesController.status': { access: 'protected' },
+
+  'TelegramWebhookController.receiveWebhook': { access: 'public' },
+
+  'TransactionsController.create': { access: 'protected' },
+  'TransactionsController.list': { access: 'protected' },
+  'TransactionsController.remove': { access: 'protected' },
+  'TransactionsController.update': { access: 'protected' },
+
+  'UsersController.updateTheme': { access: 'protected' },
+} satisfies Record<string, ExpectedAccess>;
 
 const reflector = new Reflector();
 
-function isPublic(controller: ControllerType, handler: (...args: never[]) => unknown) {
-  return reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [handler, controller]);
+function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
-function allowsPendingPayment(controller: ControllerType, handler: (...args: never[]) => unknown) {
-  return reflector.getAllAndOverride<boolean>(ALLOW_PENDING_PAYMENT_ACCESS_KEY, [handler, controller]);
+function isClassType(value: unknown): value is ClassType {
+  return (
+    typeof value === 'function' &&
+    typeof (value as { name?: unknown }).name === 'string' &&
+    typeof (value as { prototype?: unknown }).prototype === 'object'
+  );
 }
 
-function expectThrottle(handler: (...args: never[]) => unknown, limit: number) {
+function arrayMetadata(key: string, target: object): unknown[] {
+  const value = Reflect.getMetadata(key, target) as unknown;
+  return Array.isArray(value) ? value : [];
+}
+
+function registeredControllers(rootModule: ClassType): ClassType[] {
+  const controllers = new Set<ClassType>();
+  const visited = new Set<unknown>();
+
+  const addControllers = (candidates: unknown) => {
+    if (!Array.isArray(candidates)) return;
+    for (const candidate of candidates) {
+      if (isClassType(candidate)) controllers.add(candidate);
+    }
+  };
+
+  const visit = (rawReference: unknown) => {
+    let reference = rawReference;
+    if (isRecord(reference) && typeof reference.forwardRef === 'function') {
+      reference = (reference.forwardRef as () => unknown)();
+    }
+    if (reference === null || reference === undefined || visited.has(reference)) return;
+    visited.add(reference);
+
+    if (isRecord(reference) && 'module' in reference) {
+      addControllers(reference.controllers);
+      if (Array.isArray(reference.imports)) {
+        for (const imported of reference.imports) visit(imported);
+      }
+      visit(reference.module);
+      return;
+    }
+    if (!isClassType(reference)) return;
+
+    addControllers(arrayMetadata(MODULE_METADATA.CONTROLLERS, reference));
+    for (const imported of arrayMetadata(MODULE_METADATA.IMPORTS, reference)) {
+      visit(imported);
+    }
+  };
+
+  visit(rootModule);
+  return [...controllers].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function controllerHandlers(controller: ClassType): AppRoute[] {
+  const methodNames = new Set<string>();
+  let prototype: object | null = controller.prototype;
+
+  while (prototype !== null && prototype !== Object.prototype) {
+    for (const methodName of Object.getOwnPropertyNames(prototype)) {
+      if (methodName !== 'constructor') methodNames.add(methodName);
+    }
+    prototype = Object.getPrototypeOf(prototype) as object | null;
+  }
+
+  const handlers = controller.prototype as unknown as Record<string, unknown>;
+  return [...methodNames]
+    .sort()
+    .flatMap((methodName): AppRoute[] => {
+      const handler = handlers[methodName];
+      if (
+        typeof handler !== 'function' ||
+        !Reflect.hasMetadata(METHOD_METADATA, handler)
+      ) {
+        return [];
+      }
+      return [
+        {
+          key: `${controller.name}.${methodName}`,
+          controller,
+          handler: handler as Handler,
+        },
+      ];
+    });
+}
+
+function discoverAppRoutes(rootModule: ClassType): AppRoute[] {
+  return registeredControllers(rootModule)
+    .flatMap((controller) => controllerHandlers(controller))
+    .sort((left, right) => left.key.localeCompare(right.key));
+}
+
+const appRoutes = discoverAppRoutes(AppModule);
+const routesByKey = new Map(appRoutes.map((route) => [route.key, route]));
+
+if (routesByKey.size !== appRoutes.length) {
+  throw new Error('O AppModule registrou chaves de handler duplicadas.');
+}
+
+function routeFor(key: string): AppRoute {
+  const route = routesByKey.get(key);
+  if (!route) throw new Error(`Rota não registrada no AppModule: ${key}`);
+  return route;
+}
+
+function isPublic(route: AppRoute) {
+  return reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+    route.handler,
+    route.controller,
+  ]);
+}
+
+function allowsBlockedTenant(route: AppRoute) {
+  return reflector.getAllAndOverride<boolean>(ALLOW_BLOCKED_TENANT_ACCESS_KEY, [
+    route.handler,
+    route.controller,
+  ]);
+}
+
+function guardsFor(route: AppRoute) {
+  const controllerGuards =
+    (Reflect.getMetadata(GUARDS_METADATA, route.controller) as unknown[] | undefined) ?? [];
+  const handlerGuards =
+    (Reflect.getMetadata(GUARDS_METADATA, route.handler) as unknown[] | undefined) ?? [];
+  return [...controllerGuards, ...handlerGuards];
+}
+
+function actualAccess(route: AppRoute): ExpectedAccess {
+  return {
+    access: isPublic(route) === true ? 'public' : 'protected',
+    ...(allowsBlockedTenant(route) === true ? { allowBlockedTenant: true as const } : {}),
+    ...(guardsFor(route).includes(TenantOwnerGuard) ? { ownerOnly: true as const } : {}),
+  };
+}
+
+function handlerFor(key: string): Handler {
+  return routeFor(key).handler;
+}
+
+function expectThrottle(key: string, limit: number) {
+  const handler = handlerFor(key);
   expect(Reflect.getMetadata(THROTTLER_LIMIT_DEFAULT, handler)).toBe(limit);
   expect(Reflect.getMetadata(THROTTLER_TTL_DEFAULT, handler)).toBe(ONE_MINUTE_MS);
-}
-
-function guardsFor(controller: ControllerType, handler: (...args: never[]) => unknown) {
-  const controllerGuards = (Reflect.getMetadata(GUARDS_METADATA, controller) as unknown[] | undefined) ?? [];
-  const handlerGuards = (Reflect.getMetadata(GUARDS_METADATA, handler) as unknown[] | undefined) ?? [];
-  return [...controllerGuards, ...handlerGuards];
 }
 
 describe('metadados de acesso dos controllers', () => {
@@ -56,214 +337,141 @@ describe('metadados de acesso dos controllers', () => {
       endpoint() {}
     }
 
-    expect(isPublic(FixtureController, FixtureController.prototype.endpoint)).toBe(true);
+    const route = {
+      key: 'FixtureController.endpoint',
+      controller: FixtureController,
+      handler: FixtureController.prototype.endpoint,
+    };
+    expect(isPublic(route)).toBe(true);
   });
 
-  it('AllowPendingPaymentAccess marca o handler com a chave compartilhada', () => {
+  it('AllowBlockedTenantAccess marca o handler com a chave canônica', () => {
     class FixtureController {
-      @AllowPendingPaymentAccess()
+      @AllowBlockedTenantAccess()
       endpoint() {}
     }
 
-    expect(
-      allowsPendingPayment(FixtureController, FixtureController.prototype.endpoint),
-    ).toBe(true);
+    const route = {
+      key: 'FixtureController.endpoint',
+      controller: FixtureController,
+      handler: FixtureController.prototype.endpoint,
+    };
+    expect(allowsBlockedTenant(route)).toBe(true);
   });
 
-  it('libera para tenant bloqueado somente sessão, logout e cobrança revisada', () => {
-    expect(allowsPendingPayment(AuthController, AuthController.prototype.me)).toBe(true);
-    expect(allowsPendingPayment(AuthController, AuthController.prototype.logout)).toBe(true);
-    expect(
-      allowsPendingPayment(
-        PaymentsController,
-        PaymentsController.prototype.getSubscription,
-      ),
-    ).toBe(true);
-    expect(
-      allowsPendingPayment(
-        PaymentsController,
-        PaymentsController.prototype.createCheckout,
-      ),
-    ).toBe(true);
-    expect(
-      allowsPendingPayment(
-        PaymentsController,
-        PaymentsController.prototype.reconcileSubscription,
-      ),
-    ).toBe(true);
-    expect(
-      allowsPendingPayment(
-        PaymentsController,
-        PaymentsController.prototype.cancelSubscription,
-      ),
-    ).toBe(true);
-    expect(allowsPendingPayment(AuthController, AuthController.prototype.methods)).toBeUndefined();
-    expect(allowsPendingPayment(UsersController, UsersController.prototype.updateTheme)).toBeUndefined();
-    expect(
-      allowsPendingPayment(MembersController, MembersController.prototype.list),
-    ).toBeUndefined();
-    expect(
-      allowsPendingPayment(MembersController, MembersController.prototype.deactivate),
-    ).toBeUndefined();
+  it('deriva do AppModule exatamente todos os controllers e handlers revisados', () => {
+    expect(appRoutes.map((route) => route.key)).toEqual(
+      Object.keys(EXPECTED_ACCESS).sort(),
+    );
   });
 
-  it.each([
-    ['login', AuthController, AuthController.prototype.login],
-    ['início Google OAuth', AuthController, AuthController.prototype.startGoogle],
-    ['callback Google OAuth', AuthController, AuthController.prototype.googleCallback],
-    ['consulta de convite', MemberInvitesController, MemberInvitesController.prototype.resolve],
-    ['cadastro de membro', MemberInvitesController, MemberInvitesController.prototype.register],
-    [
-      'confirmação de email do convite',
-      MemberInvitesController,
-      MemberInvitesController.prototype.confirmEmail,
-    ],
-    [
-      'reenvio de email do convite',
-      MemberInvitesController,
-      MemberInvitesController.prototype.resendEmail,
-    ],
-    [
-      'status de email do convite',
-      MemberInvitesController,
-      MemberInvitesController.prototype.emailVerificationStatus,
-    ],
-    ['webhook do Telegram', TelegramWebhookController, TelegramWebhookController.prototype.receiveWebhook],
-    [
-      'webhook autenticado da AbacatePay',
-      AbacatePayWebhookController,
-      AbacatePayWebhookController.prototype.receive,
-    ],
-    ['healthcheck', HealthController, HealthController.prototype.check],
-  ] as const)('marca %s como público', (_label, controller, handler) => {
-    expect(isPublic(controller, handler)).toBe(true);
-  });
+  it.each(Object.entries(EXPECTED_ACCESS))(
+    'mantém a classificação explícita de %s',
+    (key, expected) => {
+      expect(actualAccess(routeFor(key))).toEqual(expected);
+    },
+  );
 
-  it.each([
-    ['sessão atual', AuthController, AuthController.prototype.me],
-    ['métodos de acesso', AuthController, AuthController.prototype.methods],
-    ['desvínculo Google', AuthController, AuthController.prototype.unlinkGoogle],
-    ['logout', AuthController, AuthController.prototype.logout],
-    ['criação de convite', MemberInvitesController, MemberInvitesController.prototype.create],
-    ['listagem de convites', MemberInvitesController, MemberInvitesController.prototype.list],
-    ['revogação de convite', MemberInvitesController, MemberInvitesController.prototype.revoke],
-    ['aprovações de membros', MemberApprovalsController, MemberApprovalsController.prototype.list],
-    ['listagem de membros', MembersController, MembersController.prototype.list],
-    ['inativação de membro', MembersController, MembersController.prototype.deactivate],
-    ['listagem de perfis', ProfilesController, ProfilesController.prototype.list],
-    ['atualização de tema', UsersController, UsersController.prototype.updateTheme],
-    ['status do Telegram', TelegramAuthCodesController, TelegramAuthCodesController.prototype.status],
-    ['código do grupo Telegram', TelegramAuthCodesController, TelegramAuthCodesController.prototype.createGroupCode],
-    [
-      'código de membro Telegram',
-      TelegramAuthCodesController,
-      TelegramAuthCodesController.prototype.createMemberCode,
-    ],
-  ] as const)('não marca a rota protegida %s como pública', (_label, controller, handler) => {
-    expect(isPublic(controller, handler)).toBeUndefined();
+  it('fecha o inventário com as contagens de política revisadas', () => {
+    const policies: ExpectedAccess[] = Object.values(EXPECTED_ACCESS);
+    expect({
+      controllers: new Set(appRoutes.map((route) => route.controller)).size,
+      handlers: appRoutes.length,
+      public: policies.filter((policy) => policy.access === 'public').length,
+      protected: policies.filter((policy) => policy.access === 'protected').length,
+      allowBlockedTenant: policies.filter((policy) => policy.allowBlockedTenant).length,
+      ownerOnly: policies.filter((policy) => policy.ownerOnly).length,
+      protectedDefault: policies.filter(
+        (policy) =>
+          policy.access === 'protected' &&
+          !policy.allowBlockedTenant &&
+          !policy.ownerOnly,
+      ).length,
+      blockedOwnerOnly: policies.filter(
+        (policy) => policy.allowBlockedTenant && policy.ownerOnly,
+      ).length,
+    }).toEqual({
+      controllers: 21,
+      handlers: 71,
+      public: 18,
+      protected: 53,
+      allowBlockedTenant: 6,
+      ownerOnly: 13,
+      protectedDefault: 37,
+      blockedOwnerOnly: 3,
+    });
   });
 
   it('limita tentativas de login a 5 por minuto', () => {
-    expectThrottle(AuthController.prototype.login, 5);
+    expectThrottle('AuthController.login', 5);
   });
 
   it('limita início, callback e desvínculo Google sem estrangular o retorno do provedor', () => {
-    expectThrottle(AuthController.prototype.startGoogle, 10);
-    expectThrottle(AuthController.prototype.googleCallback, 60);
-    expectThrottle(AuthController.prototype.unlinkGoogle, 5);
+    expectThrottle('AuthController.startGoogle', 10);
+    expectThrottle('AuthController.googleCallback', 60);
+    expectThrottle('AuthController.unlinkGoogle', 5);
   });
 
   it('exige Origin exata nas mutações Google e usa autenticação opcional nos handlers públicos', () => {
-    expect(guardsFor(AuthController, AuthController.prototype.login)).toContain(BrowserOriginGuard);
-    expect(guardsFor(AuthController, AuthController.prototype.startGoogle)).toEqual(
+    expect(guardsFor(routeFor('AuthController.login'))).toContain(BrowserOriginGuard);
+    expect(guardsFor(routeFor('AuthController.startGoogle'))).toEqual(
       expect.arrayContaining([BrowserOriginGuard, OptionalJwtAuthGuard]),
     );
-    expect(guardsFor(AuthController, AuthController.prototype.googleCallback)).toContain(OptionalJwtAuthGuard);
-    expect(guardsFor(AuthController, AuthController.prototype.unlinkGoogle)).toContain(BrowserOriginGuard);
+    expect(guardsFor(routeFor('AuthController.googleCallback'))).toContain(
+      OptionalJwtAuthGuard,
+    );
+    expect(guardsFor(routeFor('AuthController.unlinkGoogle'))).toContain(
+      BrowserOriginGuard,
+    );
   });
 
   it('limita cadastros de membros a 3 por minuto', () => {
-    expectThrottle(MemberInvitesController.prototype.register, 3);
+    expectThrottle('MemberInvitesController.register', 3);
   });
 
   it('limita resolução e verificação pública de convites', () => {
-    expectThrottle(MemberInvitesController.prototype.resolve, 30);
-    expectThrottle(MemberInvitesController.prototype.confirmEmail, 10);
-    expectThrottle(MemberInvitesController.prototype.resendEmail, 3);
-    expectThrottle(MemberInvitesController.prototype.emailVerificationStatus, 30);
+    expectThrottle('MemberInvitesController.resolve', 30);
+    expectThrottle('MemberInvitesController.confirmEmail', 10);
+    expectThrottle('MemberInvitesController.resendEmail', 3);
+    expectThrottle('MemberInvitesController.emailVerificationStatus', 30);
   });
 
   it('exige Origin exata em todas as mutações e consultas públicas com token de convite', () => {
-    for (const handler of [
-      MemberInvitesController.prototype.create,
-      MemberInvitesController.prototype.resolve,
-      MemberInvitesController.prototype.register,
-      MemberInvitesController.prototype.confirmEmail,
-      MemberInvitesController.prototype.resendEmail,
-      MemberInvitesController.prototype.emailVerificationStatus,
-      MemberInvitesController.prototype.revoke,
+    for (const key of [
+      'MemberInvitesController.create',
+      'MemberInvitesController.resolve',
+      'MemberInvitesController.register',
+      'MemberInvitesController.confirmEmail',
+      'MemberInvitesController.resendEmail',
+      'MemberInvitesController.emailVerificationStatus',
+      'MemberInvitesController.revoke',
     ]) {
-      expect(guardsFor(MemberInvitesController, handler)).toContain(BrowserOriginGuard);
+      expect(guardsFor(routeFor(key))).toContain(BrowserOriginGuard);
     }
   });
 
   it('exige Origin exata nas decisões e na inativação de membros', () => {
-    for (const [controller, handler] of [
-      [MemberApprovalsController, MemberApprovalsController.prototype.approve],
-      [MemberApprovalsController, MemberApprovalsController.prototype.reject],
-      [MembersController, MembersController.prototype.deactivate],
-    ] as const) {
-      expect(guardsFor(controller, handler)).toContain(BrowserOriginGuard);
+    for (const key of [
+      'MemberApprovalsController.approve',
+      'MemberApprovalsController.reject',
+      'MembersController.deactivate',
+    ]) {
+      expect(guardsFor(routeFor(key))).toContain(BrowserOriginGuard);
     }
   });
 
   it('limita requisições do webhook Telegram a 60 por minuto', () => {
-    expectThrottle(TelegramWebhookController.prototype.receiveWebhook, 60);
+    expectThrottle('TelegramWebhookController.receiveWebhook', 60);
   });
 
-  it.each([
-    ['criação de convite', MemberInvitesController, MemberInvitesController.prototype.create],
-    ['listagem de convites', MemberInvitesController, MemberInvitesController.prototype.list],
-    ['revogação de convite', MemberInvitesController, MemberInvitesController.prototype.revoke],
-    ['listagem de aprovações', MemberApprovalsController, MemberApprovalsController.prototype.list],
-    ['aprovação de membro', MemberApprovalsController, MemberApprovalsController.prototype.approve],
-    ['rejeição de membro', MemberApprovalsController, MemberApprovalsController.prototype.reject],
-    ['listagem de membros', MembersController, MembersController.prototype.list],
-    ['inativação de membro', MembersController, MembersController.prototype.deactivate],
-    ['código do grupo Telegram', TelegramAuthCodesController, TelegramAuthCodesController.prototype.createGroupCode],
-  ] as const)('protege %s com TenantOwnerGuard', (_label, controller, handler) => {
-    expect(guardsFor(controller, handler)).toContain(TenantOwnerGuard);
-  });
-
-  it.each([
-    ['consulta pública de convite', MemberInvitesController, MemberInvitesController.prototype.resolve],
-    ['cadastro público por convite', MemberInvitesController, MemberInvitesController.prototype.register],
-    [
-      'confirmação pública de email do convite',
-      MemberInvitesController,
-      MemberInvitesController.prototype.confirmEmail,
-    ],
-    [
-      'reenvio público de email do convite',
-      MemberInvitesController,
-      MemberInvitesController.prototype.resendEmail,
-    ],
-    [
-      'status público de email do convite',
-      MemberInvitesController,
-      MemberInvitesController.prototype.emailVerificationStatus,
-    ],
-    [
-      'status Telegram do próprio membro',
-      TelegramAuthCodesController,
-      TelegramAuthCodesController.prototype.status,
-    ],
-    [
-      'código Telegram do próprio membro',
-      TelegramAuthCodesController,
-      TelegramAuthCodesController.prototype.createMemberCode,
-    ],
-  ] as const)('não exige owner para %s', (_label, controller, handler) => {
-    expect(guardsFor(controller, handler)).not.toContain(TenantOwnerGuard);
+  it('mantém o detalhamento de IA e as mutações de cobrança restritos ao owner', () => {
+    for (const key of [
+      'TelegramAuthCodesController.memberUsage',
+      'PaymentsController.createCheckout',
+      'PaymentsController.reconcileSubscription',
+      'PaymentsController.cancelSubscription',
+    ]) {
+      expect(guardsFor(routeFor(key))).toContain(TenantOwnerGuard);
+    }
   });
 });
